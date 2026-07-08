@@ -1,0 +1,12 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/shared" },
+    { "path": "packages/interfaces" },
+    { "path": "packages/platform" },
+    { "path": "packages/providers" },
+    { "path": "packages/agents" },
+    { "path": "packages/orchestrator" },
+    { "path": "apps/cli" }
+  ]
+}

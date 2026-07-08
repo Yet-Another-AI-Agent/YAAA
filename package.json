@@ -1,0 +1,21 @@
+{
+  "name": "yaaa-monorepo",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "lint": "biome lint .",
+    "format": "biome format . --write",
+    "test": "vitest run --coverage",
+    "dev:ui": "npm run dev:electron --workspace=apps/ui"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.8.3",
+    "@vitest/coverage-v8": "^1.6.0",
+    "typescript": "^5.5.4",
+    "vitest": "^1.6.0"
+  }
+}

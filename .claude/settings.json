@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CRG_DATA_DIR=\"$HOME/.code-review-graph/yaaa\" code-review-graph update --skip-flows --repo \"/Users/krishnarajk/Documents/projects/yaaa\" || true",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CRG_DATA_DIR=\"$HOME/.code-review-graph/yaaa\" code-review-graph status --repo \"/Users/krishnarajk/Documents/projects/yaaa\" || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

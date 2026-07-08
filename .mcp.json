@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "code-review-graph": {
+      "command": "uvx",
+      "args": [
+        "code-review-graph",
+        "serve"
+      ],
+      "cwd": "/Users/krishnarajk/Documents/projects/yaaa",
+      "env": {
+        "CRG_DATA_DIR": "/Users/krishnarajk/.code-review-graph/yaaa"
+      },
+      "type": "stdio"
+    }
+  }
+}
