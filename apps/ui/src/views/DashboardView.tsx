@@ -188,6 +188,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [greeting] = useState(getGreeting());
   const [showTaskView, setShowTaskView] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
 
   // Past task selected states
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
@@ -204,8 +205,16 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     if (running || taskId) {
       setSelectedTaskId(null);
       setShowTaskView(true);
+      setSidebarOpen(false);
     }
   }, [running, taskId]);
+
+  // Automatically reopen sidebar on New Mission page
+  useEffect(() => {
+    if (!showTaskView && !selectedTaskId) {
+      setSidebarOpen(true);
+    }
+  }, [showTaskView, selectedTaskId]);
 
   // Fetch orchestrator.md when a task is selected
   useEffect(() => {
@@ -254,6 +263,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   const handleSelectTask = (id: string) => {
     setSelectedTaskId(id);
     setShowTaskView(false);
+    setSidebarOpen(false);
   };
 
   const handleNewMission = () => {
@@ -280,7 +290,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   return (
     <div className="dash-root fade-in-dashboard">
       {/* ─── SIDEBAR LIST ─── */}
-      <div className="dash-sidebar">
+      <div className={`dash-sidebar ${sidebarOpen ? "" : "collapsed"}`}>
         <div className="sidebar-header">
           <div className="sidebar-brand">
             <img src={logoImg} alt="logo" className="sidebar-logo" />
@@ -329,6 +339,13 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
         {/* Top-right: Back + Settings + Avatar */}
         <div className="dash-topbar">
           <div className="dash-topbar-left">
+            <button className="hamburger-btn" onClick={() => setSidebarOpen(!sidebarOpen)} title="Toggle Sidebar">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="3" y1="12" x2="21" y2="12"/>
+                <line x1="3" y1="6" x2="21" y2="6"/>
+                <line x1="3" y1="18" x2="21" y2="18"/>
+              </svg>
+            </button>
             {(showTaskView || selectedTaskId) && (
               <button className="dash-back-btn" onClick={handleReset}>
                 ← New Mission

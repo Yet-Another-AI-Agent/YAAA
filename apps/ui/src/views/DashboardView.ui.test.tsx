@@ -63,4 +63,42 @@ describe("DashboardView", () => {
     render(<DashboardView viewModel={makeViewModel()} />);
     expect(screen.queryByText("Security Confirmation Required", { exact: false })).toBeNull();
   });
+
+  it("renders the hamburger menu button and toggles the sidebar collapsed class on click", () => {
+    render(<DashboardView viewModel={makeViewModel()} />);
+    
+    const toggleBtn = screen.getByTitle("Toggle Sidebar");
+    expect(toggleBtn).toBeTruthy();
+
+    const sidebar = screen.getByText("Missions").closest(".dash-sidebar");
+    expect(sidebar).toBeTruthy();
+    expect(sidebar?.classList.contains("collapsed")).toBe(false);
+
+    toggleBtn.click();
+    expect(sidebar?.classList.contains("collapsed")).toBe(true);
+
+    toggleBtn.click();
+    expect(sidebar?.classList.contains("collapsed")).toBe(false);
+  });
+
+  it("collapses the sidebar when a task is selected from the sidebar", () => {
+    const tasks = [
+      { id: "task-1", prompt: "Test task 1", status: "success", created_at: "2026-07-08T12:00:00Z" }
+    ];
+    render(<DashboardView viewModel={makeViewModel({ tasks })} />);
+
+    const sidebar = screen.getByText("Missions").closest(".dash-sidebar");
+    expect(sidebar?.classList.contains("collapsed")).toBe(false);
+
+    const taskItem = screen.getByText("Test task 1");
+    taskItem.click();
+
+    expect(sidebar?.classList.contains("collapsed")).toBe(true);
+  });
+
+  it("collapses the sidebar if running is true or taskId is set on mount", () => {
+    render(<DashboardView viewModel={makeViewModel({ running: true, taskId: "task-1" })} />);
+    const sidebar = screen.getByText("Missions").closest(".dash-sidebar");
+    expect(sidebar?.classList.contains("collapsed")).toBe(true);
+  });
 });
