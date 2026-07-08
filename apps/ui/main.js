@@ -51,7 +51,7 @@ ipcMain.handle("start-task", async (event, goal) => {
   console.log(`[Spawn CLI] Path: ${cliPath}, Goal: "${goal}"`);
 
   // Spawn CLI tool as a subprocess in GUI mode
-  cliProcess = spawn("node", [cliPath, "--gui", goal], {
+  cliProcess = spawn("node", [cliPath, "task", "-n", goal, "--gui"], {
     cwd: path.resolve(__dirname, "../cli"), // Run from CLI package context
   });
 
@@ -75,6 +75,11 @@ ipcMain.handle("start-task", async (event, goal) => {
           mainWindow.webContents.send("task-event", {
             topic: `task.${taskId}.plan_updated`,
             data: payload.plan,
+          });
+        } else if (payload.event === "task-started") {
+          mainWindow.webContents.send("task-event", {
+            topic: `task.${taskId}.task-started`,
+            data: { taskId: payload.taskId },
           });
         } else if (payload.event === "thought") {
           mainWindow.webContents.send("task-event", {

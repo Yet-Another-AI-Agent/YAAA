@@ -110,7 +110,7 @@ describe("SqliteStore", () => {
 
   it("should initialize task DB and create tables", async () => {
     await expect(store.initTaskDb(taskId)).resolves.not.toThrow();
-    const dbFileExists = fs.existsSync(path.join(testDbDir, `${taskId}.db`));
+    const dbFileExists = fs.existsSync(path.join(testDbDir, taskId, "databases", "task.db"));
     expect(dbFileExists).toBe(true);
   });
 

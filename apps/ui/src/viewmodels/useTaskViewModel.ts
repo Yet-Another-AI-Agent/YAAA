@@ -82,6 +82,12 @@ export function useTaskViewModel() {
             addLog("agent", `[${agentName}] 🛠️ Requesting tool execution: ${data.content}`);
           }
 
+          else if (topic.includes("task-started")) {
+            if (data && data.taskId) {
+              addLog("system", `Backend Task UUID: ${data.taskId}`);
+            }
+          }
+
           else if (topic.includes("started") || topic.includes("completed") || topic.includes("failed")) {
             if (data && data.note) {
               addLog("orchestrator", data.note);

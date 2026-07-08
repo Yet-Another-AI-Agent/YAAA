@@ -10,6 +10,7 @@ export class SqliteStore implements IStore {
 
   constructor(baseDir = "./.yaaa/tasks") {
     this.baseDir = path.resolve(baseDir);
+    // Base directory will be created dynamically per task or on startup if needed
     if (!fs.existsSync(this.baseDir)) {
       fs.mkdirSync(this.baseDir, { recursive: true });
     }
@@ -18,7 +19,11 @@ export class SqliteStore implements IStore {
   private getDb(taskId: string): Database.Database {
     let db = this.connections.get(taskId);
     if (!db) {
-      const dbPath = path.join(this.baseDir, `${taskId}.db`);
+      const dbDir = path.join(this.baseDir, taskId, "databases");
+      if (!fs.existsSync(dbDir)) {
+        fs.mkdirSync(dbDir, { recursive: true });
+      }
+      const dbPath = path.join(dbDir, "task.db");
       db = new Database(dbPath);
       
       // Run Migrations / Schema initialization

@@ -1,7 +1,11 @@
 import readline from "node:readline";
+import path from "node:path";
+import fs from "node:fs";
+import crypto from "node:crypto";
 import { container, MessageBus, PermissionEngine } from "@yaaa/platform";
 import { SqliteStore, FilesFs, MeshGateway } from "@yaaa/providers";
 import { Supervisor } from "@yaaa/orchestrator";
+import { CliAuth } from "./auth.js";
 
 // Create readline interface for human-in-the-loop confirmations
 const rl = readline.createInterface({
@@ -47,33 +51,145 @@ function askUserApprovalGui(agentId: string, call: any): Promise<boolean> {
   });
 }
 
-async function bootstrap() {
-  const args = process.argv.slice(2);
-  const guiMode = args.includes("--gui");
-  const filteredArgs = args.filter((a) => a !== "--gui");
-  const goal = filteredArgs.join(" ");
+function writeOrchestratorMd(
+  taskDir: string,
+  taskId: string,
+  prompt: string,
+  status: string,
+  plan: any,
+  ledgerEntries: any[]
+) {
+  const mdPath = path.join(taskDir, "orchestrator.md");
+  let content = `# Task Orchestration Ledger\n\n`;
+  content += `* **Task ID**: ${taskId}\n`;
+  content += `* **Prompt**: ${prompt}\n`;
+  content += `* **Status**: ${status}\n`;
+  content += `* **Updated At**: ${new Date().toISOString()}\n\n`;
 
-  if (!guiMode) {
-    console.log("🚀 Initializing YAAA CLI Spine Runtime...");
+  if (plan) {
+    content += `## Plan\n`;
+    content += `Goal: ${plan.goal}\n\n`;
+    for (const subtask of plan.subtasks) {
+      content += `- **[${subtask.id}]** ${subtask.title}\n`;
+      content += `  - Capability: \`${subtask.capability}\`\n`;
+      content += `  - Status: \`${subtask.state || "pending"}\`\n`;
+      content += `  - Success Criteria: *${subtask.successCriteria}*\n`;
+      if (subtask.dependsOn && subtask.dependsOn.length > 0) {
+        content += `  - Dependencies: [${subtask.dependsOn.join(", ")}]\n`;
+      }
+      content += `\n`;
+    }
+  }
+
+  if (ledgerEntries && ledgerEntries.length > 0) {
+    content += `## Execution Ledger\n\n`;
+    for (const entry of ledgerEntries) {
+      content += `### Step ${entry.step} (${entry.timestamp || new Date().toISOString()})\n`;
+      content += `* **Strategy**: ${entry.nextStepStrategy}\n`;
+      if (entry.facts && entry.facts.length > 0) {
+        content += `* **Facts Learned**:\n`;
+        for (const fact of entry.facts) {
+          content += `  - ${fact}\n`;
+        }
+      }
+      if (entry.assumptions && entry.assumptions.length > 0) {
+        content += `* **Assumptions Made**:\n`;
+        for (const ass of entry.assumptions) {
+          content += `  - ${ass}\n`;
+        }
+      }
+      content += `\n`;
+    }
+  }
+
+  fs.writeFileSync(mdPath, content, "utf-8");
+}
+
+export async function executeTask(auth: CliAuth, goal: string, guiMode: boolean) {
+  const taskId = crypto.randomUUID();
+  const yaaaDir = auth.getYaaaDir();
+  const taskDir = path.join(yaaaDir, "tasks", taskId);
+
+  // Create folder structure
+  const workingDir = path.join(taskDir, "working");
+  const databasesDir = path.join(taskDir, "databases");
+  const resourcesDir = path.join(taskDir, "resources");
+
+  fs.mkdirSync(workingDir, { recursive: true });
+  fs.mkdirSync(databasesDir, { recursive: true });
+  fs.mkdirSync(resourcesDir, { recursive: true });
+
+  // Initialize files
+  const orchestratorMdPath = path.join(taskDir, "orchestrator.md");
+  fs.writeFileSync(
+    orchestratorMdPath,
+    `# Task Orchestration Ledger\n\n* **Task ID**: ${taskId}\n* **Prompt**: ${goal}\n* **Status**: pending\n* **Created At**: ${new Date().toISOString()}\n\n## Plan\n*(Generating plan...)*\n`,
+    "utf-8"
+  );
+
+  const modelsConfigPath = path.join(taskDir, "models");
+  const configData = auth.loadConfig();
+  fs.writeFileSync(
+    modelsConfigPath,
+    JSON.stringify(configData.preferredModels || {}, null, 2),
+    "utf-8"
+  );
+
+  fs.writeFileSync(path.join(taskDir, "agents"), JSON.stringify([], null, 2), "utf-8");
+
+  // Save to main.db
+  const mainDb = auth.getMainDbConnection();
+  try {
+    mainDb.prepare("INSERT INTO tasks (id, prompt, status, path) VALUES (?, ?, ?, ?)").run(
+      taskId,
+      goal,
+      "running",
+      taskDir
+    );
+  } catch (err: any) {
+    if (guiMode) {
+      console.log(
+        JSON.stringify({
+          event: "complete",
+          result: { success: false, summary: `Failed to insert task to main db: ${err.message}` },
+        })
+      );
+    } else {
+      console.error("Failed to insert task to main db:", err.message);
+    }
+    mainDb.close();
+    rl.close();
+    process.exit(1);
+  }
+  mainDb.close();
+
+  if (guiMode) {
+    // Print JSON start task id for UI
+    console.log(JSON.stringify({ event: "task-started", taskId }));
+  } else {
+    console.log(`🚀 Initializing YAAA CLI Spine Runtime...`);
+    console.log(`Task ID: ${taskId}`);
+    console.log(`Task directory: ${taskDir}`);
   }
 
   // 1. Initialize core services
-  const store = new SqliteStore("./.yaaa/tasks");
+  const store = new SqliteStore(path.join(yaaaDir, "tasks"));
   const bus = new MessageBus();
   const permissions = new PermissionEngine();
-  const gateway = new MeshGateway();
 
-  // Create sandbox files directory
-  const filesSandbox = "./workspace";
-  const filesProvider = new FilesFs(filesSandbox);
+  // Load preferred model mappings or use defaults
+  const gateway = new MeshGateway({
+    apiKey: configData.accessToken || process.env.MESH_API_KEY || undefined,
+    modelMapping: configData.preferredModels || undefined,
+  });
+
+  const filesProvider = new FilesFs(workingDir);
 
   // 2. Register dependencies in container
   container.register("IStore", store);
   container.register("IBus", bus);
   container.register("PermissionEngine", permissions);
   container.register("IMeshGateway", gateway);
-  
-  // Register capability providers dynamically
   container.register("capability:files", filesProvider);
 
   // 3. Register user approval callback
@@ -84,8 +200,8 @@ async function bootstrap() {
     return askUserApproval(agentId, call);
   });
 
-  // 4. Subscribe to message bus events for live stdout streaming
-  bus.subscribe("task.*.agent.*.thought", (topic, msg) => {
+  // 4. Subscribe to message bus events for live stdout streaming and orchestrator.md updates
+  bus.subscribe(`task.${taskId}.agent.*.thought`, (topic, msg) => {
     if (guiMode) {
       const agentName = topic.split(".").find((p) => p.includes("agent-")) || "agent";
       console.log(JSON.stringify({ event: "thought", from: agentName, content: msg.content }));
@@ -94,13 +210,11 @@ async function bootstrap() {
     }
   });
 
-  bus.subscribe("task.*.agent_message", (topic, msg) => {
+  bus.subscribe(`task.${taskId}.agent_message`, (topic, msg) => {
     if (msg.kind === "result") {
-      if (guiMode) {
-        // Handled at completion, but we can stream it too
-      } else {
+      if (!guiMode) {
         console.log(`\n✅ [\x1b[32mRESULT\x1b[0m] [${msg.from}]: ${msg.summary}`);
-        if (msg.artifacts.length > 0) {
+        if (msg.artifacts && msg.artifacts.length > 0) {
           console.log("Artifacts produced:");
           for (const art of msg.artifacts) {
             console.log(`  - [${art.mimeType}] ${art.path} : ${art.description}`);
@@ -110,7 +224,7 @@ async function bootstrap() {
     }
   });
 
-  bus.subscribe("task.*.started", (topic, msg) => {
+  bus.subscribe(`task.${taskId}.started`, (topic, msg) => {
     if (guiMode) {
       console.log(JSON.stringify({ event: "started", note: msg.note }));
     } else {
@@ -118,31 +232,45 @@ async function bootstrap() {
     }
   });
 
-  // Event listener for plan updates
-  bus.subscribe("task.*.plan_updated", (topic, plan) => {
+  bus.subscribe(`task.${taskId}.plan_updated`, (topic, plan) => {
     if (guiMode) {
       console.log(JSON.stringify({ event: "plan-updated", plan }));
     }
   });
 
-  // 5. Get user goal from args
-  if (!goal) {
-    if (guiMode) {
-      console.log(JSON.stringify({ event: "complete", result: { success: false, summary: "No goal string provided." } }));
-    } else {
-      console.error(
-        'Error: Please provide a goal string. Example: npm start "Create a file facts.txt with facts about batteries"'
-      );
-    }
-    rl.close();
-    process.exit(1);
-  }
-
-  // 6. Run task via Supervisor
+  // 5. Run task via Supervisor
   try {
     const supervisor = new Supervisor();
-    const result = await supervisor.runTask(goal);
-    
+    const result = await supervisor.runTask(goal, taskId);
+
+    // Update status in main.db
+    const mainDbUpdate = auth.getMainDbConnection();
+    mainDbUpdate.prepare("UPDATE tasks SET status = ? WHERE id = ?").run(
+      result.success ? "success" : "failed",
+      taskId
+    );
+    mainDbUpdate.close();
+
+    // Query facts/ledger to populate final orchestrator.md
+    const finalPlan = await store.getPlan(taskId);
+    const ledgerEntries = await store.getLedgerEntries(taskId);
+    writeOrchestratorMd(
+      taskDir,
+      taskId,
+      goal,
+      result.success ? "success" : "failed",
+      finalPlan,
+      ledgerEntries
+    );
+
+    // Save active agents
+    const messages = await store.getMessages(taskId);
+    const agents = messages
+      .filter((m: any) => m.from && m.from.includes("agent-"))
+      .map((m: any) => m.from);
+    const uniqueAgents = Array.from(new Set(agents));
+    fs.writeFileSync(path.join(taskDir, "agents"), JSON.stringify(uniqueAgents, null, 2), "utf-8");
+
     if (guiMode) {
       console.log(JSON.stringify({ event: "complete", result }));
     } else {
@@ -153,21 +281,172 @@ async function bootstrap() {
       console.log("========================================\n");
     }
   } catch (err: any) {
+    // Update status to failed in main.db
+    const mainDbUpdate = auth.getMainDbConnection();
+    mainDbUpdate.prepare("UPDATE tasks SET status = ? WHERE id = ?").run("failed", taskId);
+    mainDbUpdate.close();
+
+    try {
+      const finalPlan = await store.getPlan(taskId);
+      const ledgerEntries = await store.getLedgerEntries(taskId);
+      writeOrchestratorMd(taskDir, taskId, goal, "failed", finalPlan, ledgerEntries);
+    } catch {}
+
     if (guiMode) {
       console.log(JSON.stringify({ event: "complete", result: { success: false, summary: err.message } }));
     } else {
       console.error("Fatal execution error:", err.message);
     }
   } finally {
-    // Cleanup
     store.closeAll();
     rl.close();
-    process.exit(0);
   }
 }
 
-bootstrap().catch((err) => {
-  console.error("Bootstrap error:", err);
+function printHelp() {
+  console.log(`
+🤖 YAAA (Yet Another Agent Architecture) CLI
+
+Usage:
+  npm start <command> [options]
+
+Commands:
+  task -n "<prompt>"                 Create a new task with a UUID and start it
+  task -ls, task --list             List all tasks stored in the main database
+  config --key <key_value>           Configure your Mesh API access key
+  config --model <role> <model_id>   Choose your preferred model for an agent role
+
+Agent Roles for Model config:
+  planner, worker, verifier, utility
+
+Options:
+  -h, --help                        Show this help menu recursively
+  --gui                             Run in GUI event-stream mode (for Electron app)
+
+Examples:
+  npm start config --key "github_pat_..."
+  npm start config --model worker "openai/gpt-4o"
+  npm start task -n "Create a summary.txt file with battery details"
+  npm start task -ls
+`);
+}
+
+export async function bootstrap() {
+  const args = process.argv.slice(2);
+  const helpMode = args.includes("-h") || args.includes("--help");
+  const guiMode = args.includes("--gui");
+
+  // Clean args of --gui
+  const cleanArgs = args.filter((a) => a !== "--gui");
+
+  const auth = new CliAuth();
+  const config = auth.loadConfig();
+
+  // 1. Help Menu
+  if (helpMode || cleanArgs.length === 0) {
+    printHelp();
+    rl.close();
+    process.exit(0);
+  }
+
+  const mainCommand = cleanArgs[0];
+
+  if (mainCommand === "config") {
+    const subFlag = cleanArgs[1];
+    if (subFlag === "--key" || subFlag === "-k") {
+      const keyValue = cleanArgs[2];
+      if (!keyValue) {
+        console.error("Error: Please provide a key value. Example: npm start config --key <key>");
+        rl.close();
+        process.exit(1);
+      }
+      config.accessToken = keyValue;
+      auth.saveConfig(config);
+      console.log("✅ Mesh API Key updated successfully in config.json");
+      rl.close();
+      process.exit(0);
+    } else if (subFlag === "--model" || subFlag === "-m") {
+      const role = cleanArgs[2];
+      const modelId = cleanArgs[3];
+      if (!role || !modelId) {
+        console.error(
+          "Error: Please provide role and model ID. Example: npm start config --model worker openai/gpt-4o"
+        );
+        rl.close();
+        process.exit(1);
+      }
+      if (!["planner", "worker", "verifier", "utility"].includes(role)) {
+        console.error("Error: Role must be one of: planner, worker, verifier, utility");
+        rl.close();
+        process.exit(1);
+      }
+      if (!config.preferredModels) {
+        config.preferredModels = {};
+      }
+      config.preferredModels[role as any] = modelId;
+      auth.saveConfig(config);
+      console.log(`✅ Preferred model for role "${role}" set to "${modelId}" in config.json`);
+      rl.close();
+      process.exit(0);
+    } else {
+      console.error("Unknown config option. Use config --key <key> or config --model <role> <model_id>");
+      rl.close();
+      process.exit(1);
+    }
+  }
+
+  if (mainCommand === "task") {
+    const subFlag = cleanArgs[1];
+    if (subFlag === "-ls" || subFlag === "--list") {
+      const db = auth.getMainDbConnection();
+      try {
+        const rows = db.prepare("SELECT id, prompt, status, created_at FROM tasks ORDER BY created_at DESC").all() as any[];
+        if (rows.length === 0) {
+          console.log("No tasks found in main database.");
+        } else {
+          console.log("\n=================== YAAA TASKS LIST ===================");
+          for (const row of rows) {
+            console.log(`ID:      ${row.id}`);
+            console.log(`Prompt:  "${row.prompt}"`);
+            console.log(`Status:  ${row.status.toUpperCase()}`);
+            console.log(`Created: ${row.created_at}`);
+            console.log("-------------------------------------------------------");
+          }
+        }
+      } catch (err: any) {
+        console.error("Failed to query task list:", err.message);
+      } finally {
+        db.close();
+        rl.close();
+      }
+      process.exit(0);
+    } else if (subFlag === "-n" || subFlag === "--create") {
+      const goal = cleanArgs[2];
+      if (!goal) {
+        console.error('Error: Please provide a task prompt/goal. Example: npm start task -n "My prompt"');
+        rl.close();
+        process.exit(1);
+      }
+      await executeTask(auth, goal, guiMode);
+      process.exit(0);
+    } else {
+      console.error(
+        "Unknown task option. Use task -n \"<prompt>\" to create a task, or task -ls to list tasks."
+      );
+      rl.close();
+      process.exit(1);
+    }
+  }
+
+  console.error(`Unknown command: ${mainCommand}. Use -h or --help for instructions.`);
   rl.close();
   process.exit(1);
-});
+}
+
+if (process.env.NODE_ENV !== "test") {
+  bootstrap().catch((err) => {
+    console.error("Bootstrap error:", err);
+    rl.close();
+    process.exit(1);
+  });
+}

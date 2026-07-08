@@ -13,6 +13,7 @@
     "@yaaa/platform": "*",
     "@yaaa/providers": "*",
     "@yaaa/agents": "*",
-    "@yaaa/orchestrator": "*"
+    "@yaaa/orchestrator": "*",
+    "better-sqlite3": "^11.1.2"
   }
 }
