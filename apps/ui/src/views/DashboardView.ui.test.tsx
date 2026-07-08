@@ -1,7 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen } from "@testing-library/react";
-import React from "react";
 import { DashboardView } from "./DashboardView";
 
 vi.mock("../assets/logo.jpg", () => ({ default: "logo.jpg" }));
