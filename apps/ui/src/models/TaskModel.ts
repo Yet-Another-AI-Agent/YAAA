@@ -14,6 +14,13 @@ export interface UISubtask {
   state: "pending" | "running" | "completed" | "failed";
 }
 
+export interface UITask {
+  id: string;
+  prompt: string;
+  status: string;
+  created_at: string;
+}
+
 export class TaskModel {
   static getElectronAPI() {
     const api = (window as any).electronAPI;
@@ -29,6 +36,14 @@ export class TaskModel {
 
   static async resolveApproval(callId: string, approved: boolean): Promise<any> {
     return this.getElectronAPI().resolveApproval(callId, approved);
+  }
+
+  static async listTasks(): Promise<UITask[]> {
+    return this.getElectronAPI().listTasks();
+  }
+
+  static async readTaskOrchestrator(taskId: string): Promise<string | null> {
+    return this.getElectronAPI().readTaskOrchestrator(taskId);
   }
 
   static subscribeEvents(

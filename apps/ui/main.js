@@ -3,6 +3,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { spawn, execSync } from "node:child_process";
+import { CliAuth } from "../cli/dist/auth.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -143,6 +144,34 @@ ipcMain.handle("resolve-approval", async (event, { callId, approved }) => {
     return { status: "success" };
   }
   return { status: "error", error: "No active CLI process found" };
+});
+
+ipcMain.handle("list-tasks", async (event) => {
+  const auth = new CliAuth();
+  const db = auth.getMainDbConnection();
+  try {
+    const rows = db.prepare("SELECT id, prompt, status, created_at FROM tasks ORDER BY created_at DESC").all();
+    return rows;
+  } catch (err) {
+    console.error("Failed to query task list:", err);
+    return [];
+  } finally {
+    db.close();
+  }
+});
+
+ipcMain.handle("read-task-orchestrator", async (event, taskId) => {
+  const auth = new CliAuth();
+  const yaaaDir = auth.getYaaaDir();
+  const mdPath = path.join(yaaaDir, "tasks", taskId, "orchestrator.md");
+  try {
+    if (fs.existsSync(mdPath)) {
+      return fs.readFileSync(mdPath, "utf-8");
+    }
+  } catch (err) {
+    console.error(`Failed to read orchestrator for task ${taskId}:`, err);
+  }
+  return null;
 });
 
 app.whenReady().then(() => {

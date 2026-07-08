@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { TaskModel, type UISubtask, type UIArtifact } from "../models/TaskModel";
+import { TaskModel, type UISubtask, type UIArtifact, type UITask } from "../models/TaskModel";
 import { useLogState } from "./useLogState";
 import { useApprovalState } from "./useApprovalState";
 
@@ -11,6 +11,7 @@ export function useTaskViewModel() {
   const [artifacts, setArtifacts] = useState<UIArtifact[]>([]);
   const [summary, setSummary] = useState<string | null>(null);
   const [success, setSuccess] = useState<boolean | null>(null);
+  const [tasks, setTasks] = useState<UITask[]>([]);
 
   // Delegate Logging Responsibility
   const { logs, addLog, clearLogs } = useLogState();
@@ -20,7 +21,17 @@ export function useTaskViewModel() {
 
   const unsubscribeRef = useRef<(() => void) | null>(null);
 
+  const loadTasks = async () => {
+    try {
+      const list = await TaskModel.listTasks();
+      setTasks(list || []);
+    } catch (err) {
+      console.error("Failed to load tasks:", err);
+    }
+  };
+
   useEffect(() => {
+    loadTasks();
     return () => {
       if (unsubscribeRef.current) {
         unsubscribeRef.current();
@@ -53,6 +64,7 @@ export function useTaskViewModel() {
       const newTaskId = await TaskModel.startTask(goal);
       setTaskId(newTaskId);
       addLog("system", `Task initialized. ID: ${newTaskId}. Listening to event stream...`);
+      loadTasks(); // Update list immediately once startTask runs and task gets created
 
       // 2. Subscribe to Model events and delegate actions
       unsubscribeRef.current = TaskModel.subscribeEvents(
@@ -85,6 +97,7 @@ export function useTaskViewModel() {
           else if (topic.includes("task-started")) {
             if (data && data.taskId) {
               addLog("system", `Backend Task UUID: ${data.taskId}`);
+              loadTasks(); // Reload to capture any backend changes
             }
           }
 
@@ -104,6 +117,7 @@ export function useTaskViewModel() {
           setSummary(resultData.summary);
           setRunning(false);
           addLog("system", `Task completed. Status: ${resultData.success ? "SUCCESS" : "FAILED"}`);
+          loadTasks(); // Reload list to show final status
           
           if (unsubscribeRef.current) {
             unsubscribeRef.current();
@@ -131,6 +145,8 @@ export function useTaskViewModel() {
     success,
     startTask,
     resolveApproval,
+    tasks,
+    loadTasks,
   };
 }
 export type TaskViewModel = ReturnType<typeof useTaskViewModel>;
