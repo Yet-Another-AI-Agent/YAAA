@@ -401,16 +401,20 @@ export async function bootstrap() {
       const db = auth.getMainDbConnection();
       try {
         const rows = db.prepare("SELECT id, prompt, status, created_at FROM tasks ORDER BY created_at DESC").all() as any[];
-        if (rows.length === 0) {
-          console.log("No tasks found in main database.");
+        if (guiMode) {
+          console.log(JSON.stringify({ event: "task-list", tasks: rows }));
         } else {
-          console.log("\n=================== YAAA TASKS LIST ===================");
-          for (const row of rows) {
-            console.log(`ID:      ${row.id}`);
-            console.log(`Prompt:  "${row.prompt}"`);
-            console.log(`Status:  ${row.status.toUpperCase()}`);
-            console.log(`Created: ${row.created_at}`);
-            console.log("-------------------------------------------------------");
+          if (rows.length === 0) {
+            console.log("No tasks found in main database.");
+          } else {
+            console.log("\n=================== YAAA TASKS LIST ===================");
+            for (const row of rows) {
+              console.log(`ID:      ${row.id}`);
+              console.log(`Prompt:  "${row.prompt}"`);
+              console.log(`Status:  ${row.status.toUpperCase()}`);
+              console.log(`Created: ${row.created_at}`);
+              console.log("-------------------------------------------------------");
+            }
           }
         }
       } catch (err: any) {

@@ -1,9 +1,9 @@
 import { app, BrowserWindow, ipcMain } from "electron";
 import path from "node:path";
 import fs from "node:fs";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { spawn, execSync } from "node:child_process";
-import { CliAuth } from "../cli/dist/auth.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -147,22 +147,40 @@ ipcMain.handle("resolve-approval", async (event, { callId, approved }) => {
 });
 
 ipcMain.handle("list-tasks", async (event) => {
-  const auth = new CliAuth();
-  const db = auth.getMainDbConnection();
-  try {
-    const rows = db.prepare("SELECT id, prompt, status, created_at FROM tasks ORDER BY created_at DESC").all();
-    return rows;
-  } catch (err) {
-    console.error("Failed to query task list:", err);
-    return [];
-  } finally {
-    db.close();
-  }
+  return new Promise((resolve) => {
+    const cliPath = path.resolve(__dirname, "../cli/dist/index.js");
+    const child = spawn("node", [cliPath, "task", "-ls", "--gui"], {
+      cwd: path.resolve(__dirname, "../cli"),
+    });
+
+    let output = "";
+    child.stdout.on("data", (data) => {
+      output += data.toString();
+    });
+
+    child.on("close", () => {
+      try {
+        const lines = output.split("\n");
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith("{")) {
+            const parsed = JSON.parse(trimmed);
+            if (parsed.event === "task-list") {
+              resolve(parsed.tasks);
+              return;
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Failed to parse task-list JSON output:", err);
+      }
+      resolve([]);
+    });
+  });
 });
 
 ipcMain.handle("read-task-orchestrator", async (event, taskId) => {
-  const auth = new CliAuth();
-  const yaaaDir = auth.getYaaaDir();
+  const yaaaDir = process.env.YAAA_DATA_DIR || path.join(os.homedir(), ".yaaa");
   const mdPath = path.join(yaaaDir, "tasks", taskId, "orchestrator.md");
   try {
     if (fs.existsSync(mdPath)) {
