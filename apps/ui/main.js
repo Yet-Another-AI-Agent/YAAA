@@ -1,7 +1,8 @@
 import { app, BrowserWindow, ipcMain } from "electron";
 import path from "node:path";
+import fs from "node:fs";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -140,6 +141,20 @@ ipcMain.handle("resolve-approval", async (event, { callId, approved }) => {
 });
 
 app.whenReady().then(() => {
+  const isDev = !app.isPackaged;
+  if (isDev) {
+    const cliPath = path.resolve(__dirname, "../cli/dist/index.js");
+    if (!fs.existsSync(cliPath)) {
+      console.log("[Electron] CLI build not found. Compiling monorepo...");
+      try {
+        execSync("npm run build", { cwd: path.resolve(__dirname, "../..") });
+        console.log("[Electron] CLI compiled successfully.");
+      } catch (err) {
+        console.error("[Electron] Failed to compile CLI on startup:", err);
+      }
+    }
+  }
+
   createWindow();
 
   app.on("activate", () => {

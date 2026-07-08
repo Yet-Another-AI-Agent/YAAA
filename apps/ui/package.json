@@ -10,7 +10,7 @@
     "lint": "oxlint",
     "preview": "vite preview",
     "electron:start": "electron .",
-    "dev:electron": "concurrently \"npm run dev\" \"sleep 2 && electron .\""
+    "dev:electron": "concurrently \"tsc -b -w\" \"npm run dev\" \"sleep 2 && electron .\""
   },
   "dependencies": {
     "@yaaa/agents": "*",
