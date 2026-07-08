@@ -89,8 +89,7 @@ vi.mock("better-sqlite3", async () => {
   return { default: MockDatabase };
 });
 
-// Import AFTER mock is registered so SqliteStore picks up the mock.
-const { SqliteStore } = await import("./sqlite-store.js");
+import { SqliteStore } from "./sqlite-store.js";
 
 describe("SqliteStore", () => {
   // Use os.tmpdir() so directory creation and cleanup work on all platforms
