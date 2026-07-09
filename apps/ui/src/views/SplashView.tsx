@@ -81,7 +81,7 @@ export function SplashView({ onAnimationEnd }: SplashViewProps) {
     }
     if (!isValidMeshApiKey(apiKey)) {
       setApiKeyError(
-        "Please enter a valid Mesh API Key (it should start with 'mesh_').",
+        "Please enter a valid Mesh API Key (it should start with 'mesh_' and be at least 8 characters after the prefix).",
       );
       return;
     }
