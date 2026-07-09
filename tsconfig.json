@@ -7,6 +7,7 @@
     { "path": "packages/providers" },
     { "path": "packages/agents" },
     { "path": "packages/orchestrator" },
+    { "path": "packages/core" },
     { "path": "apps/cli" }
   ]
 }

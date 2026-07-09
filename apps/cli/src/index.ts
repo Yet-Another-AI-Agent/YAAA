@@ -2,9 +2,8 @@ import readline from "node:readline";
 import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
-import { container, MessageBus, PermissionEngine } from "@yaaa/platform";
-import { SqliteStore, FilesFs, MeshGateway } from "@yaaa/providers";
-import { Supervisor } from "@yaaa/orchestrator";
+import { SqliteStore, MeshGateway } from "@yaaa/providers";
+import { createRuntime, type RuntimeEvent } from "@yaaa/core";
 import { ORCHESTRATOR_MD_HEADERS } from "@yaaa/shared";
 import { CliAuth } from "./auth.js";
 
@@ -183,89 +182,86 @@ export async function executeTask(
     console.log(`Task directory: ${taskDir}`);
   }
 
-  // 1. Initialize core services
-  const store = new SqliteStore(path.join(yaaaDir, "tasks"));
-  const bus = new MessageBus();
-  const permissions = new PermissionEngine();
-
-  // Load preferred model mappings or use defaults
-  const gateway = new MeshGateway({
-    apiKey: configData.accessToken || process.env.MESH_API_KEY || undefined,
-    modelMapping: configData.preferredModels || undefined,
-  });
-
-  const filesProvider = new FilesFs(workingDir);
-
-  // 2. Register dependencies in container
-  container.register("IStore", store);
-  container.register("IBus", bus);
-  container.register("PermissionEngine", permissions);
-  container.register("IMeshGateway", gateway);
-  container.register("capability:files", filesProvider);
-
-  // 3. Register user approval callback
-  permissions.registerApprovalHandler(async (agentId, call) => {
-    if (guiMode) {
-      return askUserApprovalGui(agentId, call);
-    }
-    return askUserApproval(agentId, call);
-  });
-
-  // 4. Subscribe to message bus events for live stdout streaming and orchestrator.md updates
-  bus.subscribe(`task.${taskId}.agent.*.thought`, (topic, msg) => {
-    if (guiMode) {
-      const agentName =
-        topic.split(".").find((p) => p.includes("agent-")) || "agent";
-      console.log(
-        JSON.stringify({
-          event: "thought",
-          from: agentName,
-          content: msg.content,
-        }),
-      );
-    } else {
-      console.log(
-        `\n💬 [\x1b[36mTHOUGHT\x1b[0m] [${msg.from}]: ${msg.content}`,
-      );
-    }
-  });
-
-  bus.subscribe(`task.${taskId}.agent_message`, (topic, msg) => {
-    if (msg.kind === "result") {
-      if (!guiMode) {
-        console.log(
-          `\n✅ [\x1b[32mRESULT\x1b[0m] [${msg.from}]: ${msg.summary}`,
-        );
-        if (msg.artifacts && msg.artifacts.length > 0) {
-          console.log("Artifacts produced:");
-          for (const art of msg.artifacts) {
-            console.log(
-              `  - [${art.mimeType}] ${art.path} : ${art.description}`,
-            );
+  // 1. Compose the engine via the shared core runtime. All provider wiring and
+  //    the bus -> typed-event bridge now live in @yaaa/core; the CLI is just a
+  //    frontend that renders RuntimeEvents and answers approval prompts.
+  const onEvent = (event: RuntimeEvent) => {
+    switch (event.type) {
+      case "plan-updated":
+        if (guiMode) {
+          console.log(JSON.stringify({ event: "plan-updated", plan: event.plan }));
+        }
+        break;
+      case "thought":
+        if (guiMode) {
+          console.log(
+            JSON.stringify({
+              event: "thought",
+              from: event.from,
+              content: event.content,
+            }),
+          );
+        } else {
+          console.log(
+            `\n💬 [\x1b[36mTHOUGHT\x1b[0m] [${event.from}]: ${event.content}`,
+          );
+        }
+        break;
+      case "tool-requested":
+        if (guiMode) {
+          console.log(
+            JSON.stringify({
+              event: "tool-requested",
+              from: event.from,
+              content: event.content,
+            }),
+          );
+        }
+        break;
+      case "status":
+        if (guiMode) {
+          console.log(JSON.stringify({ event: "started", note: event.note }));
+        } else {
+          console.log(
+            `\n🔔 [\x1b[33mSYSTEM\x1b[0m] [${event.from}]: ${event.note}`,
+          );
+        }
+        break;
+      case "result":
+        if (!guiMode) {
+          console.log(
+            `\n✅ [\x1b[32mRESULT\x1b[0m] [${event.from}]: ${event.summary}`,
+          );
+          if (event.artifacts && event.artifacts.length > 0) {
+            console.log("Artifacts produced:");
+            for (const art of event.artifacts) {
+              console.log(
+                `  - [${art.mimeType}] ${art.path} : ${art.description}`,
+              );
+            }
           }
         }
-      }
+        break;
+      // "task-started" is already printed above; "complete" is handled after run().
+      default:
+        break;
     }
+  };
+
+  const runtime = createRuntime({
+    taskId,
+    tasksBaseDir: path.join(yaaaDir, "tasks"),
+    workingDir,
+    apiKey: configData.accessToken || process.env.MESH_API_KEY || undefined,
+    modelMapping: configData.preferredModels || undefined,
+    onEvent,
+    onApproval: async (agentId, call) =>
+      guiMode ? askUserApprovalGui(agentId, call) : askUserApproval(agentId, call),
   });
 
-  bus.subscribe(`task.${taskId}.started`, (topic, msg) => {
-    if (guiMode) {
-      console.log(JSON.stringify({ event: "started", note: msg.note }));
-    } else {
-      console.log(`\n🔔 [\x1b[33mSYSTEM\x1b[0m] [${msg.from}]: ${msg.note}`);
-    }
-  });
-
-  bus.subscribe(`task.${taskId}.plan_updated`, (topic, plan) => {
-    if (guiMode) {
-      console.log(JSON.stringify({ event: "plan-updated", plan }));
-    }
-  });
-
-  // 5. Run task via Supervisor
+  // 2. Run task via the shared core runtime
   try {
-    const supervisor = new Supervisor();
-    const result = await supervisor.runTask(goal, taskId);
+    const result = await runtime.run(goal);
 
     // Update status in main.db
     const mainDbUpdate = auth.getMainDbConnection();
@@ -275,7 +271,7 @@ export async function executeTask(
     mainDbUpdate.close();
 
     // Query facts/ledger to populate final orchestrator.md
-    const ledgerEntries = await store.getLedgerEntries(taskId);
+    const ledgerEntries = await runtime.store.getLedgerEntries(taskId);
     writeOrchestratorMd(
       taskDir,
       taskId,
@@ -286,7 +282,7 @@ export async function executeTask(
     );
 
     // Save active agents
-    const messages = await store.getMessages(taskId);
+    const messages = await runtime.store.getMessages(taskId);
     const agents = messages
       .filter((m: any) => m.from && m.from.includes("agent-"))
       .map((m: any) => m.from);
@@ -318,8 +314,8 @@ export async function executeTask(
     mainDbUpdate.close();
 
     try {
-      const finalPlan = await store.getPlan(taskId);
-      const ledgerEntries = await store.getLedgerEntries(taskId);
+      const finalPlan = await runtime.store.getPlan(taskId);
+      const ledgerEntries = await runtime.store.getLedgerEntries(taskId);
       writeOrchestratorMd(
         taskDir,
         taskId,
@@ -342,7 +338,7 @@ export async function executeTask(
     }
     return false;
   } finally {
-    store.closeAll();
+    runtime.dispose();
     rl.close();
   }
 }
