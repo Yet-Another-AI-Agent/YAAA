@@ -21,6 +21,8 @@ const makeViewModel = (overrides = {}) => ({
   resolveApproval: vi.fn(),
   tasks: [],
   loadTasks: vi.fn().mockResolvedValue(undefined),
+  apiKeyPrompt: null,
+  setApiKeyPrompt: vi.fn(),
   ...overrides,
 });
 

@@ -1,5 +1,21 @@
 import OpenAI from "openai";
 import type { IMeshGateway, ChatMessage, ChatOptions, ModelRole } from "@yaaa/interfaces";
+import { isInsufficientFundsError, INSUFFICIENT_FUNDS_CODE } from "@yaaa/shared";
+
+/**
+ * Normalize provider errors: if the failure means the account is out of
+ * balance/credit, rethrow a clean, stably-coded error the UI can react to.
+ */
+function rethrowGatewayError(err: unknown): never {
+  if (isInsufficientFundsError(err)) {
+    const e = new Error(
+      "Your Mesh API account has insufficient funds. Update your API key or add credit to continue.",
+    ) as Error & { code?: string };
+    e.code = INSUFFICIENT_FUNDS_CODE;
+    throw e;
+  }
+  throw err as Error;
+}
 
 export interface MeshGatewayConfig {
   apiKey?: string;
@@ -49,7 +65,7 @@ export class MeshGateway implements IMeshGateway {
       return response.choices[0]?.message?.content || "";
     } catch (err) {
       console.error(`Mesh API call failed using model ${model} for role ${options.modelRole}:`, err);
-      throw err;
+      rethrowGatewayError(err);
     }
   }
 
@@ -82,7 +98,7 @@ export class MeshGateway implements IMeshGateway {
       }
     } catch (err) {
       console.error(`Mesh API stream call failed using model ${model} for role ${options.modelRole}:`, err);
-      throw err;
+      rethrowGatewayError(err);
     }
   }
 

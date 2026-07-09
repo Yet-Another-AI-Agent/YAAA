@@ -13,6 +13,12 @@ export function useTaskViewModel() {
   const [success, setSuccess] = useState<boolean | null>(null);
   const [tasks, setTasks] = useState<UITask[]>([]);
 
+  // Controls the shared API-key modal. "funds" is set automatically when a run
+  // stops for lack of balance; "manual" is opened from the Settings button.
+  const [apiKeyPrompt, setApiKeyPrompt] = useState<null | "funds" | "manual">(
+    null,
+  );
+
   // Delegate Logging Responsibility
   const { logs, addLog, clearLogs } = useLogState();
 
@@ -117,8 +123,12 @@ export function useTaskViewModel() {
           setSummary(resultData.summary);
           setRunning(false);
           addLog("system", `Task completed. Status: ${resultData.success ? "SUCCESS" : "FAILED"}`);
+          if (resultData.reason === "insufficient_funds") {
+            addLog("system", "⚠️ API account is out of funds — update your key or add credit.");
+            setApiKeyPrompt("funds");
+          }
           loadTasks(); // Reload list to show final status
-          
+
           if (unsubscribeRef.current) {
             unsubscribeRef.current();
             unsubscribeRef.current = null;
@@ -148,6 +158,8 @@ export function useTaskViewModel() {
     resolveApproval,
     tasks,
     loadTasks,
+    apiKeyPrompt,
+    setApiKeyPrompt,
   };
 }
 export type TaskViewModel = ReturnType<typeof useTaskViewModel>;

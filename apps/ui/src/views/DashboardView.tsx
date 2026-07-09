@@ -2,6 +2,8 @@ import { useRef, useEffect, useState, useMemo } from "react";
 import logoImg from "../assets/logo.jpg";
 import type { TaskViewModel } from "../viewmodels/useTaskViewModel";
 import { TaskModel } from "../models/TaskModel";
+import { ApiKeyModal } from "../components/ApiKeyModal";
+import { MissionInput } from "../components/MissionInput";
 import * as shared from "@yaaa/shared";
 const { ORCHESTRATOR_MD_HEADERS } = shared;
 
@@ -219,10 +221,11 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     startTask,
     resolveApproval,
     tasks,
+    apiKeyPrompt,
+    setApiKeyPrompt,
   } = viewModel;
 
   const consoleEndRef = useRef<HTMLDivElement>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [greeting] = useState(getGreeting());
   const [showTaskView, setShowTaskView] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -296,23 +299,8 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     };
   }, [selectedTaskId]);
 
-  // Auto-resize textarea
-  const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setGoal(e.target.value);
-    e.target.style.height = "auto";
-    e.target.style.height = Math.min(e.target.scrollHeight, 200) + "px";
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      if (goal.trim() && !running) startTask();
-    }
-  };
-
   const handleChipClick = (chip: string) => {
     setGoal(chip);
-    textareaRef.current?.focus();
   };
 
   const handleReset = () => {
@@ -570,7 +558,12 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
           </div>
 
           <div className="dash-topbar-right">
-            <button className="icon-btn" title="Settings" aria-label="Settings">
+            <button
+              className="icon-btn"
+              title="API key settings"
+              aria-label="API key settings"
+              onClick={() => setApiKeyPrompt("manual")}
+            >
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <circle cx="12" cy="12" r="3"/>
                 <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
@@ -596,49 +589,13 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
             {/* Mission Orchestrator Input */}
             <div className="mission-orchestrator">
               <div className="mission-label">MISSION ORCHESTRATOR</div>
-              <div className="mission-input-wrapper">
-                <textarea
-                  ref={textareaRef}
-                  className="mission-textarea"
-                  placeholder="What's the mission today?"
-                  value={goal}
-                  onChange={handleInputChange}
-                  onKeyDown={handleKeyDown}
-                  rows={1}
-                  disabled={running}
-                />
-                <div className="mission-actions">
-                  <button className="mission-action-btn" title="Attach file" aria-label="Attach file">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
-                    </svg>
-                  </button>
-                  <button className="mission-action-btn" title="Voice input" aria-label="Voice input">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
-                      <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-                      <line x1="12" y1="19" x2="12" y2="23"/>
-                      <line x1="8" y1="23" x2="16" y2="23"/>
-                    </svg>
-                  </button>
-                  <button
-                    className="mission-send-btn"
-                    onClick={() => startTask()}
-                    disabled={running || !goal.trim()}
-                    title="Launch agent"
-                    aria-label="Launch agent"
-                  >
-                    {running ? (
-                      <span className="send-spinner" />
-                    ) : (
-                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                        <line x1="22" y1="2" x2="11" y2="13"/>
-                        <polygon points="22 2 15 22 11 13 2 9 22 2"/>
-                      </svg>
-                    )}
-                  </button>
-                </div>
-              </div>
+              <MissionInput
+                value={goal}
+                onChange={setGoal}
+                onSubmit={() => startTask()}
+                running={running}
+                placeholder="What's the mission today?"
+              />
               <div className="mission-chips">
                 {SUGGESTION_CHIPS.map((chip) => (
                   <button key={chip} className="chip" onClick={() => handleChipClick(chip)}>
@@ -782,13 +739,20 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
               <div className="slack-chat-input-container">
                 <div className="slack-chat-input-box">
                   <span>
-                    {selectedTaskId && "🔒 Channel is archived. You can view the complete execution log."}
+                    {selectedTaskId && "🔒 Archived channel — send a message to start a new mission."}
                     {!selectedTaskId && running && "⚡ Mission in progress... Agent is running and printing thoughts."}
-                    {!selectedTaskId && !running && success === true && "✅ Mission completed. Channel is archived."}
-                    {!selectedTaskId && !running && success === false && "❌ Mission failed. Channel is archived."}
+                    {!selectedTaskId && !running && success === true && "✅ Mission completed."}
+                    {!selectedTaskId && !running && success === false && "❌ Mission failed."}
                     {!selectedTaskId && !running && success === null && "⚡ Channel initialized. Ready to execute."}
                   </span>
                 </div>
+                <MissionInput
+                  value={goal}
+                  onChange={setGoal}
+                  onSubmit={() => startTask()}
+                  running={running}
+                  placeholder="Message this channel…"
+                />
               </div>
             </div>
             ) : (
@@ -970,6 +934,30 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
           </div>
         )}
       </div>
+
+      {apiKeyPrompt && (
+        <ApiKeyModal
+          overlay
+          title={apiKeyPrompt === "funds" ? "API account out of funds" : "Update Mesh API Key"}
+          description={
+            apiKeyPrompt === "funds"
+              ? "Your last mission stopped because the Mesh API account has no remaining balance."
+              : "Update the Mesh API key used to run missions. It is stored locally in config.json."
+          }
+          notice={
+            apiKeyPrompt === "funds" ? (
+              <>
+                To continue, add credit to your Mesh account in your provider's
+                billing dashboard, or enter a different API key below. The key is
+                stored locally in <code>config.json</code>.
+              </>
+            ) : undefined
+          }
+          submitLabel="Save key"
+          onSaved={() => setApiKeyPrompt(null)}
+          onClose={() => setApiKeyPrompt(null)}
+        />
+      )}
     </div>
   );
 }

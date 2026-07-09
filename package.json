@@ -6,7 +6,7 @@
     "apps/*"
   ],
   "scripts": {
-    "start": "npm start --workspace=apps/cli",
+    "start": "npm run dev:ui",
     "build": "tsc -b",
     "lint": "biome lint .",
     "format": "biome format . --write",

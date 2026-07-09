@@ -1,44 +1,64 @@
 # 🚀 YAAA: Yet Another Agent Architecture
 
-YAAA is a highly modular, event-driven multi-agent framework structured as a TypeScript monorepo. It features a complete decoupled architecture powered by dependency injection, asynchronous message-bus communications, sandboxed execution verification, and a modern Electron dashboard.
+YAAA is a highly modular, event-driven multi-agent framework structured as a TypeScript monorepo. It features a decoupled, clean architecture powered by dependency injection, asynchronous message-bus communication, sandboxed execution verification, and a modern Electron dashboard.
+
+The engine runs **in-process** behind a single typed API. The Electron UI is a thin frontend over that shared core — there is no CLI subprocess and no stdout parsing.
 
 ---
 
 ## 🏛️ System Architecture
 
-YAAA is built on clean architecture principles, separating core domain abstractions from concrete providers and external application layers.
+YAAA follows ports-and-adapters (hexagonal) principles: the UI and the agent engine never touch storage directly. Every database, file, and credential access is funneled through the **interface library** and its providers, and state is segregated into a **global** tier (app-wide) and a **task** tier (per-task folder).
 
 ```mermaid
 graph TD
-    subgraph Applications
-        CLI["apps/cli (CLI Tool)"]
-        UI["apps/ui (Electron UI Dashboard)"]
+    subgraph Frontend
+        UI["apps/ui — Electron dashboard (MVVM: views, viewmodels, models)"]
     end
 
-    subgraph Core Orchestration
-        Orchestrator["packages/orchestrator (Planner, Supervisor, Synthesizer)"]
-        Agents["packages/agents (Outer & Inner Loops, Executor Agents)"]
+    subgraph SharedCore["Shared Core (in-process)"]
+        Core["packages/core — createRuntime() + RuntimeEvent + Workspace"]
+        Orchestrator["packages/orchestrator — Planner, Supervisor, Synthesizer"]
+        Agents["packages/agents — Outer & Inner execution loops"]
     end
 
-    subgraph Platform Abstractions
-        Platform["packages/platform (DI Container, Permissions, Event Bus)"]
-        Interfaces["packages/interfaces (IBus, IStore, IGateway)"]
-        Shared["packages/shared (Types, Event Schemas, Ledger Models)"]
+    subgraph Platform["Platform Abstractions"]
+        Platform2["packages/platform — DI container, PermissionEngine, MessageBus"]
+        Interfaces["packages/interfaces — IStore, IMeshGateway, IBus, IFiles"]
+        Shared["packages/shared — types, Zod schemas, event topics"]
     end
 
-    subgraph Concrete Providers
-        Providers["packages/providers (FilesFS, SQLiteStore, MeshGateway)"]
+    subgraph Providers["Concrete Providers"]
+        Providers2["packages/providers — SqliteStore, FilesFs, MeshGateway"]
     end
 
-    %% Dependencies
-    CLI --> Orchestrator
-    UI --> Orchestrator
-    Orchestrator --> Agents
-    Agents --> Platform
-    Providers --> Interfaces
-    Platform --> Interfaces
+    subgraph State["State (only reached via providers)"]
+        Global["Global tier — ~/.yaaa/config.json + main.db"]
+        Task["Task tier — ~/.yaaa/tasks/&lt;taskId&gt;/ (task.db, working/, orchestrator.md)"]
+        LLM["External LLM API"]
+    end
+
+    UI -->|typed RuntimeEvents + IPC| Core
+    Core --> Orchestrator
+    Core --> Agents
+    Core -->|Workspace| Global
+    Agents --> Platform2
+    Platform2 --> Interfaces
+    Providers2 --> Interfaces
     Interfaces --> Shared
+    Providers2 --> Task
+    Providers2 -->|IMeshGateway| LLM
 ```
+
+### The core contract
+
+`packages/core` is the single composition root and the only surface a frontend talks to:
+
+* **`createRuntime(config)`** — wires the concrete providers (`SqliteStore`, `FilesFs`, `MeshGateway`, `PermissionEngine`, `MessageBus`) into the DI container behind their interfaces, and bridges the internal message bus to a typed event stream.
+* **`RuntimeEvent`** — the typed events a frontend renders: `task-started`, `plan-updated`, `thought`, `tool-requested`, `status`, `result`, `complete`. Frontends subscribe via `onEvent`; approvals are answered via `onApproval`.
+* **`Workspace`** — owns the **global** tier (`config.json` + `main.db`) and the per-task folder lifecycle (scaffolding, `orchestrator.md`, task listing/history). It is the single place these stores are touched.
+
+Because the engine is a library with a typed API, the Electron main process drives it directly — no subprocess, no text protocol.
 
 ---
 
@@ -47,20 +67,19 @@ graph TD
 ```
 yaaa/
 ├── apps/
-│   ├── cli/             # Command-Line Interface to initiate and manage tasks
-│   └── ui/              # Electron-based dashboard, VM views, and approval workflows
+│   └── ui/              # Electron dashboard: views, viewmodels, models, IPC to the core
 ├── packages/
-│   ├── agents/          # Inner & outer execution loops for executing subtasks
-│   ├── interfaces/      # Contract definitions (IBus, IStore, IGateway)
-│   ├── orchestrator/    # Planning, supervising, and output synthesizing logic
-│   ├── platform/        # Dependency Injection (DI), permissions, and central event bus
-│   ├── providers/       # SQLite storage, local file system, and mesh gateway providers
-│   └── shared/          # Shared schemas, Zod definitions, types, and event structures
-├── .agents/
-│   └── AGENTS.md        # AI Agent instructions, project rules, and token saving guidelines
-├── CLAUDE.md            # Knowledge graph MCP tools and local commands reference
-├── tsconfig.json        # TypeScript configuration utilizing project references
-└── biome.json           # Biome configuration for formatting and linting
+│   ├── core/            # createRuntime() + RuntimeEvent + Workspace (shared composition root)
+│   ├── orchestrator/    # Planning, supervising, and output synthesis
+│   ├── agents/          # Inner & outer execution loops for subtasks
+│   ├── platform/        # DI container, PermissionEngine, MessageBus
+│   ├── interfaces/      # Contract definitions (IStore, IMeshGateway, IBus, IFiles)
+│   ├── providers/       # SqliteStore, FilesFs, MeshGateway (concrete implementations)
+│   └── shared/          # Types, Zod schemas, and event-topic definitions
+├── .agents/AGENTS.md    # AI agent instructions and project rules
+├── CLAUDE.md            # Knowledge-graph MCP tools and local commands reference
+├── tsconfig.json        # TypeScript project references
+└── biome.json           # Biome formatting and linting config
 ```
 
 ---
@@ -68,68 +87,50 @@ yaaa/
 ## ⚙️ Core Components
 
 ### 🔄 Orchestration & Loops
-* **OuterLoop**: Solves the task plan's dependency DAG, checking constraints and sequential execution status, and writes facts and assumptions onto the task ledger.
-* **InnerLoop**: The local execution and verification container that invokes agent templates (`FilesAgent`, `VerifierAgent`) to perform targeted actions.
-* **Planner & Supervisor**: Formulates structured steps and watches progress, while the **Synthesizer** combines subtask results into final answers.
+* **OuterLoop**: solves the task plan's dependency DAG, checks constraints and sequencing, and writes facts/assumptions onto the task ledger.
+* **InnerLoop**: the local execution/verification container that invokes agent templates (`FilesAgent`, `VerifierAgent`) to perform targeted actions.
+* **Planner & Supervisor**: the Planner formulates structured steps and the Supervisor watches progress, while the **Synthesizer** combines subtask results into a final answer.
 
 ### 🛡️ Platform & Safety
-* **Event Bus (`IBus`)**: Asynchronous, topic-based event-driven pub/sub communication channels powering notifications and status updates.
-* **Dependency Injection (`container`)**: A platform-wide IoC registry to resolve interface bindings decouple implementations from orchestration.
-* **Permissions Manager**: Enforces security boundaries and sandboxed execution over platform activities.
+* **Interface library (`packages/interfaces`)**: the only doorway to state. `IStore`, `IMeshGateway`, `IBus`, and `IFiles` are implemented by `packages/providers`; nothing else touches a database, file, or credential directly.
+* **State segregation**: global, app-wide state lives in `~/.yaaa` (`config.json`, `main.db`); per-task state lives inside `~/.yaaa/tasks/<taskId>/` (`databases/task.db`, `working/`, `orchestrator.md`), so a task is isolated and portable.
+* **Event Bus (`IBus`)**: asynchronous, topic-based pub/sub powering live status updates, surfaced to the UI as typed `RuntimeEvent`s.
+* **Permissions (`PermissionEngine`)**: enforces capability/path scoping and human-in-the-loop approval for gated tool calls.
 
 ---
 
 ## 🚀 Getting Started
 
 ### Prerequisites
-* **Node.js**: `v18` or higher
-* **npm**: `v9` or higher
+* **Node.js** `v18` or higher
+* **npm** `v9` or higher
 
 ### Installation & Build
 
-1. Clone and install dependencies:
-   ```bash
-   npm install
-   ```
+```bash
+npm install
+npm run build   # tsc -b across the project references
+```
 
-2. Build all packages using TypeScript Project References:
-   ```bash
-   npm run build
-   ```
+> **Native modules:** the core uses `better-sqlite3`, which now loads inside the Electron main process. If you hit an ABI mismatch when launching the UI, rebuild it for Electron once with `npx electron-rebuild` (or `npm rebuild better-sqlite3`).
 
-### Running Applications
+### Running the app
 
-* **Start Electron UI Dashboard**:
-  ```bash
-  npm run dev:ui
-  ```
+```bash
+npm run dev:ui   # starts the Electron dashboard (Vite renderer + Electron main)
+```
 
-* **Run CLI**:
-  ```bash
-  node apps/cli/dist/index.js
-  ```
+Configuration (Mesh API key, preferred models, and your personalization profile) is managed in-app through the onboarding flow and persisted to `~/.yaaa/config.json`.
 
 ---
 
 ## 🧪 Testing, Linting & Formatting
 
-YAAA uses modern tooling for testing and linting to maintain a high-quality codebase.
-
-* **Run Tests with Coverage**:
-  ```bash
-  npm test
-  ```
-  *(Uses Vitest to execute individual unit tests for all packages and generates a coverage summary).*
-
-* **Lint Codebase**:
-  ```bash
-  npm run lint
-  ```
-
-* **Format Codebase**:
-  ```bash
-  npm run format
-  ```
+```bash
+npm test         # Vitest unit tests with coverage
+npm run lint     # Biome lint
+npm run format   # Biome format --write
+```
 
 ---
 
@@ -139,9 +140,9 @@ This codebase is configured with a persistent knowledge graph via `code-review-g
 
 * **Rebuild Graph**:
   ```bash
-  CRG_DATA_DIR="$HOME/.code-review-graph/yaaa" npx code-review-graph build
+  CRG_DATA_DIR="$HOME/.code-review-graph/yaaa" code-review-graph build --repo "$(pwd)"
   ```
 * **Check Status**:
   ```bash
-  CRG_DATA_DIR="$HOME/.code-review-graph/yaaa" npx code-review-graph status
+  CRG_DATA_DIR="$HOME/.code-review-graph/yaaa" code-review-graph status --repo "$(pwd)"
   ```

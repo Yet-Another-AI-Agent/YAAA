@@ -1,6 +1,6 @@
 import type { IBus, IStore } from "@yaaa/interfaces";
 import { container } from "@yaaa/platform";
-import type { TaskPlan, LedgerEntry, Subtask } from "@yaaa/shared";
+import { type TaskPlan, type LedgerEntry, type Subtask, isInsufficientFundsError } from "@yaaa/shared";
 import { InnerLoop } from "./inner-loop.js";
 
 export class OuterLoop {
@@ -86,9 +86,15 @@ export class OuterLoop {
           facts.push(`Subtask ${subtask.id} finished. Summary: ${result.summary || JSON.stringify(result)}`);
           
         } catch (err: any) {
+          // Out-of-funds is non-recoverable: abort the whole run immediately so
+          // the caller can prompt the user to update their key / add credit,
+          // rather than churning through every subtask with the same failure.
+          if (isInsufficientFundsError(err)) {
+            throw err;
+          }
           subtaskStates[subtask.id] = "failed";
           facts.push(`Subtask ${subtask.id} failed. Error: ${err.message}`);
-          
+
           // Re-evaluate strategy or retry
           console.error(`Subtask ${subtask.id} failed:`, err);
         }

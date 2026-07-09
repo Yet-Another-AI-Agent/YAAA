@@ -1,15 +1,21 @@
 import { app, BrowserWindow, ipcMain } from "electron";
 import path from "node:path";
-import fs from "node:fs";
-import os from "node:os";
 import { fileURLToPath } from "node:url";
-import { spawn, execSync } from "node:child_process";
+import { Workspace } from "@yaaa/core";
+import { isInsufficientFundsError } from "@yaaa/shared";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 let mainWindow = null;
-let cliProcess = null;
+
+// Single shared workspace: owns config.json + main.db + per-task folders.
+const workspace = new Workspace();
+
+// Pending human-in-the-loop approvals, keyed by a per-call approval id.
+// The core runtime's `onApproval` hook parks a promise here; the renderer
+// resolves it via the "resolve-approval" IPC channel.
+const pendingApprovals = new Map();
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -35,405 +41,151 @@ function createWindow() {
   });
 }
 
-// IPC Handlers called by Renderer Process
-ipcMain.handle("start-task", async (event, goal) => {
-  if (cliProcess) {
-    try {
-      cliProcess.kill();
-    } catch (e) {}
-    cliProcess = null;
+function sendToRenderer(channel, payload) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send(channel, payload);
   }
+}
 
-  const taskId = `task-${Math.random().toString(36).substr(2, 6)}`;
-
-  // Resolve path to CLI compiled index.js
-  const cliPath = path.resolve(__dirname, "../cli/dist/index.js");
-
-  console.log(`[Spawn CLI] Path: ${cliPath}, Goal: "${goal}"`);
-
-  // Spawn CLI tool as a subprocess in GUI mode
-  cliProcess = spawn("node", [cliPath, "task", "-n", goal, "--gui"], {
-    cwd: path.resolve(__dirname, "../cli"), // Run from CLI package context
-  });
-
-  let buffer = "";
-
-  cliProcess.stdout.on("data", (data) => {
-    buffer += data.toString();
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-
-      try {
-        const payload = JSON.parse(trimmed);
-
-        if (!mainWindow || mainWindow.isDestroyed()) continue;
-
-        if (payload.event === "plan-updated") {
-          mainWindow.webContents.send("task-event", {
-            topic: `task.${taskId}.plan_updated`,
-            data: payload.plan,
-          });
-        } else if (payload.event === "task-started") {
-          mainWindow.webContents.send("task-event", {
-            topic: `task.${taskId}.task-started`,
-            data: { taskId: payload.taskId },
-          });
-        } else if (payload.event === "thought") {
-          mainWindow.webContents.send("task-event", {
-            topic: `task.${taskId}.agent.${payload.from}.thought`,
-            data: { content: payload.content },
-          });
-        } else if (payload.event === "tool-requested") {
-          mainWindow.webContents.send("task-event", {
-            topic: `task.${taskId}.agent.${payload.from}.tool_requested`,
-            data: { content: payload.content },
-          });
-        } else if (payload.event === "started") {
-          mainWindow.webContents.send("task-event", {
-            topic: `task.${taskId}.started`,
-            data: { note: payload.note },
-          });
-        } else if (payload.event === "approval-required") {
-          // Adjust call ID so UI matches it
-          payload.toolCall.id = `${taskId}-${payload.toolCall.id}`;
-          mainWindow.webContents.send("approval-required", {
-            agentId: payload.agentId,
-            toolCall: payload.toolCall,
-          });
-        } else if (payload.event === "complete") {
-          mainWindow.webContents.send("task-complete", payload.result);
-        }
-      } catch (err) {
-        // Log non-JSON lines as system updates
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send("task-event", {
-            topic: `task.${taskId}.started`,
-            data: { note: trimmed },
-          });
-        }
-      }
-    }
-  });
-
-  cliProcess.stderr.on("data", (data) => {
-    const errorText = data.toString().trim();
-    if (errorText && mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("task-event", {
-        topic: `task.${taskId}.started`,
-        data: { note: `[CLI Error] ${errorText}` },
+/**
+ * Translate a typed RuntimeEvent from the core into the topic/data shape the
+ * renderer already consumes (previously produced by parsing CLI stdout).
+ */
+function forwardRuntimeEvent(taskId, event) {
+  switch (event.type) {
+    case "task-started":
+      sendToRenderer("task-event", {
+        topic: `task.${taskId}.task-started`,
+        data: { taskId: event.taskId },
       });
-    }
-  });
-
-  cliProcess.on("close", (code) => {
-    console.log(`[CLI Terminated] Exit code: ${code}`);
-    cliProcess = null;
-  });
-
-  return taskId;
-});
-
-ipcMain.handle("resolve-approval", async (event, { callId, approved }) => {
-  if (cliProcess) {
-    console.log(
-      `[IPC Resolve Approval] Writing to CLI stdin: ${approved ? "y" : "n"}`,
-    );
-    cliProcess.stdin.write(approved ? "y\n" : "n\n");
-    return { status: "success" };
-  }
-  return { status: "error", error: "No active CLI process found" };
-});
-
-ipcMain.handle("list-tasks", async (event) => {
-  return new Promise((resolve) => {
-    const cliPath = path.resolve(__dirname, "../cli/dist/index.js");
-    const child = spawn("node", [cliPath, "task", "-ls", "--gui"], {
-      cwd: path.resolve(__dirname, "../cli"),
-    });
-
-    let output = "";
-    child.stdout.on("data", (data) => {
-      output += data.toString();
-    });
-
-    child.on("error", (err) => {
-      console.error("Failed to spawn CLI process:", err);
-      resolve([]);
-    });
-
-    child.on("close", () => {
-      try {
-        const lines = output.split("\n");
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed.startsWith("{")) {
-            const parsed = JSON.parse(trimmed);
-            if (parsed.event === "task-list") {
-              resolve(parsed.tasks);
-              return;
-            }
-          }
-        }
-      } catch (err) {
-        console.error("Failed to parse task-list JSON output:", err);
-      }
-      resolve([]);
-    });
-  });
-});
-
-/**
- * IPC handler to retrieve the chat history messages for a specific task using CLI.
- */
-ipcMain.handle("get-task-history", async (event, taskId) => {
-  if (typeof taskId !== "string" || !/^[a-zA-Z0-9-]+$/.test(taskId)) {
-    console.error(`Invalid taskId: ${taskId}`);
-    return [];
-  }
-  return new Promise((resolve) => {
-    const cliPath = path.resolve(__dirname, "../cli/dist/index.js");
-    const child = spawn("node", [cliPath, "task", "--history", taskId, "--gui"], {
-      cwd: path.resolve(__dirname, "../cli"),
-    });
-
-    let output = "";
-    let errorOutput = "";
-
-    const timeout = setTimeout(() => {
-      console.error("get-task-history process timed out. Killing child.");
-      child.kill();
-      resolve([]);
-    }, 10000);
-
-    child.stdout.on("data", (data) => {
-      output += data.toString();
-    });
-
-    child.stderr.on("data", (data) => {
-      errorOutput += data.toString();
-    });
-
-    child.on("error", (err) => {
-      clearTimeout(timeout);
-      console.error("Failed to spawn CLI process for get-task-history:", err);
-      resolve([]);
-    });
-
-    child.on("close", () => {
-      clearTimeout(timeout);
-      if (errorOutput) {
-        console.error("get-task-history CLI stderr output:", errorOutput);
-      }
-      const lines = output.split("\n");
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.startsWith("{")) {
-          try {
-            const parsed = JSON.parse(trimmed);
-            if (parsed && parsed.event === "task-history") {
-              resolve(parsed.messages || []);
-              return;
-            }
-          } catch (err) {
-            console.error("Failed to parse task-history JSON line:", err);
-          }
-        }
-      }
-      resolve([]);
-    });
-  });
-});
-
-ipcMain.handle("read-task-orchestrator", async (event, taskId) => {
-  if (typeof taskId !== "string" || !/^[a-zA-Z0-9-]+$/.test(taskId)) {
-    console.error(`Invalid taskId: ${taskId}`);
-    return null;
-  }
-  const yaaaDir = process.env.YAAA_DATA_DIR || path.join(os.homedir(), ".yaaa");
-  const tasksDir = path.join(yaaaDir, "tasks");
-  const mdPath = path.join(tasksDir, taskId, "orchestrator.md");
-
-  // check that the resolved mdPath starts with the expected tasks folder
-  const resolvedMdPath = path.resolve(mdPath);
-  const resolvedTasksDir = path.resolve(tasksDir);
-  if (!resolvedMdPath.startsWith(resolvedTasksDir)) {
-    console.error(`Path traversal detected: ${mdPath}`);
-    return null;
-  }
-
-  try {
-    if (fs.existsSync(resolvedMdPath)) {
-      return fs.readFileSync(resolvedMdPath, "utf-8");
-    }
-  } catch (err) {
-    console.error(`Failed to read orchestrator for task ${taskId}:`, err);
-  }
-  return null;
-});
-
-ipcMain.handle("get-yaaa-dir", async (event) => {
-  return process.env.YAAA_DATA_DIR || path.join(os.homedir(), ".yaaa");
-});
-
-/**
- * Loads the local configuration from config.json.
- * @returns {object} The parsed configuration object.
- */
-function loadConfig() {
-  const yaaaDir = process.env.YAAA_DATA_DIR || path.join(os.homedir(), ".yaaa");
-  const configPath = path.join(yaaaDir, "config.json");
-  if (!fs.existsSync(configPath)) {
-    return {};
-  }
-  try {
-    const raw = fs.readFileSync(configPath, "utf-8");
-    return JSON.parse(raw);
-  } catch (e) {
-    return {};
+      break;
+    case "plan-updated":
+      sendToRenderer("task-event", {
+        topic: `task.${taskId}.plan_updated`,
+        data: event.plan,
+      });
+      break;
+    case "thought":
+      sendToRenderer("task-event", {
+        topic: `task.${taskId}.agent.${event.from}.thought`,
+        data: { content: event.content },
+      });
+      break;
+    case "tool-requested":
+      sendToRenderer("task-event", {
+        topic: `task.${taskId}.agent.${event.from}.tool_requested`,
+        data: { content: event.content },
+      });
+      break;
+    case "status":
+      sendToRenderer("task-event", {
+        topic: `task.${taskId}.started`,
+        data: { note: event.note },
+      });
+      break;
+    // "result" is surfaced through the final "complete" payload; "complete"
+    // is handled by the run() caller below.
+    default:
+      break;
   }
 }
 
-/**
- * Saves the configuration object to config.json.
- * @param {object} config - The configuration data to save.
- */
-function saveConfig(config) {
-  const yaaaDir = process.env.YAAA_DATA_DIR || path.join(os.homedir(), ".yaaa");
-  if (!fs.existsSync(yaaaDir)) {
-    fs.mkdirSync(yaaaDir, { recursive: true });
-  }
-  const configPath = path.join(yaaaDir, "config.json");
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
+function makeApprovalHandler(taskId) {
+  return (agentId, call) =>
+    new Promise((resolve) => {
+      const approvalId = `${taskId}:${call.id ?? "call"}:${Date.now()}`;
+      pendingApprovals.set(approvalId, resolve);
+      sendToRenderer("approval-required", {
+        agentId,
+        toolCall: { ...call, id: approvalId },
+      });
+    });
 }
 
-/**
- * IPC handler to check if user has Mesh key and personalization profile set up.
- */
-ipcMain.handle("get-onboarding-status", async () => {
-  const config = loadConfig();
-  return {
-    hasKey: !!config.accessToken,
-    hasProfile: !!config.userName,
-    skipped: !!config.skipOnboarding,
-  };
+// ------------------------------------------------------------------ IPC: tasks
+
+ipcMain.handle("start-task", async (_event, goal) => {
+  // Scaffold synchronously so we can hand the id back before the run streams.
+  const task = workspace.createTask(goal);
+
+  // Defer the run one tick so the renderer can attach its event listeners
+  // (which it does immediately after awaiting this handler) before events fly.
+  setTimeout(() => {
+    workspace
+      .runTask(goal, task, {
+        onEvent: (event) => forwardRuntimeEvent(task.taskId, event),
+        onApproval: makeApprovalHandler(task.taskId),
+      })
+      .then((result) => {
+        const reason =
+          !result.success && isInsufficientFundsError(result.summary)
+            ? "insufficient_funds"
+            : undefined;
+        sendToRenderer("task-complete", { ...result, reason });
+      })
+      .catch((err) => {
+        sendToRenderer("task-complete", {
+          success: false,
+          summary: err?.message ?? String(err),
+          reason: isInsufficientFundsError(err) ? "insufficient_funds" : undefined,
+        });
+      });
+  }, 0);
+
+  return task.taskId;
 });
 
-/**
- * IPC handler to retrieve the saved onboarding personalization profile.
- */
-ipcMain.handle("get-onboarding-profile", async () => {
-  const config = loadConfig();
-  return {
-    name: config.userName || "",
-    profession: config.userProfession || "",
-    description: config.userDescription || "",
-  };
+ipcMain.handle("resolve-approval", async (_event, { callId, approved }) => {
+  const resolve = pendingApprovals.get(callId);
+  if (!resolve) {
+    return { status: "error", error: "No pending approval for that id" };
+  }
+  pendingApprovals.delete(callId);
+  resolve(!!approved);
+  return { status: "success" };
 });
 
-/**
- * IPC handler to save the Mesh API access key.
- */
-ipcMain.handle("save-onboarding-keys", async (event, key) => {
-  const config = loadConfig();
-  config.accessToken = key;
-  saveConfig(config);
-  return { success: true };
-});
+ipcMain.handle("list-tasks", async () => workspace.listTasks());
 
-/**
- * IPC handler to save onboarding personalization details.
- */
-ipcMain.handle(
-  "save-onboarding-profile",
-  async (event, { name, profession, description, skip } = {}) => {
-    const config = loadConfig();
-    if (name !== undefined) config.userName = name;
-    if (profession !== undefined) config.userProfession = profession;
-    if (description !== undefined) config.userDescription = description;
-    if (skip) {
-      config.skipOnboarding = true;
-    }
-    saveConfig(config);
-    return { success: true };
-  },
+ipcMain.handle("get-task-history", async (_event, taskId) =>
+  workspace.getTaskHistory(taskId),
 );
 
-/**
- * IPC handler to parse resume content via CLI utility.
- */
-ipcMain.handle("parse-resume", async (event, text) => {
-  return new Promise((resolve) => {
-    const cliPath = path.resolve(__dirname, "../cli/dist/index.js");
-    const child = spawn("node", [cliPath, "config", "--parse-resume"], {
-      cwd: path.resolve(__dirname, "../cli"),
-    });
+ipcMain.handle("read-task-orchestrator", async (_event, taskId) =>
+  workspace.readOrchestrator(taskId),
+);
 
-    let output = "";
-    let errorOutput = "";
+ipcMain.handle("get-yaaa-dir", async () => workspace.getYaaaDir());
 
-    const timeout = setTimeout(() => {
-      console.error("parse-resume process timed out. Killing child.");
-      child.kill();
-      resolve({ error: "Resume parsing timed out" });
-    }, 30000);
+// ------------------------------------------------------------ IPC: onboarding
 
-    // Write resume text to CLI stdin
-    child.stdin.write(text || "");
-    child.stdin.end();
+ipcMain.handle("get-onboarding-status", async () =>
+  workspace.getOnboardingStatus(),
+);
 
-    child.stdout.on("data", (data) => {
-      output += data.toString();
-    });
+ipcMain.handle("get-onboarding-profile", async () =>
+  workspace.getOnboardingProfile(),
+);
 
-    child.stderr.on("data", (data) => {
-      errorOutput += data.toString();
-    });
+ipcMain.handle("save-onboarding-keys", async (_event, key) =>
+  workspace.saveKey(key),
+);
 
-    child.on("close", (code) => {
-      clearTimeout(timeout);
-      try {
-        const startIndex = output.indexOf("{");
-        if (startIndex !== -1) {
-          const jsonString = output.substring(
-            startIndex,
-            output.lastIndexOf("}") + 1,
-          );
-          const parsed = JSON.parse(jsonString);
-          resolve(parsed);
-        } else {
-          resolve({ error: "No JSON found in CLI output", raw: output });
-        }
-      } catch (err) {
-        resolve({ error: "Failed to parse CLI output", raw: output });
-      }
-    });
+ipcMain.handle("save-onboarding-profile", async (_event, profile = {}) =>
+  workspace.saveProfile(profile),
+);
 
-    child.on("error", (err) => {
-      clearTimeout(timeout);
-      resolve({ error: err.message });
-    });
-  });
+ipcMain.handle("parse-resume", async (_event, text) => {
+  try {
+    return await workspace.parseResume(text ?? "");
+  } catch (err) {
+    return { error: err?.message ?? String(err) };
+  }
 });
 
-app.whenReady().then(() => {
-  const isDev = !app.isPackaged;
-  if (isDev) {
-    const cliPath = path.resolve(__dirname, "../cli/dist/index.js");
-    if (!fs.existsSync(cliPath)) {
-      console.log("[Electron] CLI build not found. Compiling monorepo...");
-      try {
-        execSync("npm run build", { cwd: path.resolve(__dirname, "../..") });
-        console.log("[Electron] CLI compiled successfully.");
-      } catch (err) {
-        console.error("[Electron] Failed to compile CLI on startup:", err);
-      }
-    }
-  }
+// ------------------------------------------------------------------- lifecycle
 
+app.whenReady().then(() => {
   createWindow();
 
   app.on("activate", () => {
@@ -444,11 +196,6 @@ app.whenReady().then(() => {
 });
 
 app.on("window-all-closed", () => {
-  if (cliProcess) {
-    try {
-      cliProcess.kill();
-    } catch (e) {}
-  }
   if (process.platform !== "darwin") {
     app.quit();
   }

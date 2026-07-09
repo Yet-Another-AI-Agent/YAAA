@@ -1,7 +1,7 @@
 import React from "react";
 import logoImg from "../assets/logo.jpg";
 import { TaskModel } from "../models/TaskModel";
-import { isValidMeshApiKey } from "../utils/validation";
+import { ApiKeyModal } from "../components/ApiKeyModal";
 
 interface SplashViewProps {
   onAnimationEnd: () => void;
@@ -13,8 +13,6 @@ export function SplashView({ onAnimationEnd }: SplashViewProps) {
   );
 
   // Form states
-  const [apiKey, setApiKey] = React.useState("");
-  const [apiKeyError, setApiKeyError] = React.useState("");
   const [name, setName] = React.useState("");
   const [profession, setProfession] = React.useState("");
   const [description, setDescription] = React.useState("");
@@ -73,21 +71,9 @@ export function SplashView({ onAnimationEnd }: SplashViewProps) {
     };
   }, [onAnimationEnd]);
 
-  const handleSaveKey = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!apiKey.trim()) {
-      setApiKeyError("Mesh API Key cannot be empty.");
-      return;
-    }
-    if (!isValidMeshApiKey(apiKey)) {
-      setApiKeyError(
-        "Please enter a valid Mesh API Key (it should start with 'mesh_' and be at least 8 characters after the prefix).",
-      );
-      return;
-    }
-    setApiKeyError("");
+  // Called by ApiKeyModal after the key is persisted; decides the next step.
+  const handleKeyContinue = async () => {
     try {
-      await TaskModel.saveOnboardingKeys(apiKey.trim());
       const newStatus = await TaskModel.getOnboardingStatus();
       if (!newStatus.hasProfile && !newStatus.skipped) {
         setStep("step-b");
@@ -95,8 +81,8 @@ export function SplashView({ onAnimationEnd }: SplashViewProps) {
         onAnimationEnd();
       }
     } catch (err) {
-      console.error("Failed to save key:", err);
-      setApiKeyError("Failed to save API key. Please try again.");
+      console.error("Failed to check status after saving key:", err);
+      onAnimationEnd();
     }
   };
 
@@ -172,35 +158,7 @@ export function SplashView({ onAnimationEnd }: SplashViewProps) {
     return (
       <div className="splash-container">
         <div className="splash-glow" />
-        <div className="glass-card onboarding-container">
-          <h2 className="onboarding-title">Mesh API Key Configuration</h2>
-          <p className="onboarding-desc">
-            To start running agentic workflows, please configure your Mesh API
-            Key. This will be stored locally in config.json.
-          </p>
-          <form onSubmit={handleSaveKey} className="onboarding-form">
-            <div className="form-group">
-              <label className="form-label" htmlFor="mesh-api-key">Mesh API Access Key</label>
-              <input
-                id="mesh-api-key"
-                type="password"
-                className="task-input"
-                placeholder="Enter Mesh API Key (e.g. mesh_...)"
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-                autoFocus
-              />
-              {apiKeyError && (
-                <div className="error-message">{apiKeyError}</div>
-              )}
-            </div>
-            <div className="onboarding-actions">
-              <button type="submit" className="btn btn-primary">
-                Save & Continue
-              </button>
-            </div>
-          </form>
-        </div>
+        <ApiKeyModal onSaved={handleKeyContinue} />
       </div>
     );
   }

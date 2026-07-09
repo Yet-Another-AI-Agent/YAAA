@@ -1,11 +1,11 @@
 /**
  * Validates a Mesh API key.
  *
- * A valid key must start with the `mesh_` prefix and have at least 8
- * characters (letters, digits, underscores or hyphens) after the prefix.
+ * Keys come from different providers and do not share a single prefix, so we
+ * only require a non-empty token of at least 8 non-whitespace characters.
  * The input is trimmed before validation.
  */
 export function isValidMeshApiKey(key: string): boolean {
   const trimmed = key.trim();
-  return /^mesh_[A-Za-z0-9_-]{8,}$/.test(trimmed);
+  return /^\S{8,}$/.test(trimmed);
 }
