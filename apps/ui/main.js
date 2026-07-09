@@ -2,6 +2,7 @@ import { app, BrowserWindow, ipcMain } from "electron";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Workspace } from "@yaaa/core";
+import { isInsufficientFundsError } from "@yaaa/shared";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -116,12 +117,17 @@ ipcMain.handle("start-task", async (_event, goal) => {
         onApproval: makeApprovalHandler(task.taskId),
       })
       .then((result) => {
-        sendToRenderer("task-complete", result);
+        const reason =
+          !result.success && isInsufficientFundsError(result.summary)
+            ? "insufficient_funds"
+            : undefined;
+        sendToRenderer("task-complete", { ...result, reason });
       })
       .catch((err) => {
         sendToRenderer("task-complete", {
           success: false,
           summary: err?.message ?? String(err),
+          reason: isInsufficientFundsError(err) ? "insufficient_funds" : undefined,
         });
       });
   }, 0);

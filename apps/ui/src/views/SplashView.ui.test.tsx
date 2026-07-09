@@ -73,7 +73,7 @@ describe("SplashView", () => {
 
       expect(screen.getByText("Mesh API Key Configuration")).toBeTruthy();
       expect(
-        screen.getByPlaceholderText("Enter Mesh API Key (e.g. mesh_...)"),
+        screen.getByPlaceholderText("Enter your Mesh API Key"),
       ).toBeTruthy();
     });
 
@@ -115,17 +115,16 @@ describe("SplashView", () => {
         await vi.advanceTimersByTimeAsync(3000);
       });
 
-      const input = screen.getByPlaceholderText(
-        "Enter Mesh API Key (e.g. mesh_...)",
-      );
-      fireEvent.change(input, { target: { value: "notavalidkey" } });
+      const input = screen.getByPlaceholderText("Enter your Mesh API Key");
+      // Too short (< 8 chars) → invalid under the relaxed rule.
+      fireEvent.change(input, { target: { value: "short" } });
 
       const submitButton = screen.getByText("Save & Continue");
       fireEvent.click(submitButton);
 
       expect(
         screen.getByText(
-          "Please enter a valid Mesh API Key (it should start with 'mesh_').",
+          "Please enter a valid Mesh API Key (at least 8 characters, no spaces).",
         ),
       ).toBeTruthy();
       expect(saveKeysMock).not.toHaveBeenCalled();

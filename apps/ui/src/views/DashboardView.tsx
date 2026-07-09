@@ -2,6 +2,7 @@ import { useRef, useEffect, useState, useMemo } from "react";
 import logoImg from "../assets/logo.jpg";
 import type { TaskViewModel } from "../viewmodels/useTaskViewModel";
 import { TaskModel } from "../models/TaskModel";
+import { ApiKeyModal } from "../components/ApiKeyModal";
 import * as shared from "@yaaa/shared";
 const { ORCHESTRATOR_MD_HEADERS } = shared;
 
@@ -219,6 +220,8 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     startTask,
     resolveApproval,
     tasks,
+    needsApiKey,
+    setNeedsApiKey,
   } = viewModel;
 
   const consoleEndRef = useRef<HTMLDivElement>(null);
@@ -970,6 +973,24 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
           </div>
         )}
       </div>
+
+      {needsApiKey && (
+        <ApiKeyModal
+          overlay
+          title="API account out of funds"
+          description="Your last mission stopped because the Mesh API account has no remaining balance."
+          notice={
+            <>
+              To continue, add credit to your Mesh account in your provider's
+              billing dashboard, or enter a different API key below. The key is
+              stored locally in <code>config.json</code>.
+            </>
+          }
+          submitLabel="Save key & continue"
+          onSaved={() => setNeedsApiKey(false)}
+          onClose={() => setNeedsApiKey(false)}
+        />
+      )}
     </div>
   );
 }

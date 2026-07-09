@@ -115,7 +115,11 @@ export class TaskModel {
   static subscribeEvents(
     onEvent: (eventData: { topic: string; data: any }) => void,
     onApproval: (approvalData: { agentId: string; toolCall: any }) => void,
-    onComplete: (resultData: { success: boolean; summary: string }) => void,
+    onComplete: (resultData: {
+      success: boolean;
+      summary: string;
+      reason?: string;
+    }) => void,
   ): () => void {
     const api = this.getElectronAPI();
 
