@@ -1,6 +1,7 @@
 import { app, BrowserWindow, ipcMain } from "electron";
 import path from "node:path";
 import fs from "node:fs";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { spawn, execSync } from "node:child_process";
 
@@ -51,7 +52,7 @@ ipcMain.handle("start-task", async (event, goal) => {
   console.log(`[Spawn CLI] Path: ${cliPath}, Goal: "${goal}"`);
 
   // Spawn CLI tool as a subprocess in GUI mode
-  cliProcess = spawn("node", [cliPath, "--gui", goal], {
+  cliProcess = spawn("node", [cliPath, "task", "-n", goal, "--gui"], {
     cwd: path.resolve(__dirname, "../cli"), // Run from CLI package context
   });
 
@@ -75,6 +76,11 @@ ipcMain.handle("start-task", async (event, goal) => {
           mainWindow.webContents.send("task-event", {
             topic: `task.${taskId}.plan_updated`,
             data: payload.plan,
+          });
+        } else if (payload.event === "task-started") {
+          mainWindow.webContents.send("task-event", {
+            topic: `task.${taskId}.task-started`,
+            data: { taskId: payload.taskId },
           });
         } else if (payload.event === "thought") {
           mainWindow.webContents.send("task-event", {
@@ -138,6 +144,75 @@ ipcMain.handle("resolve-approval", async (event, { callId, approved }) => {
     return { status: "success" };
   }
   return { status: "error", error: "No active CLI process found" };
+});
+
+ipcMain.handle("list-tasks", async (event) => {
+  return new Promise((resolve) => {
+    const cliPath = path.resolve(__dirname, "../cli/dist/index.js");
+    const child = spawn("node", [cliPath, "task", "-ls", "--gui"], {
+      cwd: path.resolve(__dirname, "../cli"),
+    });
+
+    let output = "";
+    child.stdout.on("data", (data) => {
+      output += data.toString();
+    });
+
+    child.on("error", (err) => {
+      console.error("Failed to spawn CLI process:", err);
+      resolve([]);
+    });
+
+    child.on("close", () => {
+      try {
+        const lines = output.split("\n");
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith("{")) {
+            const parsed = JSON.parse(trimmed);
+            if (parsed.event === "task-list") {
+              resolve(parsed.tasks);
+              return;
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Failed to parse task-list JSON output:", err);
+      }
+      resolve([]);
+    });
+  });
+});
+
+ipcMain.handle("read-task-orchestrator", async (event, taskId) => {
+  if (typeof taskId !== "string" || !/^[a-zA-Z0-9-]+$/.test(taskId)) {
+    console.error(`Invalid taskId: ${taskId}`);
+    return null;
+  }
+  const yaaaDir = process.env.YAAA_DATA_DIR || path.join(os.homedir(), ".yaaa");
+  const tasksDir = path.join(yaaaDir, "tasks");
+  const mdPath = path.join(tasksDir, taskId, "orchestrator.md");
+
+  // check that the resolved mdPath starts with the expected tasks folder
+  const resolvedMdPath = path.resolve(mdPath);
+  const resolvedTasksDir = path.resolve(tasksDir);
+  if (!resolvedMdPath.startsWith(resolvedTasksDir)) {
+    console.error(`Path traversal detected: ${mdPath}`);
+    return null;
+  }
+
+  try {
+    if (fs.existsSync(resolvedMdPath)) {
+      return fs.readFileSync(resolvedMdPath, "utf-8");
+    }
+  } catch (err) {
+    console.error(`Failed to read orchestrator for task ${taskId}:`, err);
+  }
+  return null;
+});
+
+ipcMain.handle("get-yaaa-dir", async (event) => {
+  return process.env.YAAA_DATA_DIR || path.join(os.homedir(), ".yaaa");
 });
 
 app.whenReady().then(() => {

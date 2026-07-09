@@ -31,6 +31,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import Database from 'better-sqlite3';
 
 export interface ModelConfig {
   id: string;
@@ -41,6 +42,8 @@ export interface ModelConfig {
 
 export interface AuthConfig {
   accessToken: string;
+  meshKeys?: Record<string, string>;
+  preferredModels?: Record<string, string>;
   models: ModelConfig[];
   mainModel: string;          // default model for workers
   orchestratorModel: string;  // the "queen" model for planning/orchestration
@@ -62,9 +65,53 @@ const DEFAULT_MODELS: ModelConfig[] = [
 
 export class CliAuth {
   private configPath: string;
+  private yaaaDir: string;
 
   constructor(configPath?: string) {
-    this.configPath = configPath ?? path.join(os.homedir(), '.yaaa', 'config.json');
+    this.yaaaDir = process.env.YAAA_DATA_DIR ?? path.join(os.homedir(), '.yaaa');
+    this.configPath = configPath ?? path.join(this.yaaaDir, 'config.json');
+    if (!fs.existsSync(this.yaaaDir)) {
+      fs.mkdirSync(this.yaaaDir, { recursive: true });
+      fs.chmodSync(this.yaaaDir, 0o700);
+    }
+  }
+
+  getYaaaDir(): string {
+    return this.yaaaDir;
+  }
+
+  loadConfig(): Partial<AuthConfig> {
+    if (!fs.existsSync(this.configPath)) {
+      return {};
+    }
+    try {
+      const raw = fs.readFileSync(this.configPath, 'utf-8');
+      return JSON.parse(raw);
+    } catch {
+      return {};
+    }
+  }
+
+  saveConfig(config: Partial<AuthConfig>): void {
+    fs.writeFileSync(this.configPath, JSON.stringify(config, null, 2), { encoding: 'utf-8', mode: 0o600 });
+    if (fs.existsSync(this.configPath)) {
+      fs.chmodSync(this.configPath, 0o600);
+    }
+  }
+
+  getMainDbConnection(): Database.Database {
+    const dbPath = path.join(this.yaaaDir, 'main.db');
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY,
+        prompt TEXT NOT NULL,
+        status TEXT NOT NULL,
+        path TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    return db;
   }
 
   /**

@@ -57,6 +57,35 @@ describe("TaskModel", () => {
     });
   });
 
+  describe("listTasks()", () => {
+    it("calls electronAPI.listTasks", async () => {
+      const listTasksMock = vi.fn().mockResolvedValue([
+        { id: "task-1", prompt: "Test", status: "success", created_at: "2026-07-08" }
+      ]);
+      (window as any).electronAPI = { listTasks: listTasksMock };
+
+      const result = await TaskModel.listTasks();
+
+      expect(listTasksMock).toHaveBeenCalledOnce();
+      expect(result).toEqual([
+        { id: "task-1", prompt: "Test", status: "success", created_at: "2026-07-08" }
+      ]);
+    });
+  });
+
+  describe("readTaskOrchestrator()", () => {
+    it("calls electronAPI.readTaskOrchestrator with the taskId", async () => {
+      const readTaskOrchestratorMock = vi.fn().mockResolvedValue("# Plan\n");
+      (window as any).electronAPI = { readTaskOrchestrator: readTaskOrchestratorMock };
+
+      const result = await TaskModel.readTaskOrchestrator("task-999");
+
+      expect(readTaskOrchestratorMock).toHaveBeenCalledOnce();
+      expect(readTaskOrchestratorMock).toHaveBeenCalledWith("task-999");
+      expect(result).toBe("# Plan\n");
+    });
+  });
+
   describe("subscribeEvents()", () => {
     it("wires up all three callbacks and returned fn calls all unsubscribers", () => {
       const unsubEvent = vi.fn();
