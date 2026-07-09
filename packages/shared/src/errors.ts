@@ -29,5 +29,20 @@ export function isInsufficientFundsError(input: unknown): boolean {
   }
 
   const msg = (typeof input === "string" ? input : (any?.message ?? "")).toString().toLowerCase();
-  return /insufficient (funds|balance|quota|credits?)|not enough (balance|credits?|funds)|payment required|quota exceeded|exceeded your current quota|billing (hard )?limit|out of (credits?|funds)|add (funds|credits?|money)|top ?up|no (remaining )?(balance|credits?)/.test(msg);
+  const patterns: RegExp[] = [
+    /insufficient (funds|balance|quota|credits?|tokens?)/,
+    /not enough (funds|balance|credits?|tokens?)/,
+    /payment required/,
+    /quota (exceeded|reached)/,
+    /exceeded your current quota/,
+    /usage (limit|cap|exceeded)/,
+    /billing (hard )?limit/,
+    /(ran |run )?out of (credits?|funds|tokens?|balance|usage)/,
+    /add (funds|credits?|money)/,
+    /top ?up/,
+    /no (remaining )?(balance|credits?|tokens?|usage)/,
+    /(no|0|zero) (tokens?|credits?|balance|usage)( left| remaining)/,
+    /(tokens?|credits?|balance|usage) (left|remaining)[:\s]+0\b/,
+  ];
+  return patterns.some((p) => p.test(msg));
 }

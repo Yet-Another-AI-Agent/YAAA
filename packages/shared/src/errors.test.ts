@@ -23,6 +23,19 @@ describe("isInsufficientFundsError", () => {
     expect(isInsufficientFundsError("402 Payment Required")).toBe(true);
   });
 
+  it("matches token/usage phrasings", () => {
+    expect(isInsufficientFundsError("No tokens left on your account")).toBe(true);
+    expect(isInsufficientFundsError("You are out of tokens")).toBe(true);
+    expect(isInsufficientFundsError("Usage limit reached")).toBe(true);
+    expect(isInsufficientFundsError("insufficient tokens")).toBe(true);
+    expect(isInsufficientFundsError("balance remaining: 0")).toBe(true);
+  });
+
+  it("does not match auth-token errors", () => {
+    expect(isInsufficientFundsError("invalid token")).toBe(false);
+    expect(isInsufficientFundsError("authentication token expired")).toBe(false);
+  });
+
   it("does not match unrelated errors", () => {
     expect(isInsufficientFundsError(null)).toBe(false);
     expect(isInsufficientFundsError(new Error("connection refused"))).toBe(false);
