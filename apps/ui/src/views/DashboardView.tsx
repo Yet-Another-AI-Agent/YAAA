@@ -179,14 +179,28 @@ function getAvatarColor(sender: string): string {
   return "#707070";
 }
 
-function formatChannelName(prompt: string): string {
+function formatChannelName(prompt: string, taskId?: string): string {
   if (!prompt) return "channel";
-  return prompt
+  let slug = prompt
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
     .trim()
     .replace(/\s+/g, "-")
     .substring(0, 30);
+  if (!slug) {
+    slug = "channel";
+  }
+  if (taskId) {
+    const suffix = taskId.substring(0, 6);
+    return `${slug}-${suffix}`;
+  }
+  return slug;
+}
+
+function getArtifactHref(yaaaDir: string, activeTaskId: string | null, artPath: string): string {
+  if (!yaaaDir || !activeTaskId || !artPath) return "#";
+  const encodedPath = artPath.split("/").map(p => encodeURIComponent(p)).join("/");
+  return `file://${yaaaDir}/tasks/${activeTaskId}/working/${encodedPath}`;
 }
 
 export function DashboardView({ viewModel }: DashboardViewProps) {
@@ -219,6 +233,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   const [loadingOrchestrator, setLoadingOrchestrator] = useState(false);
   const [historyMessages, setHistoryMessages] = useState<any[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
+  const activeHistoryRequestRef = useRef<string | null>(null);
 
   // YAAA data directory state
   const [yaaaDir, setYaaaDir] = useState<string>("");
@@ -312,16 +327,23 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
       setSidebarOpen(false); // Collapse sidebar
 
       setLoadingHistory(true);
+      activeHistoryRequestRef.current = id;
       TaskModel.getTaskHistory(id)
         .then((msgs) => {
-          setHistoryMessages(msgs || []);
+          if (activeHistoryRequestRef.current === id) {
+            setHistoryMessages(msgs || []);
+          }
         })
         .catch((err) => {
           console.error("Failed to load task history:", err);
-          setHistoryMessages([]);
+          if (activeHistoryRequestRef.current === id) {
+            setHistoryMessages([]);
+          }
         })
         .finally(() => {
-          setLoadingHistory(false);
+          if (activeHistoryRequestRef.current === id) {
+            setLoadingHistory(false);
+          }
         });
     }
   };
@@ -351,106 +373,130 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   // Pre-process display messages, subtasks, and artifacts
   const selectedTask = selectedTaskId ? tasks.find(t => t.id === selectedTaskId) : null;
   const currentChannelName = selectedTask 
-    ? formatChannelName(selectedTask.prompt)
-    : (taskId ? formatChannelName(goal) : "general");
+    ? formatChannelName(selectedTask.prompt, selectedTask.id)
+    : (taskId ? formatChannelName(goal, taskId) : "general");
 
-  let displayMessages: any[] = [];
-  if (selectedTaskId) {
-    // Prepend user's prompt as the first message
-    if (selectedTask) {
+  const memoizedData = React.useMemo(() => {
+    let displayMessages: any[] = [];
+    const parsedOrchestrator = parseOrchestratorMd(orchestratorMd);
+
+    if (selectedTaskId) {
+      // Prepend user's prompt as the first message
+      if (selectedTask) {
+        displayMessages.push({
+          id: "user-prompt",
+          sender: "User",
+          time: formatDate(selectedTask.created_at),
+          content: selectedTask.prompt,
+          kind: "thought"
+        });
+      } else if (orchestratorMd) {
+        displayMessages.push({
+          id: "user-prompt",
+          sender: "User",
+          time: formatDate(parsedOrchestrator.updatedAt),
+          content: parsedOrchestrator.prompt || "Start task",
+          kind: "thought"
+        });
+      }
+
+      // Add historical messages
+      historyMessages.forEach((msg, idx) => {
+        let sender = msg.from || "Agent";
+        let content = "";
+        let artifactsList = msg.artifacts || [];
+        if (msg.kind === "thought") {
+          content = msg.content;
+        } else if (msg.kind === "result") {
+          content = msg.summary;
+        } else if (msg.kind === "status") {
+          content = msg.note || `State update: ${msg.state}`;
+        } else if (msg.kind === "approval_request") {
+          content = `Requested approval for tool execution: ${msg.action?.capability}.${msg.action?.method}`;
+        } else if (msg.kind === "info_request") {
+          content = msg.question;
+        } else if (msg.kind === "info_reply") {
+          content = msg.answer;
+        } else {
+          content = typeof msg.data === "string" ? msg.data : JSON.stringify(msg);
+        }
+
+        displayMessages.push({
+          id: msg.id || `hist-${idx}`,
+          sender,
+          time: msg.timestamp ? formatDate(msg.timestamp) : "",
+          content,
+          kind: msg.kind,
+          artifacts: artifactsList,
+        });
+      });
+    } else if (showTaskView) {
+      // Prepend active task goal
       displayMessages.push({
         id: "user-prompt",
         sender: "User",
-        time: formatDate(selectedTask.created_at),
-        content: selectedTask.prompt,
+        time: new Date().toLocaleTimeString(),
+        content: goal,
         kind: "thought"
       });
-    } else if (orchestratorMd) {
-      const parsed = parseOrchestratorMd(orchestratorMd);
-      displayMessages.push({
-        id: "user-prompt",
-        sender: "User",
-        time: formatDate(parsed.updatedAt),
-        content: parsed.prompt || "Start task",
-        kind: "thought"
+
+      // Add live logs
+      logs.forEach((log) => {
+        let sender = log.source === "system" ? "System" : (log.source === "orchestrator" ? "Supervisor" : "Agent");
+        let content = log.content;
+        const agentMatch = log.content.match(/^\[([^\]]+)\] (.*)/);
+        if (agentMatch) {
+          sender = agentMatch[1];
+          content = agentMatch[2];
+        }
+        displayMessages.push({
+          id: log.id,
+          sender,
+          time: log.time,
+          content,
+          kind: log.source,
+          artifacts: [],
+        });
       });
     }
 
-    // Add historical messages
-    historyMessages.forEach((msg, idx) => {
-      let sender = msg.from || "Agent";
-      let content = "";
-      let artifactsList = msg.artifacts || [];
-      if (msg.kind === "thought") {
-        content = msg.content;
-      } else if (msg.kind === "result") {
-        content = msg.summary;
-      } else if (msg.kind === "status") {
-        content = msg.note || `State update: ${msg.state}`;
-      } else if (msg.kind === "approval_request") {
-        content = `Requested approval for tool execution: ${msg.action?.capability}.${msg.action?.method}`;
-      } else if (msg.kind === "info_request") {
-        content = msg.question;
-      } else if (msg.kind === "info_reply") {
-        content = msg.answer;
-      } else {
-        content = typeof msg.data === "string" ? msg.data : JSON.stringify(msg);
-      }
+    const displaySubtasks = selectedTaskId ? parsedOrchestrator.subtasks : subtasks;
+    
+    const displayArtifacts = selectedTaskId 
+      ? historyMessages.reduce((acc: any[], m) => {
+          if (m.kind === "result" && m.artifacts) {
+            acc.push(...m.artifacts);
+          }
+          return acc;
+        }, [])
+      : artifacts;
 
-      displayMessages.push({
-        id: msg.id || `hist-${idx}`,
-        sender,
-        time: msg.timestamp ? formatDate(msg.timestamp) : "",
-        content,
-        kind: msg.kind,
-        artifacts: artifactsList,
-      });
-    });
-  } else if (showTaskView) {
-    // Prepend active task goal
-    displayMessages.push({
-      id: "user-prompt",
-      sender: "User",
-      time: new Date().toLocaleTimeString(),
-      content: goal,
-      kind: "thought"
-    });
+    const currentStatus = selectedTaskId 
+      ? (selectedTask?.status || parsedOrchestrator.status) 
+      : (running ? "running" : (success ? "success" : (success === false ? "failed" : "pending")));
 
-    // Add live logs
-    logs.forEach((log) => {
-      let sender = log.source === "system" ? "System" : (log.source === "orchestrator" ? "Supervisor" : "Agent");
-      let content = log.content;
-      const agentMatch = log.content.match(/^\[([^\]]+)\] (.*)/);
-      if (agentMatch) {
-        sender = agentMatch[1];
-        content = agentMatch[2];
-      }
-      displayMessages.push({
-        id: log.id,
-        sender,
-        time: log.time,
-        content,
-        kind: log.source,
-        artifacts: [],
-      });
-    });
-  }
+    return {
+      displayMessages,
+      parsedOrchestrator,
+      displaySubtasks,
+      displayArtifacts,
+      currentStatus
+    };
+  }, [
+    selectedTaskId,
+    selectedTask,
+    orchestratorMd,
+    historyMessages,
+    showTaskView,
+    goal,
+    logs,
+    subtasks,
+    artifacts,
+    running,
+    success
+  ]);
 
-  const parsedOrchestrator = parseOrchestratorMd(orchestratorMd);
-  const displaySubtasks = selectedTaskId ? parsedOrchestrator.subtasks : subtasks;
-  
-  const displayArtifacts = selectedTaskId 
-    ? historyMessages.reduce((acc: any[], m) => {
-        if (m.kind === "result" && m.artifacts) {
-          acc.push(...m.artifacts);
-        }
-        return acc;
-      }, [])
-    : artifacts;
-
-  const currentStatus = selectedTaskId 
-    ? (selectedTask?.status || parsedOrchestrator.status) 
-    : (running ? "running" : (success ? "success" : (success === false ? "failed" : "pending")));
+  const { displayMessages, parsedOrchestrator, displaySubtasks, displayArtifacts, currentStatus } = memoizedData;
 
   return (
     <div className="dash-root fade-in-dashboard">
@@ -478,8 +524,9 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
             ) : (
               (tasks || []).map((t) => {
                 const isActive = (showTaskView && t.id === taskId) || (selectedTaskId === t.id);
-                const status = t.id === taskId && running ? "running" : t.status;
-                const channelName = formatChannelName(t.prompt);
+                const isWaiting = t.id === taskId && running && pendingApproval;
+                const status = isWaiting ? "waiting" : (t.id === taskId && running ? "running" : t.status);
+                const channelName = formatChannelName(t.prompt, t.id);
                 return (
                   <button
                     key={t.id}
@@ -652,14 +699,20 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                                   <span className="artifact-filename">{art.path.split("/").pop()}</span>
                                   <span className="artifact-description">{art.description}</span>
                                 </div>
-                                <a 
-                                  className="slack-artifact-download"
-                                  href={`file://${yaaaDir}/tasks/${selectedTaskId || taskId}/working/${art.path}`} 
-                                  target="_blank" 
-                                  rel="noreferrer"
-                                >
-                                  Open
-                                </a>
+                                {(!yaaaDir || !(selectedTaskId || taskId)) ? (
+                                  <span className="slack-artifact-download disabled" style={{ opacity: 0.5, cursor: 'not-allowed' }}>
+                                    Open
+                                  </span>
+                                ) : (
+                                  <a 
+                                    className="slack-artifact-download"
+                                    href={getArtifactHref(yaaaDir, selectedTaskId || taskId, art.path)} 
+                                    target="_blank" 
+                                    rel="noreferrer"
+                                  >
+                                    Open
+                                  </a>
+                                )}
                               </div>
                             ))}
                           </div>
@@ -778,15 +831,21 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                               {art.description}
                             </div>
                           </div>
-                          <a 
-                            className="artifact-link" 
-                            href={`file://${yaaaDir}/tasks/${selectedTaskId || taskId}/working/${art.path}`} 
-                            target="_blank" 
-                            rel="noreferrer"
-                            style={{ fontSize: '0.85rem' }}
-                          >
-                            Open
-                          </a>
+                          {(!yaaaDir || !(selectedTaskId || taskId)) ? (
+                            <span className="artifact-link disabled" style={{ opacity: 0.5, cursor: 'not-allowed', fontSize: '0.85rem' }}>
+                              Open
+                            </span>
+                          ) : (
+                            <a 
+                              className="artifact-link" 
+                              href={getArtifactHref(yaaaDir, selectedTaskId || taskId, art.path)} 
+                              target="_blank" 
+                              rel="noreferrer"
+                              style={{ fontSize: '0.85rem' }}
+                            >
+                              Open
+                            </a>
+                          )}
                         </div>
                       ))}
                     </div>

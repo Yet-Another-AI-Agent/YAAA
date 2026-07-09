@@ -306,5 +306,13 @@ describe('YAAA CLI Integration & Features', () => {
       expect(lastCall).toBeDefined();
       expect(exitSpy).toHaveBeenCalledWith(0);
     });
+
+    it('should exit with code 1 if task history query fails or taskId is missing', async () => {
+      process.argv = ['node', 'index.js', 'task', '--history', 'missing-task-id-12345'];
+      await bootstrap();
+
+      expect(errSpy).toHaveBeenCalled();
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    });
   });
 });

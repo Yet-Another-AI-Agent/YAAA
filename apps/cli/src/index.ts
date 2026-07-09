@@ -460,7 +460,15 @@ export async function bootstrap() {
         return;
       }
       const yaaaDir = auth.getYaaaDir();
+      const taskDir = path.join(yaaaDir, "tasks", taskId);
+      if (!fs.existsSync(taskDir)) {
+        console.error(`Error: Task directory not found for taskId: ${taskId}`);
+        rl.close();
+        process.exit(1);
+        return;
+      }
       const store = new SqliteStore(path.join(yaaaDir, "tasks"));
+      let success = true;
       try {
         const rows = await store.getMessages(taskId);
         if (guiMode) {
@@ -470,11 +478,12 @@ export async function bootstrap() {
         }
       } catch (err: any) {
         console.error("Failed to query task history:", err.message);
+        success = false;
       } finally {
         store.closeAll();
         rl.close();
       }
-      process.exit(0);
+      process.exit(success ? 0 : 1);
       return;
     } else {
       console.error(

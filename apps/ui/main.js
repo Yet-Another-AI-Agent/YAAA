@@ -199,30 +199,47 @@ ipcMain.handle("get-task-history", async (event, taskId) => {
     });
 
     let output = "";
+    let errorOutput = "";
+
+    const timeout = setTimeout(() => {
+      console.error("get-task-history process timed out. Killing child.");
+      child.kill();
+      resolve([]);
+    }, 10000);
+
     child.stdout.on("data", (data) => {
       output += data.toString();
     });
 
+    child.stderr.on("data", (data) => {
+      errorOutput += data.toString();
+    });
+
     child.on("error", (err) => {
+      clearTimeout(timeout);
       console.error("Failed to spawn CLI process for get-task-history:", err);
       resolve([]);
     });
 
     child.on("close", () => {
-      try {
-        const lines = output.split("\n");
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed.startsWith("{")) {
+      clearTimeout(timeout);
+      if (errorOutput) {
+        console.error("get-task-history CLI stderr output:", errorOutput);
+      }
+      const lines = output.split("\n");
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith("{")) {
+          try {
             const parsed = JSON.parse(trimmed);
-            if (parsed.event === "task-history") {
-              resolve(parsed.messages);
+            if (parsed && parsed.event === "task-history") {
+              resolve(parsed.messages || []);
               return;
             }
+          } catch (err) {
+            console.error("Failed to parse task-history JSON line:", err);
           }
         }
-      } catch (err) {
-        console.error("Failed to parse task-history JSON output:", err);
       }
       resolve([]);
     });

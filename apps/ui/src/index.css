@@ -1560,6 +1560,11 @@ body {
   box-shadow: 0 0 6px var(--color-info);
 }
 
+.slack-status-dot.waiting {
+  background: var(--color-warning);
+  box-shadow: 0 0 6px var(--color-warning);
+}
+
 .slack-status-dot.success {
   background: var(--color-success);
 }
@@ -1673,7 +1678,7 @@ body {
   font-size: 0.95rem;
   line-height: 1.5;
   max-width: 90%;
-  word-break: break-word;
+  overflow-wrap: break-word;
   white-space: pre-wrap;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
 }
