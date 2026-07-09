@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, act } from "@testing-library/react";
 import { DashboardView } from "./DashboardView";
 
 vi.mock("../assets/logo.jpg", () => ({ default: "logo.jpg" }));
@@ -75,10 +75,14 @@ describe("DashboardView", () => {
     expect(sidebar).toBeTruthy();
     expect(sidebar?.classList.contains("collapsed")).toBe(false);
 
-    toggleBtn.click();
+    act(() => {
+      toggleBtn.click();
+    });
     expect(sidebar?.classList.contains("collapsed")).toBe(true);
 
-    toggleBtn.click();
+    act(() => {
+      toggleBtn.click();
+    });
     expect(sidebar?.classList.contains("collapsed")).toBe(false);
   });
 
@@ -92,7 +96,9 @@ describe("DashboardView", () => {
     expect(sidebar?.classList.contains("collapsed")).toBe(false);
 
     const taskItem = screen.getByText("Test task 1");
-    taskItem.click();
+    act(() => {
+      taskItem.click();
+    });
 
     expect(sidebar?.classList.contains("collapsed")).toBe(true);
   });

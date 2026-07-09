@@ -86,6 +86,20 @@ describe("TaskModel", () => {
     });
   });
 
+  describe("getTaskHistory()", () => {
+    it("calls electronAPI.getTaskHistory with the taskId", async () => {
+      const fakeMessages = [{ id: "m1", kind: "thought", content: "hello" }];
+      const getTaskHistoryMock = vi.fn().mockResolvedValue(fakeMessages);
+      (window as any).electronAPI = { getTaskHistory: getTaskHistoryMock };
+
+      const result = await TaskModel.getTaskHistory("task-xyz");
+
+      expect(getTaskHistoryMock).toHaveBeenCalledOnce();
+      expect(getTaskHistoryMock).toHaveBeenCalledWith("task-xyz");
+      expect(result).toEqual(fakeMessages);
+    });
+  });
+
   describe("subscribeEvents()", () => {
     it("wires up all three callbacks and returned fn calls all unsubscribers", () => {
       const unsubEvent = vi.fn();

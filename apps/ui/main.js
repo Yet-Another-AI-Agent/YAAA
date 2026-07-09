@@ -184,6 +184,48 @@ ipcMain.handle("list-tasks", async (event) => {
   });
 });
 
+ipcMain.handle("get-task-history", async (event, taskId) => {
+  if (typeof taskId !== "string" || !/^[a-zA-Z0-9-]+$/.test(taskId)) {
+    console.error(`Invalid taskId: ${taskId}`);
+    return [];
+  }
+  return new Promise((resolve) => {
+    const cliPath = path.resolve(__dirname, "../cli/dist/index.js");
+    const child = spawn("node", [cliPath, "task", "--history", taskId, "--gui"], {
+      cwd: path.resolve(__dirname, "../cli"),
+    });
+
+    let output = "";
+    child.stdout.on("data", (data) => {
+      output += data.toString();
+    });
+
+    child.on("error", (err) => {
+      console.error("Failed to spawn CLI process for get-task-history:", err);
+      resolve([]);
+    });
+
+    child.on("close", () => {
+      try {
+        const lines = output.split("\n");
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith("{")) {
+            const parsed = JSON.parse(trimmed);
+            if (parsed.event === "task-history") {
+              resolve(parsed.messages);
+              return;
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Failed to parse task-history JSON output:", err);
+      }
+      resolve([]);
+    });
+  });
+});
+
 ipcMain.handle("read-task-orchestrator", async (event, taskId) => {
   if (typeof taskId !== "string" || !/^[a-zA-Z0-9-]+$/.test(taskId)) {
     console.error(`Invalid taskId: ${taskId}`);

@@ -315,6 +315,7 @@ Usage:
 Commands:
   task -n "<prompt>"                 Create a new task with a UUID and start it
   task -ls, task --list             List all tasks stored in the main database
+  task --history <taskId>           Get chat history for a task (alias: -his)
   config --key <key_value>           Configure your Mesh API access key
   config --model <role> <model_id>   Choose your preferred model for an agent role
 
@@ -450,9 +451,34 @@ export async function bootstrap() {
       }
       process.exit(0);
       return;
+    } else if (subFlag === "--history" || subFlag === "-his") {
+      const taskId = cleanArgs[2];
+      if (!taskId) {
+        console.error("Error: Please provide a taskId. Example: task --history <taskId>");
+        rl.close();
+        process.exit(1);
+        return;
+      }
+      const yaaaDir = auth.getYaaaDir();
+      const store = new SqliteStore(path.join(yaaaDir, "tasks"));
+      try {
+        const rows = await store.getMessages(taskId);
+        if (guiMode) {
+          console.log(JSON.stringify({ event: "task-history", messages: rows }));
+        } else {
+          console.log(JSON.stringify({ event: "task-history", messages: rows }, null, 2));
+        }
+      } catch (err: any) {
+        console.error("Failed to query task history:", err.message);
+      } finally {
+        store.closeAll();
+        rl.close();
+      }
+      process.exit(0);
+      return;
     } else {
       console.error(
-        "Unknown task option. Use task -n \"<prompt>\" to create a task, or task -ls to list tasks."
+        "Unknown task option. Use task -n \"<prompt>\" to create a task, task -ls to list tasks, or task --history <taskId> to get history."
       );
       rl.close();
       process.exit(1);

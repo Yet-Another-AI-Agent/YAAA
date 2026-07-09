@@ -170,6 +170,25 @@ function parseOrchestratorMd(content: string | null): ParsedOrchestrator {
   return result;
 }
 
+function getAvatarColor(sender: string): string {
+  if (sender === "User") return "#36c5f0"; // Slack blue
+  if (sender.toLowerCase().includes("planner")) return "#e01e5a"; // Slack pink
+  if (sender.toLowerCase().includes("worker")) return "#2eb67d"; // Slack green
+  if (sender.toLowerCase().includes("verifier")) return "#ecb22e"; // Slack yellow
+  if (sender.toLowerCase().includes("supervisor") || sender.toLowerCase().includes("orchestrator")) return "#4a154b"; // Slack purple
+  return "#707070";
+}
+
+function formatChannelName(prompt: string): string {
+  if (!prompt) return "channel";
+  return prompt
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .trim()
+    .replace(/\s+/g, "-")
+    .substring(0, 30);
+}
+
 export function DashboardView({ viewModel }: DashboardViewProps) {
   const {
     goal,
@@ -198,6 +217,8 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [orchestratorMd, setOrchestratorMd] = useState<string | null>(null);
   const [loadingOrchestrator, setLoadingOrchestrator] = useState(false);
+  const [historyMessages, setHistoryMessages] = useState<any[]>([]);
+  const [loadingHistory, setLoadingHistory] = useState(false);
 
   // YAAA data directory state
   const [yaaaDir, setYaaaDir] = useState<string>("");
@@ -211,24 +232,19 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
 
   // Auto-scroll logs
   useEffect(() => {
-    consoleEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [logs]);
+    if (consoleEndRef.current && typeof consoleEndRef.current.scrollIntoView === "function") {
+      consoleEndRef.current.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [logs, historyMessages, loadingHistory]);
 
   // Switch to task view once a task starts
   useEffect(() => {
     if (running || taskId) {
       setSelectedTaskId(null);
       setShowTaskView(true);
-      setSidebarOpen(false);
+      setSidebarOpen(false); // Collapsed on start
     }
   }, [running, taskId]);
-
-  // Automatically reopen sidebar on New Mission page
-  useEffect(() => {
-    if (!showTaskView && !selectedTaskId) {
-      setSidebarOpen(true);
-    }
-  }, [showTaskView, selectedTaskId]);
 
   // Fetch orchestrator.md when a task is selected
   useEffect(() => {
@@ -286,9 +302,28 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   };
 
   const handleSelectTask = (id: string) => {
-    setSelectedTaskId(id);
-    setShowTaskView(false);
-    setSidebarOpen(false);
+    if (id === taskId) {
+      setSelectedTaskId(null);
+      setShowTaskView(true);
+      setSidebarOpen(false); // Collapse sidebar
+    } else {
+      setSelectedTaskId(id);
+      setShowTaskView(false);
+      setSidebarOpen(false); // Collapse sidebar
+
+      setLoadingHistory(true);
+      TaskModel.getTaskHistory(id)
+        .then((msgs) => {
+          setHistoryMessages(msgs || []);
+        })
+        .catch((err) => {
+          console.error("Failed to load task history:", err);
+          setHistoryMessages([]);
+        })
+        .finally(() => {
+          setLoadingHistory(false);
+        });
+    }
   };
 
   const handleNewMission = () => {
@@ -313,6 +348,110 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     }
   };
 
+  // Pre-process display messages, subtasks, and artifacts
+  const selectedTask = selectedTaskId ? tasks.find(t => t.id === selectedTaskId) : null;
+  const currentChannelName = selectedTask 
+    ? formatChannelName(selectedTask.prompt)
+    : (taskId ? formatChannelName(goal) : "general");
+
+  let displayMessages: any[] = [];
+  if (selectedTaskId) {
+    // Prepend user's prompt as the first message
+    if (selectedTask) {
+      displayMessages.push({
+        id: "user-prompt",
+        sender: "User",
+        time: formatDate(selectedTask.created_at),
+        content: selectedTask.prompt,
+        kind: "thought"
+      });
+    } else if (orchestratorMd) {
+      const parsed = parseOrchestratorMd(orchestratorMd);
+      displayMessages.push({
+        id: "user-prompt",
+        sender: "User",
+        time: formatDate(parsed.updatedAt),
+        content: parsed.prompt || "Start task",
+        kind: "thought"
+      });
+    }
+
+    // Add historical messages
+    historyMessages.forEach((msg, idx) => {
+      let sender = msg.from || "Agent";
+      let content = "";
+      let artifactsList = msg.artifacts || [];
+      if (msg.kind === "thought") {
+        content = msg.content;
+      } else if (msg.kind === "result") {
+        content = msg.summary;
+      } else if (msg.kind === "status") {
+        content = msg.note || `State update: ${msg.state}`;
+      } else if (msg.kind === "approval_request") {
+        content = `Requested approval for tool execution: ${msg.action?.capability}.${msg.action?.method}`;
+      } else if (msg.kind === "info_request") {
+        content = msg.question;
+      } else if (msg.kind === "info_reply") {
+        content = msg.answer;
+      } else {
+        content = typeof msg.data === "string" ? msg.data : JSON.stringify(msg);
+      }
+
+      displayMessages.push({
+        id: msg.id || `hist-${idx}`,
+        sender,
+        time: msg.timestamp ? formatDate(msg.timestamp) : "",
+        content,
+        kind: msg.kind,
+        artifacts: artifactsList,
+      });
+    });
+  } else if (showTaskView) {
+    // Prepend active task goal
+    displayMessages.push({
+      id: "user-prompt",
+      sender: "User",
+      time: new Date().toLocaleTimeString(),
+      content: goal,
+      kind: "thought"
+    });
+
+    // Add live logs
+    logs.forEach((log) => {
+      let sender = log.source === "system" ? "System" : (log.source === "orchestrator" ? "Supervisor" : "Agent");
+      let content = log.content;
+      const agentMatch = log.content.match(/^\[([^\]]+)\] (.*)/);
+      if (agentMatch) {
+        sender = agentMatch[1];
+        content = agentMatch[2];
+      }
+      displayMessages.push({
+        id: log.id,
+        sender,
+        time: log.time,
+        content,
+        kind: log.source,
+        artifacts: [],
+      });
+    });
+  }
+
+  const parsedOrchestrator = parseOrchestratorMd(orchestratorMd);
+  const displaySubtasks = selectedTaskId ? parsedOrchestrator.subtasks : subtasks;
+  
+  const displayArtifacts = selectedTaskId 
+    ? historyMessages.reduce((acc: any[], m) => {
+        if (m.kind === "result" && m.artifacts) {
+          acc.push(...m.artifacts);
+        }
+        return acc;
+      }, [])
+    : artifacts;
+
+  const currentStatus = selectedTaskId 
+    ? (selectedTask?.status || parsedOrchestrator.status) 
+    : (running ? "running" : (success ? "success" : (success === false ? "failed" : "pending")));
+
   return (
     <div className="dash-root fade-in-dashboard">
       {/* ─── SIDEBAR LIST ─── */}
@@ -332,37 +471,37 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
         </div>
 
         <div className="sidebar-list">
-          <div className="sidebar-section-title">Recent Missions</div>
-          {tasks.length === 0 ? (
-            <div className="sidebar-empty">No past missions</div>
-          ) : (
-            tasks.map((t) => {
-              const isActive = (showTaskView && t.id === taskId) || (selectedTaskId === t.id);
-              // Handle active run case (t.status could be 'running' or 'success'/'failed')
-              const status = t.id === taskId && running ? "running" : t.status;
-              return (
-                <button
-                  key={t.id}
-                  className={`sidebar-item ${isActive ? "active" : ""}`}
-                  onClick={() => handleSelectTask(t.id)}
-                >
-                  <span className={`status-indicator ${status}`} />
-                  <div className="sidebar-item-content">
-                    <div className="sidebar-item-prompt" title={t.prompt}>{t.prompt}</div>
-                    <div className="sidebar-item-meta">
-                      {formatDate(t.created_at)}
-                    </div>
-                  </div>
-                </button>
-              );
-            })
-          )}
+          <div className="sidebar-section-title">Channels</div>
+          <div className="slack-channel-list">
+            {(tasks || []).length === 0 ? (
+              <div className="sidebar-empty">No channels</div>
+            ) : (
+              (tasks || []).map((t) => {
+                const isActive = (showTaskView && t.id === taskId) || (selectedTaskId === t.id);
+                const status = t.id === taskId && running ? "running" : t.status;
+                const channelName = formatChannelName(t.prompt);
+                return (
+                  <button
+                    key={t.id}
+                    className={`slack-channel-item ${isActive ? "active" : ""}`}
+                    onClick={() => handleSelectTask(t.id)}
+                    title={t.prompt}
+                  >
+                    <span className="slack-hash">#</span>
+                    <span className="slack-channel-name">{channelName}</span>
+                    <span style={{ display: "none" }}>{t.prompt}</span>
+                    <span className={`slack-status-dot ${status}`} />
+                  </button>
+                );
+              })
+            )}
+          </div>
         </div>
       </div>
 
       {/* ─── MAIN CONTENT CONTAINER ─── */}
       <div className="dash-main-container">
-        {/* Top-right: Back + Settings + Avatar */}
+        {/* Topbar */}
         <div className="dash-topbar">
           <div className="dash-topbar-left">
             <button className="hamburger-btn" onClick={() => setSidebarOpen(!sidebarOpen)} title="Toggle Sidebar">
@@ -392,131 +531,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
           </div>
         </div>
 
-        {selectedTaskId ? (
-          /* ─── PAST MISSION VIEW ─── */
-          loadingOrchestrator ? (
-            <div className="past-task-detail">
-              <div className="panel-empty">
-                <div className="thinking-dots">
-                  <span /><span /><span />
-                </div>
-                <span style={{ marginLeft: "1rem" }}>Reading mission log...</span>
-              </div>
-            </div>
-          ) : !orchestratorMd ? (
-            <div className="past-task-detail">
-              <div className="panel-empty">
-                <span>No execution ledger found for this mission.</span>
-              </div>
-            </div>
-          ) : (() => {
-            const parsed = parseOrchestratorMd(orchestratorMd);
-            return (
-              <div className="past-task-detail fade-in-dashboard">
-                <div className="detail-header">
-                  <div className="detail-info">
-                    <div className="detail-prompt">"{parsed.prompt || 'Untitled Mission'}"</div>
-                    <div className="detail-meta">
-                      <span>ID: {parsed.taskId}</span>
-                      <span>Updated: {formatDate(parsed.updatedAt)}</span>
-                    </div>
-                  </div>
-                  <span className={`detail-status-pill ${parsed.status}`}>
-                    {parsed.status || "Unknown"}
-                  </span>
-                </div>
-
-                <div className="detail-grid">
-                  {/* Plan Panel */}
-                  <div className="task-panel glass-card">
-                    <h3 className="panel-title">Execution Plan</h3>
-                    {parsed.planGoal && (
-                      <div style={{ fontSize: "0.9rem", color: "var(--text-secondary)", marginBottom: "1rem", fontStyle: "italic" }}>
-                        Goal: {parsed.planGoal}
-                      </div>
-                    )}
-                    <div className="subtask-list">
-                      {parsed.subtasks.map((st) => (
-                        <div key={st.id} className={`subtask-item ${st.state}`}>
-                          <div className="subtask-dot-col">
-                            <span className={`status-badge ${st.state}`} />
-                          </div>
-                          <div className="subtask-body">
-                            <div className="subtask-title">
-                              <span style={{ fontFamily: "var(--font-mono)", fontSize: "0.8rem", marginRight: "0.5rem" }}>
-                                [{st.id}]
-                              </span>
-                              {st.title}
-                            </div>
-                            <div className="subtask-meta">
-                              {st.capability && <span className="capability-tag">{st.capability}</span>}
-                              {st.successCriteria && (
-                                <span style={{ color: "var(--text-muted)", fontSize: "0.75rem" }}>
-                                  Criteria: {st.successCriteria}
-                                </span>
-                              )}
-                              {st.dependencies && st.dependencies.length > 0 && (
-                                <span style={{ color: "var(--text-muted)", fontSize: "0.75rem" }}>
-                                  Needs: {st.dependencies.join(", ")}
-                                </span>
-                              )}
-                            </div>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* Ledger Steps Panel */}
-                  <div className="task-panel glass-card">
-                    <h3 className="panel-title">Execution Ledger</h3>
-                    <div className="ledger-steps-list">
-                      {parsed.steps.length === 0 ? (
-                        <div className="panel-empty">No steps recorded in ledger.</div>
-                      ) : (
-                        parsed.steps.map((step, idx) => (
-                          <div key={idx} className="ledger-step-card">
-                            <div className="ledger-step-header">
-                              <span>Step {step.step}</span>
-                              <span className="ledger-step-time">{formatDate(step.timestamp)}</span>
-                            </div>
-                            {step.strategy && (
-                              <div className="ledger-step-strategy">
-                                {step.strategy}
-                              </div>
-                            )}
-                            <div className="ledger-step-lists">
-                              {step.facts && step.facts.length > 0 && (
-                                <div>
-                                  <div className="ledger-step-list-title">Facts Learned</div>
-                                  <ul className="ledger-bullets facts">
-                                    {step.facts.map((fact, fIdx) => (
-                                      <li key={fIdx}>{fact}</li>
-                                    ))}
-                                  </ul>
-                                </div>
-                              )}
-                              {step.assumptions && step.assumptions.length > 0 && (
-                                <div>
-                                  <div className="ledger-step-list-title">Assumptions Made</div>
-                                  <ul className="ledger-bullets assumptions">
-                                    {step.assumptions.map((ass, aIdx) => (
-                                      <li key={aIdx}>{ass}</li>
-                                    ))}
-                                  </ul>
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        ))
-                      )}
-                    </div>
-                  </div>
-                </div>
-              </div>
-            );
-          })()
-        ) : !showTaskView ? (
+        {(!selectedTaskId && !showTaskView) ? (
           /* ─── HOME VIEW ─── */
           <div className="dash-home">
             <div className="dash-hero">
@@ -583,148 +598,200 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
             </div>
           </div>
         ) : (
-          /* ─── TASK EXECUTION VIEW ─── */
-          <div className="dash-task-view fade-in-dashboard">
-            {/* Compact input bar at top */}
-            <div className="compact-input-bar">
-              <div className="compact-input-wrapper">
-                <textarea
-                  ref={textareaRef}
-                  className="mission-textarea compact"
-                  placeholder="What's the mission today?"
-                  value={goal}
-                  onChange={handleInputChange}
-                  onKeyDown={handleKeyDown}
-                  rows={1}
-                  disabled={running}
-                />
-                <div className="mission-actions">
-                  <button className="mission-action-btn" title="Attach file" aria-label="Attach file">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
-                    </svg>
-                  </button>
-                  <button className="mission-action-btn" title="Voice input" aria-label="Voice input">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
-                      <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-                      <line x1="12" y1="19" x2="12" y2="23"/>
-                      <line x1="8" y1="23" x2="16" y2="23"/>
-                    </svg>
-                  </button>
-                  <button
-                    className="mission-send-btn"
-                    onClick={() => startTask()}
-                    disabled={running || !goal.trim()}
-                    title="Launch agent"
-                    aria-label="Launch agent"
-                  >
-                    {running ? <span className="send-spinner" /> : (
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                        <line x1="22" y1="2" x2="11" y2="13"/>
-                        <polygon points="22 2 15 22 11 13 2 9 22 2"/>
-                      </svg>
-                    )}
-                  </button>
+          /* ─── SLACK WORKSPACE CHAT VIEW ─── */
+          <div className="slack-chat-view-container">
+            {/* Middle slack-chat-pane */}
+            <div className="slack-chat-pane">
+              <div className="slack-channel-header">
+                <div className="slack-channel-header-title">
+                  <span className="slack-hash">#</span>
+                  <span>{currentChannelName}</span>
+                </div>
+              </div>
+
+              <div className="slack-chat-messages">
+                {/* Loading state for past task */}
+                {selectedTaskId && loadingHistory && (
+                  <div className="panel-empty">
+                    <div className="thinking-dots">
+                      <span /><span /><span />
+                    </div>
+                    <span style={{ marginLeft: "1rem" }}>Reading channel history...</span>
+                  </div>
+                )}
+
+                {/* Main conversation message bubbles */}
+                {!loadingHistory && displayMessages.length === 0 && (
+                  <div className="panel-empty">
+                    No logs or thoughts in this channel yet.
+                  </div>
+                )}
+
+                {!loadingHistory && displayMessages.map((msg) => (
+                  <div className="slack-message" key={msg.id}>
+                    <div 
+                      className="slack-message-avatar" 
+                      style={{ backgroundColor: getAvatarColor(msg.sender) }}
+                    >
+                      {msg.sender.charAt(0).toUpperCase()}
+                    </div>
+                    <div className="slack-message-content">
+                      <div className="slack-message-header">
+                        <span className="slack-message-sender">{msg.sender}</span>
+                        <span className="slack-message-time">{msg.time}</span>
+                      </div>
+                      <div className={`slack-message-bubble ${msg.sender === 'User' ? 'slack-message-sender-user' : ''}`}>
+                        <div className="slack-message-text">{msg.content}</div>
+                        
+                        {msg.artifacts && msg.artifacts.length > 0 && (
+                          <div className="slack-message-artifacts">
+                            {msg.artifacts.map((art: any, aIdx: number) => (
+                              <div key={aIdx} className="slack-message-artifact-card">
+                                <span style={{ fontSize: '1.1rem' }}>📄</span>
+                                <div className="artifact-details">
+                                  <span className="artifact-filename">{art.path.split("/").pop()}</span>
+                                  <span className="artifact-description">{art.description}</span>
+                                </div>
+                                <a 
+                                  className="slack-artifact-download"
+                                  href={`file://${yaaaDir}/tasks/${selectedTaskId || taskId}/working/${art.path}`} 
+                                  target="_blank" 
+                                  rel="noreferrer"
+                                >
+                                  Open
+                                </a>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+                
+                {/* Approval Banner inside chat list */}
+                {showTaskView && pendingApproval && (
+                  <div className="approval-banner" style={{ marginTop: '1.25rem' }}>
+                    <div className="approval-title">⚠️ Security Confirmation Required</div>
+                    <div className="approval-body">
+                      <p>Agent <strong>{pendingApproval.agentId}</strong> requests permission to run:</p>
+                      <div className="approval-details">
+                        <strong>Capability:</strong> {pendingApproval.toolCall.capability}<br />
+                        <strong>Method:</strong> {pendingApproval.toolCall.method}<br />
+                        <strong>Args:</strong>
+                        <pre>{JSON.stringify(pendingApproval.toolCall.args, null, 2)}</pre>
+                      </div>
+                    </div>
+                    <div className="approval-actions">
+                      <button className="btn-reject" onClick={() => resolveApproval(false)}>Reject</button>
+                      <button className="btn-approve" onClick={() => resolveApproval(true)}>Approve & Execute</button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Result summary inline in chat */}
+                {showTaskView && summary && (
+                  <div className={`result-banner ${success ? "success" : "failed"}`} style={{ marginTop: '1.25rem' }}>
+                    <span>{success ? "✅" : "❌"}</span>
+                    <p>{summary}</p>
+                  </div>
+                )}
+
+                <div ref={consoleEndRef} />
+              </div>
+
+              {/* Chat Input / Status Info */}
+              <div className="slack-chat-input-container">
+                <div className="slack-chat-input-box">
+                  <span>
+                    {selectedTaskId && "🔒 Channel is archived. You can view the complete execution log."}
+                    {!selectedTaskId && running && "⚡ Mission in progress... Agent is running and printing thoughts."}
+                    {!selectedTaskId && !running && success === true && "✅ Mission completed. Channel is archived."}
+                    {!selectedTaskId && !running && success === false && "❌ Mission failed. Channel is archived."}
+                    {!selectedTaskId && !running && success === null && "⚡ Channel initialized. Ready to execute."}
+                  </span>
                 </div>
               </div>
             </div>
 
-            {/* Human-in-the-Loop Approval Banner */}
-            {pendingApproval && (
-              <div className="approval-banner">
-                <div className="approval-title">⚠️ Security Confirmation Required</div>
-                <div className="approval-body">
-                  <p>Agent <strong>{pendingApproval.agentId}</strong> requests permission to run:</p>
-                  <div className="approval-details">
-                    <strong>Capability:</strong> {pendingApproval.toolCall.capability}<br />
-                    <strong>Method:</strong> {pendingApproval.toolCall.method}<br />
-                    <strong>Args:</strong>
-                    <pre>{JSON.stringify(pendingApproval.toolCall.args, null, 2)}</pre>
-                  </div>
-                </div>
-                <div className="approval-actions">
-                  <button className="btn-reject" onClick={() => resolveApproval(false)}>Reject</button>
-                  <button className="btn-approve" onClick={() => resolveApproval(true)}>Approve & Execute</button>
-                </div>
+            {/* Right slack-details-sidebar */}
+            <div className="slack-details-sidebar">
+              <div className="slack-details-header">
+                Mission Details
               </div>
-            )}
+              <div className="slack-details-content">
+                {/* Status section */}
+                <div style={{ marginBottom: '1rem' }}>
+                  <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '0.5rem' }}>Status</div>
+                  <span className={`detail-status-pill ${currentStatus}`}>
+                    {currentStatus ? currentStatus.toUpperCase() : "PENDING"}
+                  </span>
+                </div>
 
-            {/* Result Banner */}
-            {summary && (
-              <div className={`result-banner ${success ? "success" : "failed"}`}>
-                <span>{success ? "✅" : "❌"}</span>
-                <p>{summary}</p>
-              </div>
-            )}
-
-            <div className="task-grid">
-              {/* Pipeline */}
-              <div className="task-panel glass-card">
-                <h3 className="panel-title">Execution Pipeline</h3>
-                {subtasks.length === 0 ? (
-                  <div className="panel-empty">
-                    {running ? (
-                      <div className="thinking-dots">
-                        <span /><span /><span />
-                      </div>
-                    ) : "Planning subtasks..."}
-                  </div>
-                ) : (
-                  <div className="subtask-list">
-                    {subtasks.map((st) => (
-                      <div key={st.id} className={`subtask-item ${st.state}`}>
-                        <div className="subtask-dot-col">
-                          <span className={`status-badge ${st.state}`} />
-                          {st.state === "running" && <div className="subtask-line-active" />}
-                        </div>
-                        <div className="subtask-body">
-                          <div className="subtask-title">{st.title}</div>
-                          <div className="subtask-meta">
-                            <span className="capability-tag">{st.capability}</span>
-                            <span className={`risk-tag ${st.riskLevel}`}>{st.riskLevel} risk</span>
+                {/* Subtasks Section */}
+                <div>
+                  <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '0.75rem' }}>Execution Plan</div>
+                  {displaySubtasks.length === 0 ? (
+                    <div style={{ color: 'var(--text-muted)', fontSize: '0.9rem', fontStyle: 'italic' }}>
+                      {selectedTaskId ? "No subtasks recorded." : (running ? "Generating plan..." : "Awaiting plan...")}
+                    </div>
+                  ) : (
+                    <div className="subtask-list">
+                      {displaySubtasks.map((st) => (
+                        <div key={st.id} className={`subtask-item ${st.state}`}>
+                          <div className="subtask-dot-col">
+                            <span className={`status-badge ${st.state}`} />
+                          </div>
+                          <div className="subtask-body">
+                            <div className="subtask-title" style={{ fontSize: '0.85rem' }}>
+                              <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.75rem', marginRight: '0.35rem' }}>
+                                [{st.id}]
+                              </span>
+                              {st.title}
+                            </div>
+                            <div className="subtask-meta">
+                              {st.capability && <span className="capability-tag">{st.capability}</span>}
+                            </div>
                           </div>
                         </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              {/* Console */}
-              <div className="task-panel glass-card console-panel">
-                <h3 className="panel-title">Thought Stream</h3>
-                <div className="console-log-box">
-                  {logs.length === 0 && (
-                    <div className="console-empty">Awaiting stream...</div>
-                  )}
-                  {logs.map((log) => (
-                    <div key={log.id} className="log-entry">
-                      <div className="log-header">
-                        <span className={`log-source ${log.source}`}>{log.source.toUpperCase()}</span>
-                        <span className="log-time">{log.time}</span>
-                      </div>
-                      <div className="log-content">{log.content}</div>
+                      ))}
                     </div>
-                  ))}
-                  <div ref={consoleEndRef} />
+                  )}
                 </div>
 
-                {/* Artifacts */}
-                {artifacts.length > 0 && (
-                  <div className="artifacts-tray">
-                    <h4 className="tray-label">Artifacts</h4>
-                    {artifacts.map((art, idx) => (
-                      <div key={idx} className="artifact-item">
-                        <div>
-                          <div className="artifact-name">{art.path.split("/").pop()}</div>
-                          <div className="artifact-desc">{art.description}</div>
+                {/* Artifacts Section */}
+                <div style={{ borderTop: '1px solid var(--border-color)', paddingTop: '1.25rem' }}>
+                  <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '0.75rem' }}>Artifacts</div>
+                  {displayArtifacts.length === 0 ? (
+                    <div style={{ color: 'var(--text-muted)', fontSize: '0.9rem', fontStyle: 'italic' }}>
+                      No artifacts generated yet.
+                    </div>
+                  ) : (
+                    <div className="artifact-list">
+                      {displayArtifacts.map((art, idx) => (
+                        <div key={idx} className="artifact-item">
+                          <div style={{ minWidth: 0, flex: 1, paddingRight: '8px' }}>
+                            <div className="artifact-name" style={{ fontSize: '0.85rem', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {art.path.split("/").pop()}
+                            </div>
+                            <div className="artifact-desc" style={{ fontSize: '0.75rem', color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {art.description}
+                            </div>
+                          </div>
+                          <a 
+                            className="artifact-link" 
+                            href={`file://${yaaaDir}/tasks/${selectedTaskId || taskId}/working/${art.path}`} 
+                            target="_blank" 
+                            rel="noreferrer"
+                            style={{ fontSize: '0.85rem' }}
+                          >
+                            Open
+                          </a>
                         </div>
-                        <a className="artifact-link" href={`file://${yaaaDir}/tasks/${selectedTaskId || taskId}/working/${art.path}`} target="_blank" rel="noreferrer">Open</a>
-                      </div>
-                    ))}
-                  </div>
-                )}
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
           </div>

@@ -253,5 +253,58 @@ describe('YAAA CLI Integration & Features', () => {
       expect(exitSpy).toHaveBeenCalledTimes(1);
       expect(exitSpy).toHaveBeenCalledWith(1);
     });
+
+    it('should fetch and display task history via "task --history <taskId>"', async () => {
+      const taskId = 'history-test-task';
+      const taskDir = path.join(tempDir, 'tasks', taskId);
+      fs.mkdirSync(path.join(taskDir, 'databases'), { recursive: true });
+
+      const { SqliteStore } = await import('@yaaa/providers');
+      const store = new SqliteStore(path.join(tempDir, 'tasks'));
+      await store.saveMessage(taskId, {
+        kind: 'thought',
+        from: 'agent-planner',
+        content: 'This is a test thought'
+      });
+      store.closeAll();
+
+      process.argv = ['node', 'index.js', 'task', '--history', taskId];
+      await bootstrap();
+
+      expect(logSpy).toHaveBeenCalled();
+      const lastCall = logSpy.mock.calls.find((call: any) => call[0].includes('history-test-task') || call[0].includes('This is a test thought'));
+      expect(lastCall).toBeDefined();
+      expect(exitSpy).toHaveBeenCalledWith(0);
+    });
+
+    it('should output task history as JSON if --gui is specified', async () => {
+      const taskId = 'history-gui-test-task';
+      const taskDir = path.join(tempDir, 'tasks', taskId);
+      fs.mkdirSync(path.join(taskDir, 'databases'), { recursive: true });
+
+      const { SqliteStore } = await import('@yaaa/providers');
+      const store = new SqliteStore(path.join(tempDir, 'tasks'));
+      await store.saveMessage(taskId, {
+        kind: 'thought',
+        from: 'agent-planner',
+        content: 'Gui test thought'
+      });
+      store.closeAll();
+
+      process.argv = ['node', 'index.js', 'task', '--history', taskId, '--gui'];
+      await bootstrap();
+
+      expect(logSpy).toHaveBeenCalled();
+      const lastCall = logSpy.mock.calls.find((call: any) => {
+        try {
+          const parsed = JSON.parse(call[0]);
+          return parsed.event === 'task-history' && parsed.messages[0].content === 'Gui test thought';
+        } catch {
+          return false;
+        }
+      });
+      expect(lastCall).toBeDefined();
+      expect(exitSpy).toHaveBeenCalledWith(0);
+    });
   });
 });

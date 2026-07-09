@@ -46,6 +46,10 @@ export class TaskModel {
     return this.getElectronAPI().readTaskOrchestrator(taskId);
   }
 
+  static async getTaskHistory(taskId: string): Promise<any[]> {
+    return this.getElectronAPI().getTaskHistory(taskId);
+  }
+
   static async getYaaaDir(): Promise<string> {
     return this.getElectronAPI().getYaaaDir();
   }
