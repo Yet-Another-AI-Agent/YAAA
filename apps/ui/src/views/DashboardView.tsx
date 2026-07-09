@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState } from "react";
+import { useRef, useEffect, useState, useMemo } from "react";
 import logoImg from "../assets/logo.jpg";
 import type { TaskViewModel } from "../viewmodels/useTaskViewModel";
 import { TaskModel } from "../models/TaskModel";
@@ -226,11 +226,11 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   const [greeting] = useState(getGreeting());
   const [showTaskView, setShowTaskView] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [chatTab, setChatTab] = useState<"chat" | "agent-space">("chat");
 
   // Past task selected states
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [orchestratorMd, setOrchestratorMd] = useState<string | null>(null);
-  const [loadingOrchestrator, setLoadingOrchestrator] = useState(false);
   const [historyMessages, setHistoryMessages] = useState<any[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const activeHistoryRequestRef = useRef<string | null>(null);
@@ -238,11 +238,21 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   // YAAA data directory state
   const [yaaaDir, setYaaaDir] = useState<string>("");
 
+  // User's name from onboarding profile
+  const [userName, setUserName] = useState("");
+
   // Fetch yaaaDir on mount
   useEffect(() => {
     TaskModel.getYaaaDir()
       .then(setYaaaDir)
       .catch((err) => console.error("Failed to fetch YAAA dir:", err));
+  }, []);
+
+  // Fetch user's name from onboarding profile on mount
+  useEffect(() => {
+    TaskModel.getOnboardingProfile()
+      .then((p) => setUserName(p.name))
+      .catch((err) => console.error("Failed to fetch profile:", err));
   }, []);
 
   // Auto-scroll logs
@@ -265,7 +275,6 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   useEffect(() => {
     let active = true;
     if (selectedTaskId) {
-      setLoadingOrchestrator(true);
       (async () => {
         try {
           const content = await TaskModel.readTaskOrchestrator(selectedTaskId);
@@ -276,10 +285,6 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
           console.error("Failed to load orchestrator:", err);
           if (active) {
             setOrchestratorMd(null);
-          }
-        } finally {
-          if (active) {
-            setLoadingOrchestrator(false);
           }
         }
       })();
@@ -376,7 +381,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     ? formatChannelName(selectedTask.prompt, selectedTask.id)
     : (taskId ? formatChannelName(goal, taskId) : "general");
 
-  const memoizedData = React.useMemo(() => {
+  const memoizedData = useMemo(() => {
     let displayMessages: any[] = [];
     const parsedOrchestrator = parseOrchestratorMd(orchestratorMd);
 
@@ -477,7 +482,6 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
 
     return {
       displayMessages,
-      parsedOrchestrator,
       displaySubtasks,
       displayArtifacts,
       currentStatus
@@ -496,7 +500,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     success
   ]);
 
-  const { displayMessages, parsedOrchestrator, displaySubtasks, displayArtifacts, currentStatus } = memoizedData;
+  const { displayMessages, displaySubtasks, displayArtifacts, currentStatus } = memoizedData;
 
   return (
     <div className="dash-root fade-in-dashboard">
@@ -572,7 +576,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                 <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
               </svg>
             </button>
-            <div className="avatar-btn" title="Krishna" aria-label="User profile">
+            <div className="avatar-btn" title={userName || "User"} aria-label="User profile">
               K
             </div>
           </div>
@@ -586,7 +590,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                 <img src={logoImg} alt="YAAA logo" className="dash-brand-logo" />
                 <span className="dash-brand-label">YAAA <span className="dash-brand-sep">·</span> Yet Another AI Agent</span>
               </div>
-              <h1 className="dash-greeting">{greeting}, Krishna.</h1>
+              <h1 className="dash-greeting">{greeting}, {userName || "there"}.</h1>
             </div>
 
             {/* Mission Orchestrator Input */}
@@ -647,7 +651,28 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
         ) : (
           /* ─── SLACK WORKSPACE CHAT VIEW ─── */
           <div className="slack-chat-view-container">
-            {/* Middle slack-chat-pane */}
+            {/* Small left nav rail */}
+            <div className="chat-rail">
+              <button
+                className={`chat-rail-item ${chatTab === "chat" ? "active" : ""}`}
+                onClick={() => setChatTab("chat")}
+                title="Chat"
+              >
+                <span className="chat-rail-icon" aria-hidden="true">💬</span>
+                <span className="chat-rail-label">Chat</span>
+              </button>
+              <button
+                className={`chat-rail-item ${chatTab === "agent-space" ? "active" : ""}`}
+                onClick={() => setChatTab("agent-space")}
+                title="Agent Space"
+              >
+                <span className="chat-rail-icon" aria-hidden="true">🧠</span>
+                <span className="chat-rail-label">Agent Space</span>
+              </button>
+            </div>
+
+            {chatTab === "chat" ? (
+            /* Middle slack-chat-pane */
             <div className="slack-chat-pane">
               <div className="slack-channel-header">
                 <div className="slack-channel-header-title">
@@ -766,6 +791,49 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                 </div>
               </div>
             </div>
+            ) : (
+            /* Agent Space placeholder pane */
+            <div className="agent-space-pane">
+              <div className="agent-space-header">
+                <div className="agent-space-header-title">
+                  <span className="agent-space-header-icon" aria-hidden="true">🧠</span>
+                  <span>Agent Space</span>
+                </div>
+                <span className="agent-space-preview-tag">Preview</span>
+              </div>
+              <div className="agent-space-body">
+                <div className="agent-space-heading">What the agent thinks and does</div>
+
+                <div className="agent-space-block agent-space-thinking">
+                  <div className="agent-space-block-label">Thinking</div>
+                  <div className="agent-space-block-text">
+                    Analyzing the request and breaking it into subtasks…
+                  </div>
+                </div>
+
+                <div className="agent-space-block">
+                  <div className="agent-space-block-label">Actions</div>
+                  <div className="agent-space-action-row">
+                    <span className="agent-space-action-icon" aria-hidden="true">🔧</span>
+                    <span className="agent-space-action-text">Ran: <code>read_file(package.json)</code></span>
+                  </div>
+                  <div className="agent-space-action-row">
+                    <span className="agent-space-action-icon" aria-hidden="true">🌐</span>
+                    <span className="agent-space-action-text">Searched web: <code>'vite ESM config'</code></span>
+                  </div>
+                  <div className="agent-space-action-row">
+                    <span className="agent-space-action-icon" aria-hidden="true">📝</span>
+                    <span className="agent-space-action-text">Wrote: <code>notes.md</code></span>
+                  </div>
+                </div>
+
+                <div className="agent-space-note">
+                  This is a preview of the Agent Space. Live reasoning and tool activity will
+                  appear here in a future release.
+                </div>
+              </div>
+            </div>
+            )}
 
             {/* Right slack-details-sidebar */}
             <div className="slack-details-sidebar">
@@ -773,19 +841,76 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                 Mission Details
               </div>
               <div className="slack-details-content">
-                {/* Status section */}
-                <div style={{ marginBottom: '1rem' }}>
-                  <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '0.5rem' }}>Status</div>
-                  <span className={`detail-status-pill ${currentStatus}`}>
-                    {currentStatus ? currentStatus.toUpperCase() : "PENDING"}
-                  </span>
+                {/* ── 1. Artifacts (REAL) ── */}
+                <div className="slack-details-section">
+                  <div className="slack-section-title">Artifacts</div>
+                  {displayArtifacts.length === 0 ? (
+                    <div className="slack-section-empty">
+                      No artifacts generated yet.
+                    </div>
+                  ) : (
+                    <div className="artifact-list">
+                      {displayArtifacts.map((art, idx) => (
+                        <div key={idx} className="artifact-item">
+                          <div style={{ minWidth: 0, flex: 1, paddingRight: '8px' }}>
+                            <div className="artifact-name" style={{ fontSize: '0.85rem', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {art.path.split("/").pop()}
+                            </div>
+                            <div className="artifact-desc" style={{ fontSize: '0.75rem', color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {art.description}
+                            </div>
+                          </div>
+                          {(!yaaaDir || !(selectedTaskId || taskId)) ? (
+                            <span className="artifact-link disabled" style={{ opacity: 0.5, cursor: 'not-allowed', fontSize: '0.85rem' }}>
+                              Open
+                            </span>
+                          ) : (
+                            <a
+                              className="artifact-link"
+                              href={getArtifactHref(yaaaDir, selectedTaskId || taskId, art.path)}
+                              target="_blank"
+                              rel="noreferrer"
+                              style={{ fontSize: '0.85rem' }}
+                            >
+                              Open
+                            </a>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
 
-                {/* Subtasks Section */}
-                <div>
-                  <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '0.75rem' }}>Execution Plan</div>
+                {/* ── 2. Working folder (HARDCODED placeholder) ── */}
+                <div className="slack-details-section">
+                  <div className="slack-section-title">Working folder</div>
+                  <div className="working-folder-path">
+                    ~/.yaaa/tasks/{(selectedTaskId || taskId || "current").toString().substring(0, 8)}
+                  </div>
+                  <div className="working-folder-list">
+                    <div className="working-folder-row">
+                      <span className="working-folder-icon" aria-hidden="true">📁</span>
+                      <span className="working-folder-name">working/</span>
+                    </div>
+                    <div className="working-folder-row">
+                      <span className="working-folder-icon" aria-hidden="true">📄</span>
+                      <span className="working-folder-name">orchestrator.md</span>
+                    </div>
+                    <div className="working-folder-row">
+                      <span className="working-folder-icon" aria-hidden="true">📄</span>
+                      <span className="working-folder-name">messages.jsonl</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* ── 3. Todo and Progress (REAL: status + execution plan) ── */}
+                <div className="slack-details-section">
+                  <div className="slack-section-title">Todo and Progress</div>
+                  <span className={`detail-status-pill ${currentStatus}`} style={{ marginBottom: '0.75rem', display: 'inline-block' }}>
+                    {currentStatus ? currentStatus.toUpperCase() : "PENDING"}
+                  </span>
                   {displaySubtasks.length === 0 ? (
-                    <div style={{ color: 'var(--text-muted)', fontSize: '0.9rem', fontStyle: 'italic' }}>
+                    <div className="slack-section-empty">
                       {selectedTaskId ? "No subtasks recorded." : (running ? "Generating plan..." : "Awaiting plan...")}
                     </div>
                   ) : (
@@ -812,44 +937,33 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   )}
                 </div>
 
-                {/* Artifacts Section */}
-                <div style={{ borderTop: '1px solid var(--border-color)', paddingTop: '1.25rem' }}>
-                  <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '0.75rem' }}>Artifacts</div>
-                  {displayArtifacts.length === 0 ? (
-                    <div style={{ color: 'var(--text-muted)', fontSize: '0.9rem', fontStyle: 'italic' }}>
-                      No artifacts generated yet.
+                {/* ── 4. Contexts (HARDCODED placeholder) ── */}
+                <div className="slack-details-section">
+                  <div className="slack-section-title">Contexts</div>
+                  <div className="context-chips">
+                    <span className="context-chip">Project: yaaa</span>
+                    <span className="context-chip">Language: TypeScript</span>
+                    <span className="context-chip">Runtime: Electron</span>
+                  </div>
+                </div>
+
+                {/* ── 5. Active Integrations (HARDCODED placeholder) ── */}
+                <div className="slack-details-section">
+                  <div className="slack-section-title">Active Integrations</div>
+                  <div className="integration-list">
+                    <div className="integration-row">
+                      <span className="integration-name">Slack</span>
+                      <span className="integration-status connected">connected</span>
                     </div>
-                  ) : (
-                    <div className="artifact-list">
-                      {displayArtifacts.map((art, idx) => (
-                        <div key={idx} className="artifact-item">
-                          <div style={{ minWidth: 0, flex: 1, paddingRight: '8px' }}>
-                            <div className="artifact-name" style={{ fontSize: '0.85rem', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                              {art.path.split("/").pop()}
-                            </div>
-                            <div className="artifact-desc" style={{ fontSize: '0.75rem', color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                              {art.description}
-                            </div>
-                          </div>
-                          {(!yaaaDir || !(selectedTaskId || taskId)) ? (
-                            <span className="artifact-link disabled" style={{ opacity: 0.5, cursor: 'not-allowed', fontSize: '0.85rem' }}>
-                              Open
-                            </span>
-                          ) : (
-                            <a 
-                              className="artifact-link" 
-                              href={getArtifactHref(yaaaDir, selectedTaskId || taskId, art.path)} 
-                              target="_blank" 
-                              rel="noreferrer"
-                              style={{ fontSize: '0.85rem' }}
-                            >
-                              Open
-                            </a>
-                          )}
-                        </div>
-                      ))}
+                    <div className="integration-row">
+                      <span className="integration-name">GitHub</span>
+                      <span className="integration-status connected">connected</span>
                     </div>
-                  )}
+                    <div className="integration-row">
+                      <span className="integration-name">Web Search</span>
+                      <span className="integration-status enabled">enabled</span>
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>

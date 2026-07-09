@@ -323,6 +323,18 @@ ipcMain.handle("get-onboarding-status", async () => {
 });
 
 /**
+ * IPC handler to retrieve the saved onboarding personalization profile.
+ */
+ipcMain.handle("get-onboarding-profile", async () => {
+  const config = loadConfig();
+  return {
+    name: config.userName || "",
+    profession: config.userProfession || "",
+    description: config.userDescription || "",
+  };
+});
+
+/**
  * IPC handler to save the Mesh API access key.
  */
 ipcMain.handle("save-onboarding-keys", async (event, key) => {

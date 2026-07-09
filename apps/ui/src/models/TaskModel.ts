@@ -48,7 +48,7 @@ export class TaskModel {
   static async readTaskOrchestrator(taskId: string): Promise<string | null> {
     return this.getElectronAPI().readTaskOrchestrator(taskId);
   }
-
+  /**
    * Retrieves the complete execution log and chat history messages for a specific task.
    * @param {string} taskId - The unique identifier of the task.
    * @returns {Promise<any[]>} A promise resolving to an array of log/chat message objects.
@@ -73,6 +73,17 @@ export class TaskModel {
     skipped: boolean;
   }> {
     return this.getElectronAPI().getOnboardingStatus();
+  }
+
+  /**
+   * Retrieves the saved onboarding personalization profile (name, profession, description).
+   */
+  static async getOnboardingProfile(): Promise<{
+    name: string;
+    profession: string;
+    description: string;
+  }> {
+    return this.getElectronAPI().getOnboardingProfile();
   }
 
   /**
