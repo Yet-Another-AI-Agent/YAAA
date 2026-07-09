@@ -34,7 +34,10 @@ export class TaskModel {
     return this.getElectronAPI().startTask(goal);
   }
 
-  static async resolveApproval(callId: string, approved: boolean): Promise<any> {
+  static async resolveApproval(
+    callId: string,
+    approved: boolean,
+  ): Promise<any> {
     return this.getElectronAPI().resolveApproval(callId, approved);
   }
 
@@ -50,10 +53,35 @@ export class TaskModel {
     return this.getElectronAPI().getYaaaDir();
   }
 
+  static async getOnboardingStatus(): Promise<{
+    hasKey: boolean;
+    hasProfile: boolean;
+    skipped: boolean;
+  }> {
+    return this.getElectronAPI().getOnboardingStatus();
+  }
+
+  static async saveOnboardingKeys(key: string): Promise<{ success: boolean }> {
+    return this.getElectronAPI().saveOnboardingKeys(key);
+  }
+
+  static async saveOnboardingProfile(profile: {
+    name?: string;
+    profession?: string;
+    description?: string;
+    skip?: boolean;
+  }): Promise<{ success: boolean }> {
+    return this.getElectronAPI().saveOnboardingProfile(profile);
+  }
+
+  static async parseResume(text: string): Promise<any> {
+    return this.getElectronAPI().parseResume(text);
+  }
+
   static subscribeEvents(
     onEvent: (eventData: { topic: string; data: any }) => void,
     onApproval: (approvalData: { agentId: string; toolCall: any }) => void,
-    onComplete: (resultData: { success: boolean; summary: string }) => void
+    onComplete: (resultData: { success: boolean; summary: string }) => void,
   ): () => void {
     const api = this.getElectronAPI();
 

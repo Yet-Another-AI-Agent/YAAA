@@ -5,7 +5,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
   resolveApproval: (callId, approved) =>
     ipcRenderer.invoke("resolve-approval", { callId, approved }),
   listTasks: () => ipcRenderer.invoke("list-tasks"),
-  readTaskOrchestrator: (taskId) => ipcRenderer.invoke("read-task-orchestrator", taskId),
+  readTaskOrchestrator: (taskId) =>
+    ipcRenderer.invoke("read-task-orchestrator", taskId),
   getYaaaDir: () => ipcRenderer.invoke("get-yaaa-dir"),
   onTaskEvent: (callback) => {
     const subscription = (event, value) => callback(value);
@@ -22,4 +23,9 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.on("task-complete", subscription);
     return () => ipcRenderer.removeListener("task-complete", subscription);
   },
+  getOnboardingStatus: () => ipcRenderer.invoke("get-onboarding-status"),
+  saveOnboardingKeys: (key) => ipcRenderer.invoke("save-onboarding-keys", key),
+  saveOnboardingProfile: (profile) =>
+    ipcRenderer.invoke("save-onboarding-profile", profile),
+  parseResume: (text) => ipcRenderer.invoke("parse-resume", text),
 });

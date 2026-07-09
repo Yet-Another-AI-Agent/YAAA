@@ -24,7 +24,7 @@ Args:       ${JSON.stringify(call.args, null, 2)}
 Approve? (y/n): `,
       (answer) => {
         resolve(answer.trim().toLowerCase() === "y");
-      }
+      },
     );
   });
 }
@@ -36,7 +36,7 @@ function askUserApprovalGui(agentId: string, call: any): Promise<boolean> {
       event: "approval-required",
       agentId,
       toolCall: call,
-    })
+    }),
   );
 
   // Wait for stdin input: "y\n" or "n\n"
@@ -58,7 +58,7 @@ function writeOrchestratorMd(
   prompt: string,
   status: string,
   plan: any,
-  ledgerEntries: any[]
+  ledgerEntries: any[],
 ) {
   const mdPath = path.join(taskDir, "orchestrator.md");
   let content = `${ORCHESTRATOR_MD_HEADERS.TITLE}\n\n`;
@@ -106,7 +106,11 @@ function writeOrchestratorMd(
   fs.writeFileSync(mdPath, content, "utf-8");
 }
 
-export async function executeTask(auth: CliAuth, goal: string, guiMode: boolean): Promise<boolean> {
+export async function executeTask(
+  auth: CliAuth,
+  goal: string,
+  guiMode: boolean,
+): Promise<boolean> {
   const taskId = crypto.randomUUID();
   const yaaaDir = auth.getYaaaDir();
   const taskDir = path.join(yaaaDir, "tasks", taskId);
@@ -125,7 +129,7 @@ export async function executeTask(auth: CliAuth, goal: string, guiMode: boolean)
   fs.writeFileSync(
     orchestratorMdPath,
     `${ORCHESTRATOR_MD_HEADERS.TITLE}\n\n* **Task ID**: ${taskId}\n* **Prompt**: ${goal}\n* **Status**: pending\n* **Created At**: ${new Date().toISOString()}\n\n${ORCHESTRATOR_MD_HEADERS.PLAN}\n*(Generating plan...)*\n`,
-    "utf-8"
+    "utf-8",
   );
 
   const modelsConfigPath = path.join(taskDir, "models");
@@ -133,27 +137,33 @@ export async function executeTask(auth: CliAuth, goal: string, guiMode: boolean)
   fs.writeFileSync(
     modelsConfigPath,
     JSON.stringify(configData.preferredModels || {}, null, 2),
-    "utf-8"
+    "utf-8",
   );
 
-  fs.writeFileSync(path.join(taskDir, "agents"), JSON.stringify([], null, 2), "utf-8");
+  fs.writeFileSync(
+    path.join(taskDir, "agents"),
+    JSON.stringify([], null, 2),
+    "utf-8",
+  );
 
   // Save to main.db
   const mainDb = auth.getMainDbConnection();
   try {
-    mainDb.prepare("INSERT INTO tasks (id, prompt, status, path) VALUES (?, ?, ?, ?)").run(
-      taskId,
-      goal,
-      "running",
-      taskDir
-    );
+    mainDb
+      .prepare(
+        "INSERT INTO tasks (id, prompt, status, path) VALUES (?, ?, ?, ?)",
+      )
+      .run(taskId, goal, "running", taskDir);
   } catch (err: any) {
     if (guiMode) {
       console.log(
         JSON.stringify({
           event: "complete",
-          result: { success: false, summary: `Failed to insert task to main db: ${err.message}` },
-        })
+          result: {
+            success: false,
+            summary: `Failed to insert task to main db: ${err.message}`,
+          },
+        }),
       );
     } else {
       console.error("Failed to insert task to main db:", err.message);
@@ -204,21 +214,34 @@ export async function executeTask(auth: CliAuth, goal: string, guiMode: boolean)
   // 4. Subscribe to message bus events for live stdout streaming and orchestrator.md updates
   bus.subscribe(`task.${taskId}.agent.*.thought`, (topic, msg) => {
     if (guiMode) {
-      const agentName = topic.split(".").find((p) => p.includes("agent-")) || "agent";
-      console.log(JSON.stringify({ event: "thought", from: agentName, content: msg.content }));
+      const agentName =
+        topic.split(".").find((p) => p.includes("agent-")) || "agent";
+      console.log(
+        JSON.stringify({
+          event: "thought",
+          from: agentName,
+          content: msg.content,
+        }),
+      );
     } else {
-      console.log(`\n💬 [\x1b[36mTHOUGHT\x1b[0m] [${msg.from}]: ${msg.content}`);
+      console.log(
+        `\n💬 [\x1b[36mTHOUGHT\x1b[0m] [${msg.from}]: ${msg.content}`,
+      );
     }
   });
 
   bus.subscribe(`task.${taskId}.agent_message`, (topic, msg) => {
     if (msg.kind === "result") {
       if (!guiMode) {
-        console.log(`\n✅ [\x1b[32mRESULT\x1b[0m] [${msg.from}]: ${msg.summary}`);
+        console.log(
+          `\n✅ [\x1b[32mRESULT\x1b[0m] [${msg.from}]: ${msg.summary}`,
+        );
         if (msg.artifacts && msg.artifacts.length > 0) {
           console.log("Artifacts produced:");
           for (const art of msg.artifacts) {
-            console.log(`  - [${art.mimeType}] ${art.path} : ${art.description}`);
+            console.log(
+              `  - [${art.mimeType}] ${art.path} : ${art.description}`,
+            );
           }
         }
       }
@@ -246,10 +269,9 @@ export async function executeTask(auth: CliAuth, goal: string, guiMode: boolean)
 
     // Update status in main.db
     const mainDbUpdate = auth.getMainDbConnection();
-    mainDbUpdate.prepare("UPDATE tasks SET status = ? WHERE id = ?").run(
-      result.success ? "success" : "failed",
-      taskId
-    );
+    mainDbUpdate
+      .prepare("UPDATE tasks SET status = ? WHERE id = ?")
+      .run(result.success ? "success" : "failed", taskId);
     mainDbUpdate.close();
 
     // Query facts/ledger to populate final orchestrator.md
@@ -260,7 +282,7 @@ export async function executeTask(auth: CliAuth, goal: string, guiMode: boolean)
       goal,
       result.success ? "success" : "failed",
       result.plan,
-      ledgerEntries
+      ledgerEntries,
     );
 
     // Save active agents
@@ -269,14 +291,20 @@ export async function executeTask(auth: CliAuth, goal: string, guiMode: boolean)
       .filter((m: any) => m.from && m.from.includes("agent-"))
       .map((m: any) => m.from);
     const uniqueAgents = Array.from(new Set(agents));
-    fs.writeFileSync(path.join(taskDir, "agents"), JSON.stringify(uniqueAgents, null, 2), "utf-8");
+    fs.writeFileSync(
+      path.join(taskDir, "agents"),
+      JSON.stringify(uniqueAgents, null, 2),
+      "utf-8",
+    );
 
     if (guiMode) {
       console.log(JSON.stringify({ event: "complete", result }));
     } else {
       console.log("\n========================================");
       console.log("🏁 Task execution finished!");
-      console.log(`Status: ${result.success ? "\x1b[32mSUCCESS\x1b[0m" : "\x1b[31mFAILED\x1b[0m"}`);
+      console.log(
+        `Status: ${result.success ? "\x1b[32mSUCCESS\x1b[0m" : "\x1b[31mFAILED\x1b[0m"}`,
+      );
       console.log(`Summary: ${result.summary}`);
       console.log("========================================\n");
     }
@@ -284,17 +312,31 @@ export async function executeTask(auth: CliAuth, goal: string, guiMode: boolean)
   } catch (err: any) {
     // Update status to failed in main.db
     const mainDbUpdate = auth.getMainDbConnection();
-    mainDbUpdate.prepare("UPDATE tasks SET status = ? WHERE id = ?").run("failed", taskId);
+    mainDbUpdate
+      .prepare("UPDATE tasks SET status = ? WHERE id = ?")
+      .run("failed", taskId);
     mainDbUpdate.close();
 
     try {
       const finalPlan = await store.getPlan(taskId);
       const ledgerEntries = await store.getLedgerEntries(taskId);
-      writeOrchestratorMd(taskDir, taskId, goal, "failed", finalPlan, ledgerEntries);
+      writeOrchestratorMd(
+        taskDir,
+        taskId,
+        goal,
+        "failed",
+        finalPlan,
+        ledgerEntries,
+      );
     } catch {}
 
     if (guiMode) {
-      console.log(JSON.stringify({ event: "complete", result: { success: false, summary: err.message } }));
+      console.log(
+        JSON.stringify({
+          event: "complete",
+          result: { success: false, summary: err.message },
+        }),
+      );
     } else {
       console.error("Fatal execution error:", err.message);
     }
@@ -317,6 +359,10 @@ Commands:
   task -ls, task --list             List all tasks stored in the main database
   config --key <key_value>           Configure your Mesh API access key
   config --model <role> <model_id>   Choose your preferred model for an agent role
+  config --name "<value>"            Configure your user name
+  config --profession "<value>"      Configure your user profession
+  config --description "<value>"     Configure your user description
+  config --show                      Show all current configuration settings
 
 Agent Roles for Model config:
   planner, worker, verifier, utility
@@ -359,7 +405,9 @@ export async function bootstrap() {
     if (subFlag === "--key" || subFlag === "-k") {
       const keyValue = cleanArgs[2];
       if (!keyValue) {
-        console.error("Error: Please provide a key value. Example: npm start config --key <key>");
+        console.error(
+          "Error: Please provide a key value. Example: npm start config --key <key>",
+        );
         rl.close();
         process.exit(1);
         return;
@@ -375,14 +423,16 @@ export async function bootstrap() {
       const modelId = cleanArgs[3];
       if (!role || !modelId) {
         console.error(
-          "Error: Please provide role and model ID. Example: npm start config --model worker openai/gpt-4o"
+          "Error: Please provide role and model ID. Example: npm start config --model worker openai/gpt-4o",
         );
         rl.close();
         process.exit(1);
         return;
       }
       if (!["planner", "worker", "verifier", "utility"].includes(role)) {
-        console.error("Error: Role must be one of: planner, worker, verifier, utility");
+        console.error(
+          "Error: Role must be one of: planner, worker, verifier, utility",
+        );
         rl.close();
         process.exit(1);
         return;
@@ -392,12 +442,149 @@ export async function bootstrap() {
       }
       config.preferredModels[role as any] = modelId;
       auth.saveConfig(config);
-      console.log(`✅ Preferred model for role "${role}" set to "${modelId}" in config.json`);
+      console.log(
+        `✅ Preferred model for role "${role}" set to "${modelId}" in config.json`,
+      );
+      rl.close();
+      process.exit(0);
+      return;
+    } else if (subFlag === "--name") {
+      const nameValue = cleanArgs[2];
+      if (!nameValue) {
+        console.error(
+          "Error: Please provide a name value. Example: npm start config --name <name>",
+        );
+        rl.close();
+        process.exit(1);
+        return;
+      }
+      config.userName = nameValue;
+      auth.saveConfig(config);
+      console.log("✅ User name updated successfully in config.json");
+      rl.close();
+      process.exit(0);
+      return;
+    } else if (subFlag === "--profession") {
+      const professionValue = cleanArgs[2];
+      if (!professionValue) {
+        console.error(
+          "Error: Please provide a profession value. Example: npm start config --profession <profession>",
+        );
+        rl.close();
+        process.exit(1);
+        return;
+      }
+      config.userProfession = professionValue;
+      auth.saveConfig(config);
+      console.log("✅ User profession updated successfully in config.json");
+      rl.close();
+      process.exit(0);
+      return;
+    } else if (subFlag === "--description") {
+      const descriptionValue = cleanArgs[2];
+      if (!descriptionValue) {
+        console.error(
+          "Error: Please provide a description value. Example: npm start config --description <description>",
+        );
+        rl.close();
+        process.exit(1);
+        return;
+      }
+      config.userDescription = descriptionValue;
+      auth.saveConfig(config);
+      console.log("✅ User description updated successfully in config.json");
+      rl.close();
+      process.exit(0);
+      return;
+    } else if (subFlag === "--parse-resume") {
+      const text = cleanArgs[2];
+      if (!text) {
+        console.error(
+          'Error: Please provide resume text. Example: npm start config --parse-resume "<text>"',
+        );
+        rl.close();
+        process.exit(1);
+        return;
+      }
+
+      const mockResult = {
+        name: "Mock User",
+        profession: "Software Engineer",
+        description: "Biography extracted from resume.",
+      };
+
+      const apiKey = config.accessToken || process.env.MESH_API_KEY;
+      if (!apiKey) {
+        console.log(JSON.stringify(mockResult, null, 2));
+        rl.close();
+        process.exit(0);
+        return;
+      }
+
+      try {
+        const gateway = new MeshGateway({
+          apiKey: apiKey,
+          modelMapping: config.preferredModels || undefined,
+        });
+        const systemPrompt =
+          'You are a resume data extractor. Respond ONLY with a valid JSON object matching the format: { "name": "...", "profession": "...", "description": "..." }.';
+        const messages = [
+          { role: "system" as const, content: systemPrompt },
+          { role: "user" as const, content: text },
+        ];
+        const resultText = await gateway.chat(messages, {
+          modelRole: "utility",
+          jsonMode: true,
+          temperature: 0,
+        });
+
+        try {
+          const parsed = JSON.parse(resultText);
+          if (parsed && typeof parsed === "object") {
+            console.log(JSON.stringify(parsed, null, 2));
+          } else {
+            throw new Error("Invalid output structure");
+          }
+        } catch {
+          console.log(JSON.stringify(mockResult, null, 2));
+        }
+      } catch {
+        console.log(JSON.stringify(mockResult, null, 2));
+      }
+      rl.close();
+      process.exit(0);
+      return;
+    } else if (subFlag === "--show") {
+      console.log(
+        "\n=================== YAAA CONFIGURATION ===================",
+      );
+      console.log(`Access Token:      ${config.accessToken || "(Not set)"}`);
+      console.log(`User Name:         ${config.userName || "(Not set)"}`);
+      console.log(`User Profession:   ${config.userProfession || "(Not set)"}`);
+      console.log(
+        `User Description:  ${config.userDescription || "(Not set)"}`,
+      );
+      console.log("Preferred Models:");
+      if (
+        config.preferredModels &&
+        Object.keys(config.preferredModels).length > 0
+      ) {
+        for (const [role, model] of Object.entries(config.preferredModels)) {
+          console.log(`  - ${role}: ${model}`);
+        }
+      } else {
+        console.log("  (None set, using defaults)");
+      }
+      console.log(
+        "==========================================================\n",
+      );
       rl.close();
       process.exit(0);
       return;
     } else {
-      console.error("Unknown config option. Use config --key <key> or config --model <role> <model_id>");
+      console.error(
+        "Unknown config option. Use config --key <key>, config --model <role> <model_id>, config --name <name>, config --profession <profession>, config --description <description>, config --parse-resume <text>, or config --show",
+      );
       rl.close();
       process.exit(1);
       return;
@@ -409,20 +596,28 @@ export async function bootstrap() {
     if (subFlag === "-ls" || subFlag === "--list") {
       const db = auth.getMainDbConnection();
       try {
-        const rows = db.prepare("SELECT id, prompt, status, created_at FROM tasks ORDER BY created_at DESC").all() as any[];
+        const rows = db
+          .prepare(
+            "SELECT id, prompt, status, created_at FROM tasks ORDER BY created_at DESC",
+          )
+          .all() as any[];
         if (guiMode) {
           console.log(JSON.stringify({ event: "task-list", tasks: rows }));
         } else {
           if (rows.length === 0) {
             console.log("No tasks found in main database.");
           } else {
-            console.log("\n=================== YAAA TASKS LIST ===================");
+            console.log(
+              "\n=================== YAAA TASKS LIST ===================",
+            );
             for (const row of rows) {
               console.log(`ID:      ${row.id}`);
               console.log(`Prompt:  "${row.prompt}"`);
               console.log(`Status:  ${row.status.toUpperCase()}`);
               console.log(`Created: ${row.created_at}`);
-              console.log("-------------------------------------------------------");
+              console.log(
+                "-------------------------------------------------------",
+              );
             }
           }
         }
@@ -437,7 +632,9 @@ export async function bootstrap() {
     } else if (subFlag === "-n" || subFlag === "--create") {
       const goal = cleanArgs[2];
       if (!goal) {
-        console.error('Error: Please provide a task prompt/goal. Example: npm start task -n "My prompt"');
+        console.error(
+          'Error: Please provide a task prompt/goal. Example: npm start task -n "My prompt"',
+        );
         rl.close();
         process.exit(1);
         return;
@@ -452,7 +649,7 @@ export async function bootstrap() {
       return;
     } else {
       console.error(
-        "Unknown task option. Use task -n \"<prompt>\" to create a task, or task -ls to list tasks."
+        'Unknown task option. Use task -n "<prompt>" to create a task, or task -ls to list tasks.',
       );
       rl.close();
       process.exit(1);
@@ -460,7 +657,9 @@ export async function bootstrap() {
     }
   }
 
-  console.error(`Unknown command: ${mainCommand}. Use -h or --help for instructions.`);
+  console.error(
+    `Unknown command: ${mainCommand}. Use -h or --help for instructions.`,
+  );
   rl.close();
   process.exit(1);
   return;
