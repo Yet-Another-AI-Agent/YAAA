@@ -45,7 +45,7 @@ ipcMain.handle("start-task", async (event, goal) => {
   }
 
   const taskId = `task-${Math.random().toString(36).substr(2, 6)}`;
-  
+
   // Resolve path to CLI compiled index.js
   const cliPath = path.resolve(__dirname, "../cli/dist/index.js");
 
@@ -69,7 +69,7 @@ ipcMain.handle("start-task", async (event, goal) => {
 
       try {
         const payload = JSON.parse(trimmed);
-        
+
         if (!mainWindow || mainWindow.isDestroyed()) continue;
 
         if (payload.event === "plan-updated") {
@@ -139,7 +139,9 @@ ipcMain.handle("start-task", async (event, goal) => {
 
 ipcMain.handle("resolve-approval", async (event, { callId, approved }) => {
   if (cliProcess) {
-    console.log(`[IPC Resolve Approval] Writing to CLI stdin: ${approved ? "y" : "n"}`);
+    console.log(
+      `[IPC Resolve Approval] Writing to CLI stdin: ${approved ? "y" : "n"}`,
+    );
     cliProcess.stdin.write(approved ? "y\n" : "n\n");
     return { status: "success" };
   }
@@ -275,6 +277,134 @@ ipcMain.handle("read-task-orchestrator", async (event, taskId) => {
 
 ipcMain.handle("get-yaaa-dir", async (event) => {
   return process.env.YAAA_DATA_DIR || path.join(os.homedir(), ".yaaa");
+});
+
+/**
+ * Loads the local configuration from config.json.
+ * @returns {object} The parsed configuration object.
+ */
+function loadConfig() {
+  const yaaaDir = process.env.YAAA_DATA_DIR || path.join(os.homedir(), ".yaaa");
+  const configPath = path.join(yaaaDir, "config.json");
+  if (!fs.existsSync(configPath)) {
+    return {};
+  }
+  try {
+    const raw = fs.readFileSync(configPath, "utf-8");
+    return JSON.parse(raw);
+  } catch (e) {
+    return {};
+  }
+}
+
+/**
+ * Saves the configuration object to config.json.
+ * @param {object} config - The configuration data to save.
+ */
+function saveConfig(config) {
+  const yaaaDir = process.env.YAAA_DATA_DIR || path.join(os.homedir(), ".yaaa");
+  if (!fs.existsSync(yaaaDir)) {
+    fs.mkdirSync(yaaaDir, { recursive: true });
+  }
+  const configPath = path.join(yaaaDir, "config.json");
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
+}
+
+/**
+ * IPC handler to check if user has Mesh key and personalization profile set up.
+ */
+ipcMain.handle("get-onboarding-status", async () => {
+  const config = loadConfig();
+  return {
+    hasKey: !!config.accessToken,
+    hasProfile: !!config.userName,
+    skipped: !!config.skipOnboarding,
+  };
+});
+
+/**
+ * IPC handler to save the Mesh API access key.
+ */
+ipcMain.handle("save-onboarding-keys", async (event, key) => {
+  const config = loadConfig();
+  config.accessToken = key;
+  saveConfig(config);
+  return { success: true };
+});
+
+/**
+ * IPC handler to save onboarding personalization details.
+ */
+ipcMain.handle(
+  "save-onboarding-profile",
+  async (event, { name, profession, description, skip } = {}) => {
+    const config = loadConfig();
+    if (name !== undefined) config.userName = name;
+    if (profession !== undefined) config.userProfession = profession;
+    if (description !== undefined) config.userDescription = description;
+    if (skip) {
+      config.skipOnboarding = true;
+    }
+    saveConfig(config);
+    return { success: true };
+  },
+);
+
+/**
+ * IPC handler to parse resume content via CLI utility.
+ */
+ipcMain.handle("parse-resume", async (event, text) => {
+  return new Promise((resolve) => {
+    const cliPath = path.resolve(__dirname, "../cli/dist/index.js");
+    const child = spawn("node", [cliPath, "config", "--parse-resume"], {
+      cwd: path.resolve(__dirname, "../cli"),
+    });
+
+    let output = "";
+    let errorOutput = "";
+
+    const timeout = setTimeout(() => {
+      console.error("parse-resume process timed out. Killing child.");
+      child.kill();
+      resolve({ error: "Resume parsing timed out" });
+    }, 30000);
+
+    // Write resume text to CLI stdin
+    child.stdin.write(text || "");
+    child.stdin.end();
+
+    child.stdout.on("data", (data) => {
+      output += data.toString();
+    });
+
+    child.stderr.on("data", (data) => {
+      errorOutput += data.toString();
+    });
+
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+      try {
+        const startIndex = output.indexOf("{");
+        if (startIndex !== -1) {
+          const jsonString = output.substring(
+            startIndex,
+            output.lastIndexOf("}") + 1,
+          );
+          const parsed = JSON.parse(jsonString);
+          resolve(parsed);
+        } else {
+          resolve({ error: "No JSON found in CLI output", raw: output });
+        }
+      } catch (err) {
+        resolve({ error: "Failed to parse CLI output", raw: output });
+      }
+    });
+
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      resolve({ error: err.message });
+    });
+  });
 });
 
 app.whenReady().then(() => {

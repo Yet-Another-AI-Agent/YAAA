@@ -28,15 +28,15 @@
  * ------------------------------------------------------------
  */
 
-import fs from 'node:fs';
-import path from 'node:path';
-import os from 'node:os';
-import Database from 'better-sqlite3';
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import Database from "better-sqlite3";
 
 export interface ModelConfig {
   id: string;
   name: string;
-  role: 'planner' | 'worker' | 'verifier' | 'utility';
+  role: "planner" | "worker" | "verifier" | "utility";
   provider: string;
 }
 
@@ -45,8 +45,11 @@ export interface AuthConfig {
   meshKeys?: Record<string, string>;
   preferredModels?: Record<string, string>;
   models: ModelConfig[];
-  mainModel: string;          // default model for workers
-  orchestratorModel: string;  // the "queen" model for planning/orchestration
+  mainModel: string; // default model for workers
+  orchestratorModel: string; // the "queen" model for planning/orchestration
+  userName?: string;
+  userProfession?: string;
+  userDescription?: string;
 }
 
 export interface AuthResult {
@@ -57,10 +60,20 @@ export interface AuthResult {
 
 /** Default models matching MeshGateway's built-in modelMapping. */
 const DEFAULT_MODELS: ModelConfig[] = [
-  { id: 'openai/gpt-4o',         name: 'GPT-4o',          role: 'planner',  provider: 'openai'  },
-  { id: 'openai/gpt-4o',         name: 'GPT-4o',          role: 'worker',   provider: 'openai'  },
-  { id: 'google/gemini-3.1-pro', name: 'Gemini 3.1 Pro',  role: 'verifier', provider: 'google'  },
-  { id: 'openai/gpt-4o-mini',    name: 'GPT-4o Mini',     role: 'utility',  provider: 'openai'  },
+  { id: "openai/gpt-4o", name: "GPT-4o", role: "planner", provider: "openai" },
+  { id: "openai/gpt-4o", name: "GPT-4o", role: "worker", provider: "openai" },
+  {
+    id: "google/gemini-3.1-pro",
+    name: "Gemini 3.1 Pro",
+    role: "verifier",
+    provider: "google",
+  },
+  {
+    id: "openai/gpt-4o-mini",
+    name: "GPT-4o Mini",
+    role: "utility",
+    provider: "openai",
+  },
 ];
 
 export class CliAuth {
@@ -68,8 +81,9 @@ export class CliAuth {
   private yaaaDir: string;
 
   constructor(configPath?: string) {
-    this.yaaaDir = process.env.YAAA_DATA_DIR ?? path.join(os.homedir(), '.yaaa');
-    this.configPath = configPath ?? path.join(this.yaaaDir, 'config.json');
+    this.yaaaDir =
+      process.env.YAAA_DATA_DIR ?? path.join(os.homedir(), ".yaaa");
+    this.configPath = configPath ?? path.join(this.yaaaDir, "config.json");
     if (!fs.existsSync(this.yaaaDir)) {
       fs.mkdirSync(this.yaaaDir, { recursive: true });
       fs.chmodSync(this.yaaaDir, 0o700);
@@ -85,7 +99,7 @@ export class CliAuth {
       return {};
     }
     try {
-      const raw = fs.readFileSync(this.configPath, 'utf-8');
+      const raw = fs.readFileSync(this.configPath, "utf-8");
       return JSON.parse(raw);
     } catch {
       return {};
@@ -93,14 +107,17 @@ export class CliAuth {
   }
 
   saveConfig(config: Partial<AuthConfig>): void {
-    fs.writeFileSync(this.configPath, JSON.stringify(config, null, 2), { encoding: 'utf-8', mode: 0o600 });
+    fs.writeFileSync(this.configPath, JSON.stringify(config, null, 2), {
+      encoding: "utf-8",
+      mode: 0o600,
+    });
     if (fs.existsSync(this.configPath)) {
       fs.chmodSync(this.configPath, 0o600);
     }
   }
 
   getMainDbConnection(): Database.Database {
-    const dbPath = path.join(this.yaaaDir, 'main.db');
+    const dbPath = path.join(this.yaaaDir, "main.db");
     const db = new Database(dbPath);
     db.exec(`
       CREATE TABLE IF NOT EXISTS tasks (
@@ -123,13 +140,13 @@ export class CliAuth {
       return null;
     }
     try {
-      const raw = fs.readFileSync(this.configPath, 'utf-8');
+      const raw = fs.readFileSync(this.configPath, "utf-8");
       const parsed: unknown = JSON.parse(raw);
       if (
         parsed !== null &&
-        typeof parsed === 'object' &&
-        'accessToken' in parsed &&
-        typeof (parsed as Record<string, unknown>).accessToken === 'string'
+        typeof parsed === "object" &&
+        "accessToken" in parsed &&
+        typeof (parsed as Record<string, unknown>).accessToken === "string"
       ) {
         return (parsed as Record<string, string>).accessToken;
       }
@@ -155,14 +172,14 @@ export class CliAuth {
    * orchestratorModel → id of the first model with role 'planner'
    */
   buildConfig(token: string, models: ModelConfig[]): AuthConfig {
-    const workerModel  = models.find((m) => m.role === 'worker');
-    const plannerModel = models.find((m) => m.role === 'planner');
+    const workerModel = models.find((m) => m.role === "worker");
+    const plannerModel = models.find((m) => m.role === "planner");
 
     return {
       accessToken: token,
       models,
-      mainModel:         workerModel?.id  ?? '',
-      orchestratorModel: plannerModel?.id ?? '',
+      mainModel: workerModel?.id ?? "",
+      orchestratorModel: plannerModel?.id ?? "",
     };
   }
 
@@ -173,7 +190,11 @@ export class CliAuth {
   async login(): Promise<AuthResult> {
     const token = this.checkAccessToken();
     if (!token) {
-      return { success: false, error: 'No access token found. Please add your token to ~/.yaaa/config.json.' };
+      return {
+        success: false,
+        error:
+          "No access token found. Please add your token to ~/.yaaa/config.json.",
+      };
     }
 
     try {
@@ -197,7 +218,7 @@ export class CliAuth {
     }
     const entries = await fs.promises.readdir(dbDir);
     return entries
-      .filter((name) => name.endsWith('.db'))
-      .map((name) => name.slice(0, -3));  // strip ".db"
+      .filter((name) => name.endsWith(".db"))
+      .map((name) => name.slice(0, -3)); // strip ".db"
   }
 }

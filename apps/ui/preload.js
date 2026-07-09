@@ -23,4 +23,9 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.on("task-complete", subscription);
     return () => ipcRenderer.removeListener("task-complete", subscription);
   },
+  getOnboardingStatus: () => ipcRenderer.invoke("get-onboarding-status"),
+  saveOnboardingKeys: (key) => ipcRenderer.invoke("save-onboarding-keys", key),
+  saveOnboardingProfile: (profile) =>
+    ipcRenderer.invoke("save-onboarding-profile", profile),
+  parseResume: (text) => ipcRenderer.invoke("parse-resume", text),
 });
