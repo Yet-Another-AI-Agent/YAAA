@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src/**/*"],
+  "references": [
+    { "path": "../shared" },
+    { "path": "../interfaces" },
+    { "path": "../platform" },
+    { "path": "../providers" },
+    { "path": "../agents" },
+    { "path": "../orchestrator" }
+  ]
+}

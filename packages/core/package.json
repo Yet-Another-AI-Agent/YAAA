@@ -1,12 +1,12 @@
 {
-  "name": "@yaaa/cli",
+  "name": "@yaaa/core",
   "version": "1.0.0",
   "type": "module",
   "private": true,
   "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "scripts": {
-    "build": "tsc -b",
-    "start": "node dist/index.js"
+    "build": "tsc -b"
   },
   "dependencies": {
     "@yaaa/shared": "*",
@@ -14,8 +14,6 @@
     "@yaaa/platform": "*",
     "@yaaa/providers": "*",
     "@yaaa/agents": "*",
-    "@yaaa/orchestrator": "*",
-    "@yaaa/core": "*",
-    "better-sqlite3": "^11.1.2"
+    "@yaaa/orchestrator": "*"
   }
 }
