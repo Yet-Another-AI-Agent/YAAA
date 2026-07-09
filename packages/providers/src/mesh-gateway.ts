@@ -39,9 +39,10 @@ export class MeshGateway implements IMeshGateway {
       baseURL: config.baseURL || "https://api.meshapi.ai/v1",
     });
 
-    // Default Mesh API routing mapping for various agent roles.
+    // Default Mesh API routing mapping for various agent roles. The planner is
+    // the orchestrator's brain, so it always runs on the best available model.
     this.modelMapping = {
-      planner: "openai/gpt-4o",
+      planner: "anthropic/claude-sonnet-5",
       worker: "openai/gpt-4o",
       verifier: "google/gemini-3.1-pro", // genuine diversity to catch shared blindspots
       utility: "openai/gpt-4o-mini",
@@ -51,6 +52,7 @@ export class MeshGateway implements IMeshGateway {
 
   async chat(messages: ChatMessage[], options: ChatOptions): Promise<string> {
     if (this.isMockMode) {
+      options.onReasoning?.(this.getMockReasoning(options.modelRole));
       return this.getMockResponse(messages, options.modelRole);
     }
 
@@ -62,7 +64,17 @@ export class MeshGateway implements IMeshGateway {
         temperature: options.temperature ?? 0,
         response_format: options.jsonMode ? { type: "json_object" } : undefined,
       });
-      return response.choices[0]?.message?.content || "";
+      const message = response.choices[0]?.message as
+        | (typeof response.choices[0]["message"] & {
+            reasoning_content?: string;
+            reasoning?: string;
+          })
+        | undefined;
+      const reasoning = message?.reasoning_content ?? message?.reasoning;
+      if (reasoning) {
+        options.onReasoning?.(reasoning);
+      }
+      return message?.content || "";
     } catch (err) {
       console.error(`Mesh API call failed using model ${model} for role ${options.modelRole}:`, err);
       rethrowGatewayError(err);
@@ -91,7 +103,14 @@ export class MeshGateway implements IMeshGateway {
       });
 
       for await (const chunk of stream) {
-        const text = chunk.choices[0]?.delta?.content || "";
+        const delta = chunk.choices[0]?.delta as
+          | { content?: string; reasoning_content?: string; reasoning?: string }
+          | undefined;
+        const reasoning = delta?.reasoning_content ?? delta?.reasoning;
+        if (reasoning) {
+          options.onReasoning?.(reasoning);
+        }
+        const text = delta?.content || "";
         if (text) {
           yield text;
         }
@@ -99,6 +118,23 @@ export class MeshGateway implements IMeshGateway {
     } catch (err) {
       console.error(`Mesh API stream call failed using model ${model} for role ${options.modelRole}:`, err);
       rethrowGatewayError(err);
+    }
+  }
+
+  /**
+   * Sample reasoning text for MOCK mode so the UI "thinking" stream is
+   * demoable without a real reasoning-capable model / API key.
+   */
+  private getMockReasoning(role: ModelRole): string {
+    switch (role) {
+      case "planner":
+        return "The user's request needs to be decomposed. I'll create a file first, then add a verification pass so we can confirm the output is correct before reporting back.";
+      case "worker":
+        return "I have the subtask. The cleanest approach is a single file write with the required content, then hand the result back to the supervisor.";
+      case "verifier":
+        return "Checking the artifact exists and that its contents satisfy every success criterion in the plan before I pass this.";
+      default:
+        return "Working through the request step by step.";
     }
   }
 

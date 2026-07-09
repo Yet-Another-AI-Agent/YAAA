@@ -55,26 +55,22 @@ export class InnerLoop {
     });
 
     for (let turn = 1; turn <= turns; turn++) {
-      await this.bus.publish(`task.${taskId}.agent.${agentId}.thought`, {
-        kind: "thought",
-        from: agentId,
-        content: `--- Turn ${turn}/${turns} ---`
-      });
-
-      // Get next action from model
+      // Get next action from model. Reasoning tokens (when the model exposes
+      // them) are streamed to the UI as "thinking"; the raw JSON answer is kept
+      // out of the thinking stream and parsed for the actual tool call/result.
       const response = await this.gateway.chat(messages, {
         modelRole: template.modelRole,
         temperature: 0.1,
+        onReasoning: (reasoning) => {
+          void this.bus.publish(`task.${taskId}.agent.${agentId}.thought`, {
+            kind: "thought",
+            from: agentId,
+            content: reasoning,
+          });
+        },
       });
 
       messages.push({ role: "assistant", content: response });
-
-      // Check for thought content
-      await this.bus.publish(`task.${taskId}.agent.${agentId}.thought`, {
-        kind: "thought",
-        from: agentId,
-        content: response
-      });
 
       // Parse JSON tool call or final result from model output
       const jsonMatch = response.match(/```json\s*([\s\S]*?)\s*```/) || response.match(/\{[\s\S]*\}/);

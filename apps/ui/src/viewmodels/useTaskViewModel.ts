@@ -91,13 +91,13 @@ export function useTaskViewModel() {
           }
 
           else if (topic.endsWith(".thought")) {
-            const agentName = topic.split(".").find((p) => p.includes("agent-")) || "agent";
-            addLog("agent", `[${agentName}] ${data.content}`);
+            // Reasoning tokens — rendered as collapsible "thinking", not chat.
+            addLog("agent", data.content, "thinking");
           }
 
           else if (topic.endsWith(".tool_requested")) {
             const agentName = topic.split(".").find((p) => p.includes("agent-")) || "agent";
-            addLog("agent", `[${agentName}] 🛠️ Requesting tool execution: ${data.content}`);
+            addLog("agent", `🛠️ ${agentName}: ${data.content}`, "activity");
           }
 
           else if (topic.includes("task-started")) {
@@ -122,7 +122,11 @@ export function useTaskViewModel() {
           setSuccess(resultData.success);
           setSummary(resultData.summary);
           setRunning(false);
-          addLog("system", `Task completed. Status: ${resultData.success ? "SUCCESS" : "FAILED"}`);
+          // Surface the final answer as an assistant chat message. On failure
+          // the recovery banner carries the error instead, so skip it here.
+          if (resultData.success && resultData.summary) {
+            addLog("orchestrator", resultData.summary, "response");
+          }
           if (resultData.reason === "insufficient_funds") {
             addLog("system", "⚠️ API account is out of funds — update your key or add credit.");
             setApiKeyPrompt("funds");

@@ -26,7 +26,7 @@ export class Supervisor {
 
     // 1. Generate plan
     console.log(`[Orchestrator] Generating plan for goal: "${goal}"`);
-    const plan = await this.planner.plan(goal);
+    const plan = await this.planner.plan(goal, activeTaskId);
     
     // Log plan generated
     await this.bus.publish( `task.${activeTaskId}.plan_updated`, plan);

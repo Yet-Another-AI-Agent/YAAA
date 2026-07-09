@@ -4,6 +4,7 @@ import type { TaskViewModel } from "../viewmodels/useTaskViewModel";
 import { TaskModel } from "../models/TaskModel";
 import { ApiKeyModal } from "../components/ApiKeyModal";
 import { MissionInput } from "../components/MissionInput";
+import { ThinkingPanel } from "../components/ThinkingPanel";
 import * as shared from "@yaaa/shared";
 const { ORCHESTRATOR_MD_HEADERS } = shared;
 
@@ -419,7 +420,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
           sender,
           time: msg.timestamp ? formatDate(msg.timestamp) : "",
           content,
-          kind: msg.kind,
+          kind: msg.kind === "thought" ? "thinking" : msg.kind,
           artifacts: artifactsList,
         });
       });
@@ -436,6 +437,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
       // Add live logs
       logs.forEach((log) => {
         let sender = log.source === "system" ? "System" : (log.source === "orchestrator" ? "Supervisor" : "Agent");
+        if (log.kind === "response") sender = "Orchestrator";
         let content = log.content;
         const agentMatch = log.content.match(/^\[([^\]]+)\] (.*)/);
         if (agentMatch) {
@@ -447,7 +449,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
           sender,
           time: log.time,
           content,
-          kind: log.source,
+          kind: log.kind,
           artifacts: [],
         });
       });
@@ -489,6 +491,28 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   ]);
 
   const { displayMessages, displaySubtasks, displayArtifacts, currentStatus } = memoizedData;
+
+  // Collapse runs of consecutive "thinking" messages into a single dropdown
+  // panel; everything else renders as an individual chat bubble.
+  const renderGroups = useMemo(() => {
+    const groups: Array<
+      | { type: "thinking"; id: string; items: any[] }
+      | { type: "message"; id: string; msg: any }
+    > = [];
+    for (const msg of displayMessages) {
+      if (msg.kind === "thinking") {
+        const last = groups[groups.length - 1];
+        if (last && last.type === "thinking") {
+          last.items.push(msg);
+        } else {
+          groups.push({ type: "thinking", id: msg.id, items: [msg] });
+        }
+      } else {
+        groups.push({ type: "message", id: msg.id, msg });
+      }
+    }
+    return groups;
+  }, [displayMessages]);
 
   return (
     <div className="dash-root fade-in-dashboard">
@@ -656,10 +680,22 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   </div>
                 )}
 
-                {!loadingHistory && displayMessages.map((msg) => (
+                {!loadingHistory && renderGroups.map((group, gi) => {
+                  if (group.type === "thinking") {
+                    const isLastGroup = gi === renderGroups.length - 1;
+                    return (
+                      <ThinkingPanel
+                        key={group.id}
+                        items={group.items.map((m) => ({ id: m.id, content: m.content, time: m.time }))}
+                        live={running && !selectedTaskId && isLastGroup}
+                      />
+                    );
+                  }
+                  const msg = group.msg;
+                  return (
                   <div className="slack-message" key={msg.id}>
-                    <div 
-                      className="slack-message-avatar" 
+                    <div
+                      className="slack-message-avatar"
                       style={{ backgroundColor: getAvatarColor(msg.sender) }}
                     >
                       {msg.sender.charAt(0).toUpperCase()}
@@ -669,9 +705,9 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                         <span className="slack-message-sender">{msg.sender}</span>
                         <span className="slack-message-time">{msg.time}</span>
                       </div>
-                      <div className={`slack-message-bubble ${msg.sender === 'User' ? 'slack-message-sender-user' : ''}`}>
+                      <div className={`slack-message-bubble ${msg.sender === 'User' ? 'slack-message-sender-user' : ''} ${msg.kind === 'response' ? 'slack-message-response' : ''} ${msg.kind === 'activity' ? 'slack-message-activity' : ''}`}>
                         <div className="slack-message-text">{msg.content}</div>
-                        
+
                         {msg.artifacts && msg.artifacts.length > 0 && (
                           <div className="slack-message-artifacts">
                             {msg.artifacts.map((art: any, aIdx: number) => (
@@ -686,10 +722,10 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                                     Open
                                   </span>
                                 ) : (
-                                  <a 
+                                  <a
                                     className="slack-artifact-download"
-                                    href={getArtifactHref(yaaaDir, selectedTaskId || taskId, art.path)} 
-                                    target="_blank" 
+                                    href={getArtifactHref(yaaaDir, selectedTaskId || taskId, art.path)}
+                                    target="_blank"
                                     rel="noreferrer"
                                   >
                                     Open
@@ -702,7 +738,8 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                       </div>
                     </div>
                   </div>
-                ))}
+                  );
+                })}
                 
                 {/* Approval Banner inside chat list */}
                 {showTaskView && pendingApproval && (
@@ -724,11 +761,26 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   </div>
                 )}
 
-                {/* Result summary inline in chat */}
-                {showTaskView && summary && (
-                  <div className={`result-banner ${success ? "success" : "failed"}`} style={{ marginTop: '1.25rem' }}>
-                    <span>{success ? "✅" : "❌"}</span>
-                    <p>{summary}</p>
+                {/* Failure banner (success answers render as a chat reply). */}
+                {showTaskView && success === false && (
+                  <div className="result-banner failed" style={{ marginTop: '1.25rem' }}>
+                    <span>❌</span>
+                    <div className="result-banner-body">
+                      <p>{summary || "Mission failed."}</p>
+                      <div className="result-banner-recovery">
+                        <span className="result-banner-hint">
+                          If the run stopped because your Mesh API key expired or the account ran out
+                          of balance, update your key or add funds to continue.
+                        </span>
+                        <button
+                          type="button"
+                          className="btn btn-secondary result-banner-btn"
+                          onClick={() => setApiKeyPrompt("manual")}
+                        >
+                          Update API key
+                        </button>
+                      </div>
+                    </div>
                   </div>
                 )}
 
@@ -951,7 +1003,14 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                 billing dashboard, or enter a different API key below. The key is
                 stored locally in <code>config.json</code>.
               </>
-            ) : undefined
+            ) : (
+              <>
+                If a mission stopped because the key expired or the account ran out
+                of balance, paste a new key below — or add credit in your provider's
+                billing dashboard, then re-run the mission. The key is stored locally
+                in <code>config.json</code>.
+              </>
+            )
           }
           submitLabel="Save key"
           onSaved={() => setApiKeyPrompt(null)}
