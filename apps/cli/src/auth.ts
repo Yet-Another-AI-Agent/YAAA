@@ -72,6 +72,7 @@ export class CliAuth {
     this.configPath = configPath ?? path.join(this.yaaaDir, 'config.json');
     if (!fs.existsSync(this.yaaaDir)) {
       fs.mkdirSync(this.yaaaDir, { recursive: true });
+      fs.chmodSync(this.yaaaDir, 0o700);
     }
   }
 
@@ -92,7 +93,10 @@ export class CliAuth {
   }
 
   saveConfig(config: Partial<AuthConfig>): void {
-    fs.writeFileSync(this.configPath, JSON.stringify(config, null, 2), 'utf-8');
+    fs.writeFileSync(this.configPath, JSON.stringify(config, null, 2), { encoding: 'utf-8', mode: 0o600 });
+    if (fs.existsSync(this.configPath)) {
+      fs.chmodSync(this.configPath, 0o600);
+    }
   }
 
   getMainDbConnection(): Database.Database {

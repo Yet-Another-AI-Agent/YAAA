@@ -136,6 +136,7 @@ export function useTaskViewModel() {
     goal,
     setGoal,
     taskId,
+    setTaskId,
     running,
     subtasks,
     logs,

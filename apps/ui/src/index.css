@@ -5,31 +5,31 @@
   --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
 
   /* HSL Tailored Colors */
-  --bg-app: HSL(224, 25%, 8%);
-  --bg-card: HSL(222, 22%, 12%, 0.7);
-  --bg-card-hover: HSL(222, 22%, 15%, 0.85);
+  --bg-app: hsl(224, 25%, 8%);
+  --bg-card: hsl(222, 22%, 12%, 0.7);
+  --bg-card-hover: hsl(222, 22%, 15%, 0.85);
   
-  --border-color: HSL(220, 20%, 20%, 0.5);
-  --border-color-glow: HSL(242, 60%, 60%, 0.4);
+  --border-color: hsl(220, 20%, 20%, 0.5);
+  --border-color-glow: hsl(242, 60%, 60%, 0.4);
 
-  --text-primary: HSL(0, 0%, 96%);
-  --text-secondary: HSL(220, 15%, 70%);
-  --text-muted: HSL(220, 10%, 45%);
+  --text-primary: hsl(0, 0%, 96%);
+  --text-secondary: hsl(220, 15%, 70%);
+  --text-muted: hsl(220, 10%, 45%);
 
-  --color-primary: HSL(242, 85%, 65%);
-  --color-primary-glow: HSL(242, 85%, 65%, 0.35);
+  --color-primary: hsl(242, 85%, 65%);
+  --color-primary-glow: hsl(242, 85%, 65%, 0.35);
   
-  --color-success: HSL(145, 80%, 45%);
-  --color-success-glow: HSL(145, 80%, 45%, 0.3);
+  --color-success: hsl(145, 80%, 45%);
+  --color-success-glow: hsl(145, 80%, 45%, 0.3);
 
-  --color-warning: HSL(35, 90%, 55%);
-  --color-warning-glow: HSL(35, 90%, 55%, 0.25);
+  --color-warning: hsl(35, 90%, 55%);
+  --color-warning-glow: hsl(35, 90%, 55%, 0.25);
 
-  --color-danger: HSL(0, 85%, 60%);
-  --color-danger-glow: HSL(0, 85%, 60%, 0.25);
+  --color-danger: hsl(0, 85%, 60%);
+  --color-danger-glow: hsl(0, 85%, 60%, 0.25);
 
-  --color-info: HSL(195, 85%, 50%);
-  --color-info-glow: HSL(195, 85%, 50%, 0.25);
+  --color-info: hsl(195, 85%, 50%);
+  --color-info-glow: hsl(195, 85%, 50%, 0.25);
 
   --transition-smooth: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
 }
@@ -61,10 +61,10 @@ body {
 
   background: radial-gradient(
     600px circle at var(--gx, -9999px) var(--gy, -9999px),
-    HSL(0, 0%, 100%, 0.02)    0%,
-    HSL(242, 100%, 72%, 0.06) 8%,
-    HSL(260, 90%,  65%, 0.04) 22%,
-    HSL(272, 80%,  55%, 0.02) 42%,
+    hsl(0, 0%, 100%, 0.02)    0%,
+    hsl(242, 100%, 72%, 0.06) 8%,
+    hsl(260, 90%,  65%, 0.04) 22%,
+    hsl(272, 80%,  55%, 0.02) 42%,
     transparent               65%
   );
 
@@ -117,7 +117,7 @@ body {
   font-size: 2.2rem;
   font-weight: 700;
   letter-spacing: -0.5px;
-  background: linear-gradient(135deg, HSL(0, 0%, 100%) 30%, HSL(242, 85%, 70%));
+  background: linear-gradient(135deg, hsl(0, 0%, 100%) 30%, hsl(242, 85%, 70%));
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
 }
@@ -141,7 +141,7 @@ body {
 
 .glass-card:hover {
   border-color: var(--border-color-glow);
-  box-shadow: 0 8px 32px 0 HSL(242, 60%, 10%, 0.4);
+  box-shadow: 0 8px 32px 0 hsl(242, 60%, 10%, 0.4);
 }
 
 /* Inputs & Form Elements */
@@ -153,7 +153,7 @@ body {
 
 .task-input {
   flex: 1;
-  background: HSL(222, 22%, 6%);
+  background: hsl(222, 22%, 6%);
   border: 1px solid var(--border-color);
   border-radius: 10px;
   color: var(--text-primary);
@@ -170,7 +170,7 @@ body {
 }
 
 .btn-primary {
-  background: linear-gradient(135deg, var(--color-primary), HSL(242, 85%, 55%));
+  background: linear-gradient(135deg, var(--color-primary), hsl(242, 85%, 55%));
   color: white;
   border: none;
   border-radius: 10px;
@@ -233,14 +233,14 @@ body {
   justify-content: space-between;
   padding: 1.25rem;
   border-radius: 12px;
-  background: HSL(222, 20%, 15%, 0.4);
+  background: hsl(222, 20%, 15%, 0.4);
   border: 1px solid var(--border-color);
   transition: var(--transition-smooth);
 }
 
 .subtask-item.active {
   border-color: var(--color-primary);
-  background: HSL(242, 60%, 15%, 0.15);
+  background: hsl(242, 60%, 15%, 0.15);
 }
 
 .subtask-info {
@@ -292,14 +292,14 @@ body {
   font-size: 0.8rem;
   padding: 0.25rem 0.5rem;
   border-radius: 6px;
-  background: HSL(220, 15%, 22%);
+  background: hsl(220, 15%, 22%);
   color: var(--text-secondary);
   border: 1px solid var(--border-color);
 }
 
 /* Console Logs */
 .console-log-box {
-  background: HSL(222, 22%, 5%);
+  background: hsl(222, 22%, 5%);
   border: 1px solid var(--border-color);
   border-radius: 12px;
   padding: 1.25rem;
@@ -318,7 +318,7 @@ body {
   flex-direction: column;
   gap: 0.25rem;
   padding-bottom: 0.5rem;
-  border-bottom: 1px solid HSL(220, 20%, 12%);
+  border-bottom: 1px solid hsl(220, 20%, 12%);
 }
 
 .log-header {
@@ -329,7 +329,7 @@ body {
 }
 
 .log-source.orchestrator { color: var(--color-info); }
-.log-source.agent { color: HSL(280, 80%, 70%); }
+.log-source.agent { color: hsl(280, 80%, 70%); }
 .log-source.system { color: var(--color-warning); }
 
 .log-time { color: var(--text-muted); }
@@ -342,7 +342,7 @@ body {
 
 /* Human-in-the-Loop Approval Banner */
 .approval-banner {
-  background: linear-gradient(135deg, HSL(35, 95%, 12%), HSL(35, 95%, 6%));
+  background: linear-gradient(135deg, hsl(35, 95%, 12%), hsl(35, 95%, 6%));
   border: 2px solid var(--color-warning);
   box-shadow: 0 0 24px 0 var(--color-warning-glow);
   border-radius: 16px;
@@ -391,7 +391,7 @@ body {
 }
 
 .btn-approve:hover {
-  background: HSL(145, 80%, 40%);
+  background: hsl(145, 80%, 40%);
   box-shadow: 0 0 12px 0 var(--color-success-glow);
 }
 
@@ -407,7 +407,7 @@ body {
 }
 
 .btn-reject:hover {
-  background: HSL(0, 80%, 50%);
+  background: hsl(0, 80%, 50%);
   box-shadow: 0 0 12px 0 var(--color-danger-glow);
 }
 
@@ -424,7 +424,7 @@ body {
   justify-content: space-between;
   padding: 0.75rem 1rem;
   border-radius: 8px;
-  background: HSL(222, 20%, 15%);
+  background: hsl(222, 20%, 15%);
   border: 1px solid var(--border-color);
   font-size: 0.95rem;
 }
@@ -445,12 +445,12 @@ body {
 /* Final Summary Box */
 .summary-card {
   border-color: var(--color-success);
-  background: linear-gradient(135deg, HSL(145, 95%, 6%), HSL(145, 95%, 3%));
+  background: linear-gradient(135deg, hsl(145, 95%, 6%), hsl(145, 95%, 3%));
 }
 
 .summary-card.failed {
   border-color: var(--color-danger);
-  background: linear-gradient(135deg, HSL(0, 95%, 6%), HSL(0, 95%, 3%));
+  background: linear-gradient(135deg, hsl(0, 95%, 6%), hsl(0, 95%, 3%));
 }
 
 /* Animations */
@@ -461,8 +461,8 @@ body {
 }
 
 @keyframes border-glow-pulse {
-  0% { border-color: HSL(35, 90%, 55%, 0.6); }
-  100% { border-color: HSL(35, 90%, 55%, 1.2); }
+  0% { border-color: hsl(35, 90%, 55%, 0.6); }
+  100% { border-color: hsl(35, 90%, 55%, 1.2); }
 }
 
 /* Splash Screen Styles */
@@ -472,7 +472,7 @@ body {
   left: 0;
   width: 100vw;
   height: 100vh;
-  background-color: HSL(224, 25%, 6%);
+  background-color: hsl(224, 25%, 6%);
   display: flex;
   justify-content: center;
   align-items: center;
@@ -484,7 +484,7 @@ body {
   position: absolute;
   width: 400px;
   height: 400px;
-  background: radial-gradient(circle, HSL(242, 85%, 65%, 0.15) 0%, transparent 70%);
+  background: radial-gradient(circle, hsl(242, 85%, 65%, 0.15) 0%, transparent 70%);
   filter: blur(40px);
   animation: pulse-glow-bg 4s infinite alternate;
 }
@@ -501,7 +501,7 @@ body {
   width: 170px;
   height: 170px;
   border-radius: 36px;
-  box-shadow: 0 0 50px HSL(210, 85%, 65%, 0.35);
+  box-shadow: 0 0 50px hsl(210, 85%, 65%, 0.35);
   border: 1px solid var(--border-color-glow);
   animation: logo-entrance 1.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
   margin-bottom: 0.5rem;
@@ -529,7 +529,7 @@ body {
 .splash-loader-progress {
   width: 100%;
   height: 100%;
-  background: linear-gradient(90deg, var(--color-primary), HSL(242, 85%, 70%));
+  background: linear-gradient(90deg, var(--color-primary), hsl(242, 85%, 70%));
   transform: translateX(-100%);
   animation: progress-load 2.5s cubic-bezier(0.4, 0, 0.2, 1) forwards;
 }
@@ -599,7 +599,7 @@ body {
   justify-content: space-between;
   align-items: center;
   padding: 1rem 2rem;
-  background: HSL(224, 25%, 8%, 0.7);
+  background: hsl(224, 25%, 8%, 0.7);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
   border-bottom: 1px solid var(--border-color);
@@ -621,7 +621,7 @@ body {
   width: 40px;
   height: 40px;
   border-radius: 10px;
-  background: HSL(222, 22%, 14%);
+  background: hsl(222, 22%, 14%);
   border: 1px solid var(--border-color);
   color: var(--text-secondary);
   display: flex;
@@ -631,7 +631,7 @@ body {
   transition: var(--transition-smooth);
 }
 .icon-btn:hover {
-  background: HSL(222, 22%, 18%);
+  background: hsl(222, 22%, 18%);
   color: var(--text-primary);
   border-color: var(--border-color-glow);
 }
@@ -640,7 +640,7 @@ body {
   width: 40px;
   height: 40px;
   border-radius: 50%;
-  background: linear-gradient(135deg, var(--color-primary), HSL(280, 80%, 65%));
+  background: linear-gradient(135deg, var(--color-primary), hsl(280, 80%, 65%));
   color: white;
   font-weight: 700;
   font-size: 1rem;
@@ -656,7 +656,7 @@ body {
 }
 
 .dash-back-btn {
-  background: HSL(222, 22%, 14%);
+  background: hsl(222, 22%, 14%);
   border: 1px solid var(--border-color);
   color: var(--text-secondary);
   padding: 0.5rem 1rem;
@@ -753,15 +753,15 @@ body {
 
 .mission-input-wrapper {
   position: relative;
-  background: HSL(222, 22%, 10%);
+  background: hsl(222, 22%, 10%);
   border: 1px solid var(--border-color);
   border-radius: 18px;
   padding: 1.25rem 1.5rem 1rem;
   transition: var(--transition-smooth);
 }
 .mission-input-wrapper:focus-within {
-  border-color: HSL(242, 85%, 65%, 0.5);
-  box-shadow: 0 0 0 3px HSL(242, 85%, 65%, 0.08), 0 8px 32px HSL(242, 85%, 10%, 0.5);
+  border-color: hsl(242, 85%, 65%, 0.5);
+  box-shadow: 0 0 0 3px hsl(242, 85%, 65%, 0.08), 0 8px 32px hsl(242, 85%, 10%, 0.5);
 }
 
 .mission-textarea {
@@ -797,7 +797,7 @@ body {
   width: 38px;
   height: 38px;
   border-radius: 10px;
-  background: HSL(222, 22%, 16%);
+  background: hsl(222, 22%, 16%);
   border: 1px solid var(--border-color);
   color: var(--text-secondary);
   display: flex;
@@ -808,7 +808,7 @@ body {
   flex-shrink: 0;
 }
 .mission-action-btn:hover {
-  background: HSL(222, 22%, 22%);
+  background: hsl(222, 22%, 22%);
   color: var(--text-primary);
   border-color: var(--border-color-glow);
 }
@@ -828,7 +828,7 @@ body {
   flex-shrink: 0;
 }
 .mission-send-btn:hover:not(:disabled) {
-  background: HSL(242, 85%, 72%);
+  background: hsl(242, 85%, 72%);
   box-shadow: 0 0 20px var(--color-primary-glow);
   transform: translateY(-1px);
 }
@@ -858,7 +858,7 @@ body {
 }
 
 .chip {
-  background: HSL(222, 22%, 12%);
+  background: hsl(222, 22%, 12%);
   border: 1px solid var(--border-color);
   color: var(--text-secondary);
   padding: 0.5rem 1rem;
@@ -870,7 +870,7 @@ body {
   white-space: nowrap;
 }
 .chip:hover {
-  background: HSL(222, 22%, 18%);
+  background: hsl(222, 22%, 18%);
   color: var(--text-primary);
   border-color: var(--border-color-glow);
   transform: translateY(-1px);
@@ -893,7 +893,7 @@ body {
 }
 
 .compact-input-wrapper {
-  background: HSL(222, 22%, 10%);
+  background: hsl(222, 22%, 10%);
   border: 1px solid var(--border-color);
   border-radius: 14px;
   padding: 0.75rem 1rem 0.5rem;
@@ -902,7 +902,7 @@ body {
   transition: var(--transition-smooth);
 }
 .compact-input-wrapper:focus-within {
-  border-color: HSL(242, 85%, 65%, 0.4);
+  border-color: hsl(242, 85%, 65%, 0.4);
 }
 
 .task-grid {
@@ -916,7 +916,7 @@ body {
 }
 
 .task-panel {
-  background: HSL(222, 22%, 10%, 0.7);
+  background: hsl(222, 22%, 10%, 0.7);
   backdrop-filter: blur(16px);
   border: 1px solid var(--border-color);
   border-radius: 16px;
@@ -980,13 +980,13 @@ body {
   align-items: flex-start;
   padding: 0.875rem;
   border-radius: 10px;
-  background: HSL(222, 20%, 13%);
+  background: hsl(222, 20%, 13%);
   border: 1px solid transparent;
   transition: var(--transition-smooth);
 }
 .subtask-item.running {
   border-color: var(--color-primary);
-  background: HSL(242, 60%, 13%);
+  background: hsl(242, 60%, 13%);
 }
 .subtask-item.completed { opacity: 0.65; }
 
@@ -1026,7 +1026,7 @@ body {
   font-size: 0.75rem;
   padding: 0.2rem 0.5rem;
   border-radius: 5px;
-  background: HSL(220, 15%, 20%);
+  background: hsl(220, 15%, 20%);
   color: var(--text-secondary);
   border: 1px solid var(--border-color);
 }
@@ -1037,16 +1037,16 @@ body {
   border-radius: 5px;
   font-weight: 500;
 }
-.risk-tag.low { color: var(--color-success); background: HSL(145, 80%, 45%, 0.1); }
-.risk-tag.medium { color: var(--color-warning); background: HSL(35, 90%, 55%, 0.1); }
-.risk-tag.high { color: var(--color-danger); background: HSL(0, 85%, 60%, 0.1); }
+.risk-tag.low { color: var(--color-success); background: hsl(145, 80%, 45%, 0.1); }
+.risk-tag.medium { color: var(--color-warning); background: hsl(35, 90%, 55%, 0.1); }
+.risk-tag.high { color: var(--color-danger); background: hsl(0, 85%, 60%, 0.1); }
 
 /* Console */
 .console-panel { min-height: 200px; }
 
 .console-log-box {
   flex: 1;
-  background: HSL(222, 22%, 6%);
+  background: hsl(222, 22%, 6%);
   border: 1px solid var(--border-color);
   border-radius: 10px;
   padding: 1rem;
@@ -1068,7 +1068,7 @@ body {
   flex-direction: column;
   gap: 0.2rem;
   padding-bottom: 0.5rem;
-  border-bottom: 1px solid HSL(220, 20%, 11%);
+  border-bottom: 1px solid hsl(220, 20%, 11%);
 }
 .log-header {
   display: flex;
@@ -1077,7 +1077,7 @@ body {
   font-weight: 600;
 }
 .log-source.orchestrator { color: var(--color-info); }
-.log-source.agent { color: HSL(280, 80%, 70%); }
+.log-source.agent { color: hsl(280, 80%, 70%); }
 .log-source.system { color: var(--color-warning); }
 .log-time { color: var(--text-muted); }
 .log-content {
@@ -1116,12 +1116,12 @@ body {
   color: var(--text-secondary);
 }
 .result-banner.success {
-  background: HSL(145, 80%, 45%, 0.08);
-  border: 1px solid HSL(145, 80%, 45%, 0.3);
+  background: hsl(145, 80%, 45%, 0.08);
+  border: 1px solid hsl(145, 80%, 45%, 0.3);
 }
 .result-banner.failed {
-  background: HSL(0, 85%, 60%, 0.08);
-  border: 1px solid HSL(0, 85%, 60%, 0.3);
+  background: hsl(0, 85%, 60%, 0.08);
+  border: 1px solid hsl(0, 85%, 60%, 0.3);
 }
 
 /* ─── Main content wrapper to support sidebar ─── */
@@ -1137,7 +1137,7 @@ body {
 /* ─── Sidebar Styles ─── */
 .dash-sidebar {
   width: 320px;
-  background: HSL(222, 22%, 5%);
+  background: hsl(222, 22%, 5%);
   border-right: 1px solid var(--border-color);
   display: flex;
   flex-direction: column;
@@ -1169,7 +1169,7 @@ body {
 }
 
 .hamburger-btn:hover {
-  background: HSL(222, 22%, 14%);
+  background: hsl(222, 22%, 14%);
   color: var(--text-primary);
   border-color: var(--border-color);
 }
@@ -1214,7 +1214,7 @@ body {
 }
 
 .new-mission-btn:hover {
-  background: HSL(242, 85%, 72%);
+  background: hsl(242, 85%, 72%);
   box-shadow: 0 0 12px var(--color-primary-glow);
 }
 
@@ -1261,13 +1261,13 @@ body {
 }
 
 .sidebar-item:hover {
-  background: HSL(222, 22%, 10%);
+  background: hsl(222, 22%, 10%);
   color: var(--text-primary);
 }
 
 .sidebar-item.active {
-  background: HSL(242, 60%, 12%);
-  border-color: HSL(242, 85%, 65%, 0.3);
+  background: hsl(242, 60%, 12%);
+  border-color: hsl(242, 85%, 65%, 0.3);
   color: var(--text-primary);
 }
 
@@ -1318,7 +1318,7 @@ body {
 }
 
 .detail-header {
-  background: HSL(222, 22%, 10%);
+  background: hsl(222, 22%, 10%);
   border: 1px solid var(--border-color);
   border-radius: 16px;
   padding: 1.5rem;
@@ -1361,21 +1361,21 @@ body {
 }
 
 .detail-status-pill.success {
-  background: HSL(145, 80%, 45%, 0.15);
+  background: hsl(145, 80%, 45%, 0.15);
   color: var(--color-success);
-  border: 1px solid HSL(145, 80%, 45%, 0.3);
+  border: 1px solid hsl(145, 80%, 45%, 0.3);
 }
 
 .detail-status-pill.failed {
-  background: HSL(0, 85%, 60%, 0.15);
+  background: hsl(0, 85%, 60%, 0.15);
   color: var(--color-danger);
-  border: 1px solid HSL(0, 85%, 60%, 0.3);
+  border: 1px solid hsl(0, 85%, 60%, 0.3);
 }
 
 .detail-status-pill.running {
-  background: HSL(195, 85%, 50%, 0.15);
+  background: hsl(195, 85%, 50%, 0.15);
   color: var(--color-info);
-  border: 1px solid HSL(195, 85%, 50%, 0.3);
+  border: 1px solid hsl(195, 85%, 50%, 0.3);
 }
 
 .detail-grid {
@@ -1398,7 +1398,7 @@ body {
 }
 
 .ledger-step-card {
-  background: HSL(222, 22%, 10%);
+  background: hsl(222, 22%, 10%);
   border: 1px solid var(--border-color);
   border-radius: 12px;
   padding: 1.25rem;

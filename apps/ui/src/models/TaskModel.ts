@@ -46,6 +46,10 @@ export class TaskModel {
     return this.getElectronAPI().readTaskOrchestrator(taskId);
   }
 
+  static async getYaaaDir(): Promise<string> {
+    return this.getElectronAPI().getYaaaDir();
+  }
+
   static subscribeEvents(
     onEvent: (eventData: { topic: string; data: any }) => void,
     onApproval: (approvalData: { agentId: string; toolCall: any }) => void,

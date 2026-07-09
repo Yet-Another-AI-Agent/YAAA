@@ -5,6 +5,7 @@ import crypto from "node:crypto";
 import { container, MessageBus, PermissionEngine } from "@yaaa/platform";
 import { SqliteStore, FilesFs, MeshGateway } from "@yaaa/providers";
 import { Supervisor } from "@yaaa/orchestrator";
+import { ORCHESTRATOR_MD_HEADERS } from "@yaaa/shared";
 import { CliAuth } from "./auth.js";
 
 // Create readline interface for human-in-the-loop confirmations
@@ -60,14 +61,14 @@ function writeOrchestratorMd(
   ledgerEntries: any[]
 ) {
   const mdPath = path.join(taskDir, "orchestrator.md");
-  let content = `# Task Orchestration Ledger\n\n`;
+  let content = `${ORCHESTRATOR_MD_HEADERS.TITLE}\n\n`;
   content += `* **Task ID**: ${taskId}\n`;
   content += `* **Prompt**: ${prompt}\n`;
   content += `* **Status**: ${status}\n`;
   content += `* **Updated At**: ${new Date().toISOString()}\n\n`;
 
   if (plan) {
-    content += `## Plan\n`;
+    content += `${ORCHESTRATOR_MD_HEADERS.PLAN}\n`;
     content += `Goal: ${plan.goal}\n\n`;
     for (const subtask of plan.subtasks) {
       content += `- **[${subtask.id}]** ${subtask.title}\n`;
@@ -82,18 +83,18 @@ function writeOrchestratorMd(
   }
 
   if (ledgerEntries && ledgerEntries.length > 0) {
-    content += `## Execution Ledger\n\n`;
+    content += `${ORCHESTRATOR_MD_HEADERS.EXECUTION}\n\n`;
     for (const entry of ledgerEntries) {
-      content += `### Step ${entry.step} (${entry.timestamp || new Date().toISOString()})\n`;
-      content += `* **Strategy**: ${entry.nextStepStrategy}\n`;
+      content += `${ORCHESTRATOR_MD_HEADERS.STEP} ${entry.step} (${entry.timestamp || new Date().toISOString()})\n`;
+      content += `${ORCHESTRATOR_MD_HEADERS.STRATEGY} ${entry.nextStepStrategy}\n`;
       if (entry.facts && entry.facts.length > 0) {
-        content += `* **Facts Learned**:\n`;
+        content += `${ORCHESTRATOR_MD_HEADERS.FACTS}\n`;
         for (const fact of entry.facts) {
           content += `  - ${fact}\n`;
         }
       }
       if (entry.assumptions && entry.assumptions.length > 0) {
-        content += `* **Assumptions Made**:\n`;
+        content += `${ORCHESTRATOR_MD_HEADERS.ASSUMPTIONS}\n`;
         for (const ass of entry.assumptions) {
           content += `  - ${ass}\n`;
         }
@@ -105,7 +106,7 @@ function writeOrchestratorMd(
   fs.writeFileSync(mdPath, content, "utf-8");
 }
 
-export async function executeTask(auth: CliAuth, goal: string, guiMode: boolean) {
+export async function executeTask(auth: CliAuth, goal: string, guiMode: boolean): Promise<boolean> {
   const taskId = crypto.randomUUID();
   const yaaaDir = auth.getYaaaDir();
   const taskDir = path.join(yaaaDir, "tasks", taskId);
@@ -123,7 +124,7 @@ export async function executeTask(auth: CliAuth, goal: string, guiMode: boolean)
   const orchestratorMdPath = path.join(taskDir, "orchestrator.md");
   fs.writeFileSync(
     orchestratorMdPath,
-    `# Task Orchestration Ledger\n\n* **Task ID**: ${taskId}\n* **Prompt**: ${goal}\n* **Status**: pending\n* **Created At**: ${new Date().toISOString()}\n\n## Plan\n*(Generating plan...)*\n`,
+    `${ORCHESTRATOR_MD_HEADERS.TITLE}\n\n* **Task ID**: ${taskId}\n* **Prompt**: ${goal}\n* **Status**: pending\n* **Created At**: ${new Date().toISOString()}\n\n${ORCHESTRATOR_MD_HEADERS.PLAN}\n*(Generating plan...)*\n`,
     "utf-8"
   );
 
@@ -252,14 +253,13 @@ export async function executeTask(auth: CliAuth, goal: string, guiMode: boolean)
     mainDbUpdate.close();
 
     // Query facts/ledger to populate final orchestrator.md
-    const finalPlan = await store.getPlan(taskId);
     const ledgerEntries = await store.getLedgerEntries(taskId);
     writeOrchestratorMd(
       taskDir,
       taskId,
       goal,
       result.success ? "success" : "failed",
-      finalPlan,
+      result.plan,
       ledgerEntries
     );
 
@@ -280,6 +280,7 @@ export async function executeTask(auth: CliAuth, goal: string, guiMode: boolean)
       console.log(`Summary: ${result.summary}`);
       console.log("========================================\n");
     }
+    return result.success;
   } catch (err: any) {
     // Update status to failed in main.db
     const mainDbUpdate = auth.getMainDbConnection();
@@ -297,6 +298,7 @@ export async function executeTask(auth: CliAuth, goal: string, guiMode: boolean)
     } else {
       console.error("Fatal execution error:", err.message);
     }
+    return false;
   } finally {
     store.closeAll();
     rl.close();
@@ -347,6 +349,7 @@ export async function bootstrap() {
     printHelp();
     rl.close();
     process.exit(0);
+    return;
   }
 
   const mainCommand = cleanArgs[0];
@@ -359,12 +362,14 @@ export async function bootstrap() {
         console.error("Error: Please provide a key value. Example: npm start config --key <key>");
         rl.close();
         process.exit(1);
+        return;
       }
       config.accessToken = keyValue;
       auth.saveConfig(config);
       console.log("✅ Mesh API Key updated successfully in config.json");
       rl.close();
       process.exit(0);
+      return;
     } else if (subFlag === "--model" || subFlag === "-m") {
       const role = cleanArgs[2];
       const modelId = cleanArgs[3];
@@ -374,11 +379,13 @@ export async function bootstrap() {
         );
         rl.close();
         process.exit(1);
+        return;
       }
       if (!["planner", "worker", "verifier", "utility"].includes(role)) {
         console.error("Error: Role must be one of: planner, worker, verifier, utility");
         rl.close();
         process.exit(1);
+        return;
       }
       if (!config.preferredModels) {
         config.preferredModels = {};
@@ -388,10 +395,12 @@ export async function bootstrap() {
       console.log(`✅ Preferred model for role "${role}" set to "${modelId}" in config.json`);
       rl.close();
       process.exit(0);
+      return;
     } else {
       console.error("Unknown config option. Use config --key <key> or config --model <role> <model_id>");
       rl.close();
       process.exit(1);
+      return;
     }
   }
 
@@ -424,27 +433,37 @@ export async function bootstrap() {
         rl.close();
       }
       process.exit(0);
+      return;
     } else if (subFlag === "-n" || subFlag === "--create") {
       const goal = cleanArgs[2];
       if (!goal) {
         console.error('Error: Please provide a task prompt/goal. Example: npm start task -n "My prompt"');
         rl.close();
         process.exit(1);
+        return;
       }
-      await executeTask(auth, goal, guiMode);
+      const success = await executeTask(auth, goal, guiMode);
+      if (!success) {
+        rl.close();
+        process.exit(1);
+        return;
+      }
       process.exit(0);
+      return;
     } else {
       console.error(
         "Unknown task option. Use task -n \"<prompt>\" to create a task, or task -ls to list tasks."
       );
       rl.close();
       process.exit(1);
+      return;
     }
   }
 
   console.error(`Unknown command: ${mainCommand}. Use -h or --help for instructions.`);
   rl.close();
   process.exit(1);
+  return;
 }
 
 if (process.env.NODE_ENV !== "test") {

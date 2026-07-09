@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import type { IBus, IStore } from "@yaaa/interfaces";
 import { container } from "@yaaa/platform";
 import { OuterLoop } from "@yaaa/agents";
@@ -20,7 +21,7 @@ export class Supervisor {
   }
 
   async runTask(goal: string, taskId?: string): Promise<{ success: boolean; summary: string; plan: any }> {
-    const activeTaskId = taskId || `task-${Date.now()}`;
+    const activeTaskId = taskId || crypto.randomUUID();
     await this.store.initTaskDb(activeTaskId);
 
     // 1. Generate plan

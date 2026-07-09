@@ -2,6 +2,8 @@ import { useRef, useEffect, useState } from "react";
 import logoImg from "../assets/logo.jpg";
 import type { TaskViewModel } from "../viewmodels/useTaskViewModel";
 import { TaskModel } from "../models/TaskModel";
+import * as shared from "@yaaa/shared";
+const { ORCHESTRATOR_MD_HEADERS } = shared;
 
 interface DashboardViewProps {
   viewModel: TaskViewModel;
@@ -84,11 +86,11 @@ function parseOrchestratorMd(content: string | null): ParsedOrchestrator {
       continue;
     }
 
-    if (line.startsWith("## Plan")) {
+    if (line.startsWith(ORCHESTRATOR_MD_HEADERS.PLAN)) {
       currentSection = "plan";
       continue;
     }
-    if (line.startsWith("## Execution Ledger")) {
+    if (line.startsWith(ORCHESTRATOR_MD_HEADERS.EXECUTION)) {
       currentSection = "ledger";
       continue;
     }
@@ -127,8 +129,9 @@ function parseOrchestratorMd(content: string | null): ParsedOrchestrator {
     }
 
     if (currentSection === "ledger") {
-      if (line.startsWith("### Step")) {
-        const match = line.match(/### Step (\d+)\s*\((.*?)\)/);
+      if (line.startsWith(ORCHESTRATOR_MD_HEADERS.STEP)) {
+        const stepNumPart = line.replace(ORCHESTRATOR_MD_HEADERS.STEP, "").trim();
+        const match = stepNumPart.match(/^(\d+)\s*\((.*?)\)/);
         if (match) {
           currentStep = {
             step: match[1],
@@ -140,17 +143,17 @@ function parseOrchestratorMd(content: string | null): ParsedOrchestrator {
           result.steps.push(currentStep);
         }
       } else if (currentStep) {
-        if (line.startsWith("* **Strategy**:")) {
-          currentStep.strategy = line.replace("* **Strategy**:", "").trim();
+        if (line.startsWith(ORCHESTRATOR_MD_HEADERS.STRATEGY)) {
+          currentStep.strategy = line.replace(ORCHESTRATOR_MD_HEADERS.STRATEGY, "").trim();
         } else if (line.startsWith("- ") && !line.includes("**")) {
           let foundFacts = false;
           for (let j = i - 1; j >= 0; j--) {
             const prevLine = lines[j].trim();
-            if (prevLine.startsWith("* **Facts Learned**:")) {
+            if (prevLine.startsWith(ORCHESTRATOR_MD_HEADERS.FACTS)) {
               foundFacts = true;
               break;
             }
-            if (prevLine.startsWith("* **Assumptions Made**:") || prevLine.startsWith("### Step")) {
+            if (prevLine.startsWith(ORCHESTRATOR_MD_HEADERS.ASSUMPTIONS) || prevLine.startsWith(ORCHESTRATOR_MD_HEADERS.STEP)) {
               break;
             }
           }
@@ -172,6 +175,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     goal,
     setGoal,
     taskId,
+    setTaskId,
     running,
     subtasks,
     logs,
@@ -194,6 +198,16 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [orchestratorMd, setOrchestratorMd] = useState<string | null>(null);
   const [loadingOrchestrator, setLoadingOrchestrator] = useState(false);
+
+  // YAAA data directory state
+  const [yaaaDir, setYaaaDir] = useState<string>("");
+
+  // Fetch yaaaDir on mount
+  useEffect(() => {
+    TaskModel.getYaaaDir()
+      .then(setYaaaDir)
+      .catch((err) => console.error("Failed to fetch YAAA dir:", err));
+  }, []);
 
   // Auto-scroll logs
   useEffect(() => {
@@ -218,22 +232,32 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
 
   // Fetch orchestrator.md when a task is selected
   useEffect(() => {
+    let active = true;
     if (selectedTaskId) {
       setLoadingOrchestrator(true);
       (async () => {
         try {
           const content = await TaskModel.readTaskOrchestrator(selectedTaskId);
-          setOrchestratorMd(content);
+          if (active) {
+            setOrchestratorMd(content);
+          }
         } catch (err) {
           console.error("Failed to load orchestrator:", err);
-          setOrchestratorMd(null);
+          if (active) {
+            setOrchestratorMd(null);
+          }
         } finally {
-          setLoadingOrchestrator(false);
+          if (active) {
+            setLoadingOrchestrator(false);
+          }
         }
       })();
     } else {
       setOrchestratorMd(null);
     }
+    return () => {
+      active = false;
+    };
   }, [selectedTaskId]);
 
   // Auto-resize textarea
@@ -258,6 +282,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   const handleReset = () => {
     setSelectedTaskId(null);
     setShowTaskView(false);
+    setTaskId(null);
   };
 
   const handleSelectTask = (id: string) => {
@@ -270,6 +295,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     setSelectedTaskId(null);
     setShowTaskView(false);
     setGoal("");
+    setTaskId(null);
   };
 
   const formatDate = (dateStr: string): string => {
@@ -311,7 +337,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
             <div className="sidebar-empty">No past missions</div>
           ) : (
             tasks.map((t) => {
-              const isActive = t.id === (taskId || selectedTaskId);
+              const isActive = (showTaskView && t.id === taskId) || (selectedTaskId === t.id);
               // Handle active run case (t.status could be 'running' or 'success'/'failed')
               const status = t.id === taskId && running ? "running" : t.status;
               return (
@@ -694,7 +720,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                           <div className="artifact-name">{art.path.split("/").pop()}</div>
                           <div className="artifact-desc">{art.description}</div>
                         </div>
-                        <a className="artifact-link" href={`file:///Users/krishnarajk/Documents/projects/yaaa/apps/ui/workspace/${art.path}`} target="_blank" rel="noreferrer">Open</a>
+                        <a className="artifact-link" href={`file://${yaaaDir}/tasks/${selectedTaskId || taskId}/working/${art.path}`} target="_blank" rel="noreferrer">Open</a>
                       </div>
                     ))}
                   </div>

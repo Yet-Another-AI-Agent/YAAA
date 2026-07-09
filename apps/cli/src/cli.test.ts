@@ -164,17 +164,21 @@ describe('YAAA CLI Integration & Features', () => {
     let exitSpy: any;
     let logSpy: any;
     let errSpy: any;
+    let originalExit: typeof process.exit;
 
     beforeEach(() => {
       originalArgv = process.argv;
-      exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
+      originalExit = process.exit;
+      const mockExit = vi.fn(() => undefined as never);
+      process.exit = mockExit;
+      exitSpy = mockExit;
       logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
       errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     });
 
     afterEach(() => {
       process.argv = originalArgv;
-      exitSpy.mockRestore();
+      process.exit = originalExit;
       logSpy.mockRestore();
       errSpy.mockRestore();
     });
@@ -185,7 +189,9 @@ describe('YAAA CLI Integration & Features', () => {
 
       expect(auth.checkAccessToken()).toBe('cmd-key-777');
       expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('API Key updated successfully'));
+      expect(exitSpy).toHaveBeenCalledTimes(1);
       expect(exitSpy).toHaveBeenCalledWith(0);
+      expect(errSpy).not.toHaveBeenCalled();
     });
 
     it('should save preferred model via "config --model" command', async () => {
@@ -195,7 +201,9 @@ describe('YAAA CLI Integration & Features', () => {
       const loaded = auth.loadConfig();
       expect(loaded.preferredModels?.worker).toBe('openai/gpt-4-turbo');
       expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('Preferred model for role "worker" set to "openai/gpt-4-turbo"'));
+      expect(exitSpy).toHaveBeenCalledTimes(1);
       expect(exitSpy).toHaveBeenCalledWith(0);
+      expect(errSpy).not.toHaveBeenCalled();
     });
 
     it('should list tasks via "task -ls" command', async () => {
@@ -214,7 +222,9 @@ describe('YAAA CLI Integration & Features', () => {
 
       expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('task-list-id'));
       expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('List me'));
+      expect(exitSpy).toHaveBeenCalledTimes(1);
       expect(exitSpy).toHaveBeenCalledWith(0);
+      expect(errSpy).not.toHaveBeenCalled();
     });
 
     it('should fail config command if key is missing', async () => {
@@ -222,6 +232,7 @@ describe('YAAA CLI Integration & Features', () => {
       await bootstrap();
 
       expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('Please provide a key value'));
+      expect(exitSpy).toHaveBeenCalledTimes(1);
       expect(exitSpy).toHaveBeenCalledWith(1);
     });
 
@@ -230,6 +241,7 @@ describe('YAAA CLI Integration & Features', () => {
       await bootstrap();
 
       expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('Please provide role and model ID'));
+      expect(exitSpy).toHaveBeenCalledTimes(1);
       expect(exitSpy).toHaveBeenCalledWith(1);
     });
 
@@ -238,6 +250,7 @@ describe('YAAA CLI Integration & Features', () => {
       await bootstrap();
 
       expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('Role must be one of'));
+      expect(exitSpy).toHaveBeenCalledTimes(1);
       expect(exitSpy).toHaveBeenCalledWith(1);
     });
   });

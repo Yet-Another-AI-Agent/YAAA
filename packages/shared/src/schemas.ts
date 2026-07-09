@@ -75,3 +75,13 @@ export const AgentMessageSchema = z.discriminatedUnion("kind", [
     content: z.string(),
   }),
 ]);
+
+export const ORCHESTRATOR_MD_HEADERS = {
+  TITLE: "# Task Orchestration Ledger",
+  PLAN: "## Plan",
+  EXECUTION: "## Execution Ledger",
+  STEP: "### Step",
+  STRATEGY: "* **Strategy**:",
+  FACTS: "* **Facts Learned**:",
+  ASSUMPTIONS: "* **Assumptions Made**:",
+};

@@ -9,6 +9,7 @@ const makeViewModel = (overrides = {}) => ({
   goal: "",
   setGoal: vi.fn(),
   taskId: null,
+  setTaskId: vi.fn(),
   running: false,
   subtasks: [],
   logs: [],

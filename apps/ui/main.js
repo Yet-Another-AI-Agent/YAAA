@@ -158,6 +158,11 @@ ipcMain.handle("list-tasks", async (event) => {
       output += data.toString();
     });
 
+    child.on("error", (err) => {
+      console.error("Failed to spawn CLI process:", err);
+      resolve([]);
+    });
+
     child.on("close", () => {
       try {
         const lines = output.split("\n");
@@ -180,16 +185,34 @@ ipcMain.handle("list-tasks", async (event) => {
 });
 
 ipcMain.handle("read-task-orchestrator", async (event, taskId) => {
+  if (typeof taskId !== "string" || !/^[a-zA-Z0-9-]+$/.test(taskId)) {
+    console.error(`Invalid taskId: ${taskId}`);
+    return null;
+  }
   const yaaaDir = process.env.YAAA_DATA_DIR || path.join(os.homedir(), ".yaaa");
-  const mdPath = path.join(yaaaDir, "tasks", taskId, "orchestrator.md");
+  const tasksDir = path.join(yaaaDir, "tasks");
+  const mdPath = path.join(tasksDir, taskId, "orchestrator.md");
+
+  // check that the resolved mdPath starts with the expected tasks folder
+  const resolvedMdPath = path.resolve(mdPath);
+  const resolvedTasksDir = path.resolve(tasksDir);
+  if (!resolvedMdPath.startsWith(resolvedTasksDir)) {
+    console.error(`Path traversal detected: ${mdPath}`);
+    return null;
+  }
+
   try {
-    if (fs.existsSync(mdPath)) {
-      return fs.readFileSync(mdPath, "utf-8");
+    if (fs.existsSync(resolvedMdPath)) {
+      return fs.readFileSync(resolvedMdPath, "utf-8");
     }
   } catch (err) {
     console.error(`Failed to read orchestrator for task ${taskId}:`, err);
   }
   return null;
+});
+
+ipcMain.handle("get-yaaa-dir", async (event) => {
+  return process.env.YAAA_DATA_DIR || path.join(os.homedir(), ".yaaa");
 });
 
 app.whenReady().then(() => {
