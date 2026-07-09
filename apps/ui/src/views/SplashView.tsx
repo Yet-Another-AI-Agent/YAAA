@@ -1,6 +1,7 @@
 import React from "react";
 import logoImg from "../assets/logo.jpg";
 import { TaskModel } from "../models/TaskModel";
+import { isValidMeshApiKey } from "../utils/validation";
 
 interface SplashViewProps {
   onAnimationEnd: () => void;
@@ -76,6 +77,12 @@ export function SplashView({ onAnimationEnd }: SplashViewProps) {
     e.preventDefault();
     if (!apiKey.trim()) {
       setApiKeyError("Mesh API Key cannot be empty.");
+      return;
+    }
+    if (!isValidMeshApiKey(apiKey)) {
+      setApiKeyError(
+        "Please enter a valid Mesh API Key (it should start with 'mesh_' and be at least 8 characters after the prefix).",
+      );
       return;
     }
     setApiKeyError("");
@@ -188,7 +195,7 @@ export function SplashView({ onAnimationEnd }: SplashViewProps) {
               )}
             </div>
             <div className="onboarding-actions">
-              <button type="submit" className="btn-primary">
+              <button type="submit" className="btn btn-primary">
                 Save & Continue
               </button>
             </div>
@@ -211,6 +218,32 @@ export function SplashView({ onAnimationEnd }: SplashViewProps) {
           Help the AI agent adapt to your professional style, preferences, and
           guidelines. Upload your resume or fill out the profile.
         </p>
+        <div className="guide-section">
+          <h4 className="guide-title">How to Export Profiles</h4>
+          <div className="guide-grid">
+            <div className="guide-card">
+              <div className="guide-card-brand chatgpt">ChatGPT</div>
+              <div className="guide-card-text">
+                Go to Settings &gt; Personalization &gt; Custom Instructions or
+                Memory to copy your profile details.
+              </div>
+            </div>
+            <div className="guide-card">
+              <div className="guide-card-brand claude">Claude</div>
+              <div className="guide-card-text">
+                Go to Settings &gt; Custom Instructions or copy instructions
+                from your developer profile settings.
+              </div>
+            </div>
+            <div className="guide-card">
+              <div className="guide-card-brand gemini">Gemini</div>
+              <div className="guide-card-text">
+                Go to Gemini Settings &gt; Gemini Apps Activity or copy your
+                saved context from your profile.
+              </div>
+            </div>
+          </div>
+        </div>
         <form onSubmit={handleSaveProfile} className="onboarding-form">
           <div className="file-upload-zone">
             <input
@@ -268,44 +301,17 @@ export function SplashView({ onAnimationEnd }: SplashViewProps) {
           <div className="onboarding-actions">
             <button
               type="button"
-              className="btn-secondary"
+              className="btn btn-secondary"
               onClick={handleSkipProfile}
               disabled={isParsing}
             >
               Skip Profile
             </button>
-            <button type="submit" className="btn-primary" disabled={isParsing}>
+            <button type="submit" className="btn btn-primary" disabled={isParsing}>
               Save & Finish
             </button>
           </div>
         </form>
-
-        <div className="guide-section">
-          <h4 className="guide-title">How to Export Profiles</h4>
-          <div className="guide-grid">
-            <div className="guide-card">
-              <div className="guide-card-brand chatgpt">ChatGPT</div>
-              <div className="guide-card-text">
-                Go to Settings &gt; Personalization &gt; Custom Instructions or
-                Memory to copy your profile details.
-              </div>
-            </div>
-            <div className="guide-card">
-              <div className="guide-card-brand claude">Claude</div>
-              <div className="guide-card-text">
-                Go to Settings &gt; Custom Instructions or copy instructions
-                from your developer profile settings.
-              </div>
-            </div>
-            <div className="guide-card">
-              <div className="guide-card-brand gemini">Gemini</div>
-              <div className="guide-card-text">
-                Go to Gemini Settings &gt; Gemini Apps Activity or copy your
-                saved context from your profile.
-              </div>
-            </div>
-          </div>
-        </div>
       </div>
     </div>
   );
