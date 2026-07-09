@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, act } from "@testing-library/react";
 import { DashboardView } from "./DashboardView";
 
 vi.mock("../assets/logo.jpg", () => ({ default: "logo.jpg" }));
@@ -27,10 +27,15 @@ const makeViewModel = (overrides = {}) => ({
 describe("DashboardView", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    (window as any).electronAPI = {
+      getYaaaDir: vi.fn().mockResolvedValue("/mock/yaaa"),
+      getTaskHistory: vi.fn().mockResolvedValue([]),
+    };
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    delete (window as any).electronAPI;
   });
 
   it("renders the home view with brand label", () => {
@@ -75,14 +80,18 @@ describe("DashboardView", () => {
     expect(sidebar).toBeTruthy();
     expect(sidebar?.classList.contains("collapsed")).toBe(false);
 
-    toggleBtn.click();
+    act(() => {
+      toggleBtn.click();
+    });
     expect(sidebar?.classList.contains("collapsed")).toBe(true);
 
-    toggleBtn.click();
+    act(() => {
+      toggleBtn.click();
+    });
     expect(sidebar?.classList.contains("collapsed")).toBe(false);
   });
 
-  it("collapses the sidebar when a task is selected from the sidebar", () => {
+  it("collapses the sidebar when a task is selected from the sidebar", async () => {
     const tasks = [
       { id: "task-1", prompt: "Test task 1", status: "success", created_at: "2026-07-08T12:00:00Z" }
     ];
@@ -92,7 +101,9 @@ describe("DashboardView", () => {
     expect(sidebar?.classList.contains("collapsed")).toBe(false);
 
     const taskItem = screen.getByText("Test task 1");
-    taskItem.click();
+    await act(async () => {
+      taskItem.click();
+    });
 
     expect(sidebar?.classList.contains("collapsed")).toBe(true);
   });

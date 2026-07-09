@@ -1,14 +1,15 @@
-@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import "https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap";
 
 :root {
-  --font-sans: 'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+  --font-sans: "Outfit", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    sans-serif;
+  --font-mono: "JetBrains Mono", "Fira Code", monospace;
 
   /* HSL Tailored Colors */
   --bg-app: hsl(224, 25%, 8%);
   --bg-card: hsl(222, 22%, 12%, 0.7);
   --bg-card-hover: hsl(222, 22%, 15%, 0.85);
-  
+
   --border-color: hsl(220, 20%, 20%, 0.5);
   --border-color-glow: hsl(242, 60%, 60%, 0.4);
 
@@ -18,7 +19,7 @@
 
   --color-primary: hsl(242, 85%, 65%);
   --color-primary-glow: hsl(242, 85%, 65%, 0.35);
-  
+
   --color-success: hsl(145, 80%, 45%);
   --color-success-glow: hsl(145, 80%, 45%, 0.3);
 
@@ -61,20 +62,23 @@ body {
 
   background: radial-gradient(
     600px circle at var(--gx, -9999px) var(--gy, -9999px),
-    hsl(0, 0%, 100%, 0.02)    0%,
+    hsl(0, 0%, 100%, 0.02) 0%,
     hsl(242, 100%, 72%, 0.06) 8%,
-    hsl(260, 90%,  65%, 0.04) 22%,
-    hsl(272, 80%,  55%, 0.02) 42%,
-    transparent               65%
+    hsl(260, 90%, 65%, 0.04) 22%,
+    hsl(272, 80%, 55%, 0.02) 42%,
+    transparent 65%
   );
-
   -webkit-mask-image: radial-gradient(
     600px circle at var(--gx, -9999px) var(--gy, -9999px),
-    black 0%, black 60%, transparent 100%
+    black 0%,
+    black 60%,
+    transparent 100%
   );
   mask-image: radial-gradient(
     600px circle at var(--gx, -9999px) var(--gy, -9999px),
-    black 0%, black 60%, transparent 100%
+    black 0%,
+    black 60%,
+    transparent 100%
   );
 }
 
@@ -328,11 +332,19 @@ body {
   font-weight: bold;
 }
 
-.log-source.orchestrator { color: var(--color-info); }
-.log-source.agent { color: hsl(280, 80%, 70%); }
-.log-source.system { color: var(--color-warning); }
+.log-source.orchestrator {
+  color: var(--color-info);
+}
+.log-source.agent {
+  color: hsl(280, 80%, 70%);
+}
+.log-source.system {
+  color: var(--color-warning);
+}
 
-.log-time { color: var(--text-muted); }
+.log-time {
+  color: var(--text-muted);
+}
 
 .log-content {
   color: var(--text-secondary);
@@ -455,14 +467,27 @@ body {
 
 /* Animations */
 @keyframes pulse-glow {
-  0% { transform: scale(1); opacity: 0.6; }
-  50% { transform: scale(1.2); opacity: 1; }
-  100% { transform: scale(1); opacity: 0.6; }
+  0% {
+    transform: scale(1);
+    opacity: 0.6;
+  }
+  50% {
+    transform: scale(1.2);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 0.6;
+  }
 }
 
 @keyframes border-glow-pulse {
-  0% { border-color: hsl(35, 90%, 55%, 0.6); }
-  100% { border-color: hsl(35, 90%, 55%, 1.2); }
+  0% {
+    border-color: hsl(35, 90%, 55%, 0.6);
+  }
+  100% {
+    border-color: hsl(35, 90%, 55%, 1.2);
+  }
 }
 
 /* Splash Screen Styles */
@@ -484,7 +509,11 @@ body {
   position: absolute;
   width: 400px;
   height: 400px;
-  background: radial-gradient(circle, hsl(242, 85%, 65%, 0.15) 0%, transparent 70%);
+  background: radial-gradient(
+    circle,
+    hsl(242, 85%, 65%, 0.15) 0%,
+    transparent 70%
+  );
   filter: blur(40px);
   animation: pulse-glow-bg 4s infinite alternate;
 }
@@ -547,35 +576,73 @@ body {
 }
 
 @keyframes logo-entrance {
-  0% { transform: scale(0.85); opacity: 0; filter: blur(10px); }
-  100% { transform: scale(1); opacity: 1; filter: blur(0); }
+  0% {
+    transform: scale(0.85);
+    opacity: 0;
+    filter: blur(10px);
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+    filter: blur(0);
+  }
 }
 
 @keyframes subtitle-entrance {
-  0% { opacity: 0; transform: translateY(8px); }
-  100% { opacity: 1; transform: translateY(0); }
+  0% {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 @keyframes progress-load {
-  0% { transform: translateX(-100%); }
-  40% { transform: translateX(-40%); }
-  75% { transform: translateX(-15%); }
-  100% { transform: translateX(0); }
+  0% {
+    transform: translateX(-100%);
+  }
+  40% {
+    transform: translateX(-40%);
+  }
+  75% {
+    transform: translateX(-15%);
+  }
+  100% {
+    transform: translateX(0);
+  }
 }
 
 @keyframes pulse-glow-bg {
-  0% { transform: scale(0.9); opacity: 0.6; }
-  100% { transform: scale(1.1); opacity: 1; }
+  0% {
+    transform: scale(0.9);
+    opacity: 0.6;
+  }
+  100% {
+    transform: scale(1.1);
+    opacity: 1;
+  }
 }
 
 @keyframes fade-in-status {
-  0% { opacity: 0.5; }
-  100% { opacity: 1; }
+  0% {
+    opacity: 0.5;
+  }
+  100% {
+    opacity: 1;
+  }
 }
 
 @keyframes fade-in-scale {
-  0% { opacity: 0; transform: scale(0.98); }
-  100% { opacity: 1; transform: scale(1); }
+  0% {
+    opacity: 0;
+    transform: scale(0.98);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
 }
 
 /* ═══════════════════════════════════════════════════
@@ -761,7 +828,8 @@ body {
 }
 .mission-input-wrapper:focus-within {
   border-color: hsl(242, 85%, 65%, 0.5);
-  box-shadow: 0 0 0 3px hsl(242, 85%, 65%, 0.08), 0 8px 32px hsl(242, 85%, 10%, 0.5);
+  box-shadow: 0 0 0 3px hsl(242, 85%, 65%, 0.08), 0 8px 32px
+    hsl(242, 85%, 10%, 0.5);
 }
 
 .mission-textarea {
@@ -846,7 +914,9 @@ body {
   animation: spin 0.7s linear infinite;
 }
 @keyframes spin {
-  to { transform: rotate(360deg); }
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /* ─── Suggestion Chips ─── */
@@ -912,7 +982,9 @@ body {
   flex: 1;
 }
 @media (max-width: 900px) {
-  .task-grid { grid-template-columns: 1fr; }
+  .task-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .task-panel {
@@ -958,11 +1030,23 @@ body {
   background: var(--color-primary);
   animation: thinking-bounce 1.4s infinite ease-in-out;
 }
-.thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
-.thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
+.thinking-dots span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.thinking-dots span:nth-child(3) {
+  animation-delay: 0.4s;
+}
 @keyframes thinking-bounce {
-  0%, 80%, 100% { transform: scale(0.7); opacity: 0.5; }
-  40% { transform: scale(1); opacity: 1; }
+  0%,
+  80%,
+  100% {
+    transform: scale(0.7);
+    opacity: 0.5;
+  }
+  40% {
+    transform: scale(1);
+    opacity: 1;
+  }
 }
 
 /* Subtask list */
@@ -988,7 +1072,9 @@ body {
   border-color: var(--color-primary);
   background: hsl(242, 60%, 13%);
 }
-.subtask-item.completed { opacity: 0.65; }
+.subtask-item.completed {
+  opacity: 0.65;
+}
 
 .subtask-dot-col {
   display: flex;
@@ -1008,7 +1094,9 @@ body {
   opacity: 0.5;
 }
 
-.subtask-body { flex: 1; }
+.subtask-body {
+  flex: 1;
+}
 .subtask-title {
   font-size: 0.95rem;
   font-weight: 500;
@@ -1037,12 +1125,23 @@ body {
   border-radius: 5px;
   font-weight: 500;
 }
-.risk-tag.low { color: var(--color-success); background: hsl(145, 80%, 45%, 0.1); }
-.risk-tag.medium { color: var(--color-warning); background: hsl(35, 90%, 55%, 0.1); }
-.risk-tag.high { color: var(--color-danger); background: hsl(0, 85%, 60%, 0.1); }
+.risk-tag.low {
+  color: var(--color-success);
+  background: hsl(145, 80%, 45%, 0.1);
+}
+.risk-tag.medium {
+  color: var(--color-warning);
+  background: hsl(35, 90%, 55%, 0.1);
+}
+.risk-tag.high {
+  color: var(--color-danger);
+  background: hsl(0, 85%, 60%, 0.1);
+}
 
 /* Console */
-.console-panel { min-height: 200px; }
+.console-panel {
+  min-height: 200px;
+}
 
 .console-log-box {
   flex: 1;
@@ -1076,10 +1175,18 @@ body {
   font-size: 0.75rem;
   font-weight: 600;
 }
-.log-source.orchestrator { color: var(--color-info); }
-.log-source.agent { color: hsl(280, 80%, 70%); }
-.log-source.system { color: var(--color-warning); }
-.log-time { color: var(--text-muted); }
+.log-source.orchestrator {
+  color: var(--color-info);
+}
+.log-source.agent {
+  color: hsl(280, 80%, 70%);
+}
+.log-source.system {
+  color: var(--color-warning);
+}
+.log-time {
+  color: var(--text-muted);
+}
 .log-content {
   color: var(--text-secondary);
   white-space: pre-wrap;
@@ -1278,13 +1385,19 @@ body {
   flex-shrink: 0;
 }
 
-.status-indicator.success { background-color: var(--color-success); }
-.status-indicator.failed { background-color: var(--color-danger); }
+.status-indicator.success {
+  background-color: var(--color-success);
+}
+.status-indicator.failed {
+  background-color: var(--color-danger);
+}
 .status-indicator.running {
   background-color: var(--color-info);
   animation: pulse-glow 1.5s infinite;
 }
-.status-indicator.pending { background-color: var(--text-muted); }
+.status-indicator.pending {
+  background-color: var(--text-muted);
+}
 
 .sidebar-item-content {
   flex: 1;
@@ -1386,7 +1499,9 @@ body {
 }
 
 @media (max-width: 900px) {
-  .detail-grid { grid-template-columns: 1fr; }
+  .detail-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .ledger-steps-list {
@@ -1482,3 +1597,470 @@ body {
   font-weight: bold;
 }
 
+/* ==========================================================================
+   SLACK-STYLE WORKSPACE STYLES
+   ========================================================================== */
+
+.slack-workspace {
+  display: flex;
+  height: 100vh;
+  width: 100vw;
+  background: var(--bg-app);
+}
+
+.slack-channel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0.5rem;
+}
+
+.slack-channel-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  width: 100%;
+  transition: background 0.15s ease, color 0.15s ease;
+  font-family: var(--font-sans);
+}
+
+.slack-channel-item:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-primary);
+}
+
+.slack-channel-item.active {
+  background: var(--color-primary);
+  color: var(--color-primary-text);
+}
+
+.slack-channel-item.active .slack-hash {
+  color: var(--color-primary-text);
+  opacity: 0.8;
+}
+
+.slack-hash {
+  color: var(--text-muted);
+  font-weight: 700;
+  font-family: var(--font-mono);
+  font-size: 1.1rem;
+}
+
+.slack-channel-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Chat Pane */
+.slack-chat-pane {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-app);
+  height: 100%;
+  min-width: 0;
+}
+
+.slack-chat-header {
+  height: 60px;
+  border-bottom: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  padding: 0 1.5rem;
+  background: hsl(222, 22%, 9%);
+  flex-shrink: 0;
+}
+
+.slack-chat-header-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 1.1rem;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slack-chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1.5rem;
+}
+
+/* ═══════════════════════════════════════════════════
+   ONBOARDING GATING WIZARD
+   ═══════════════════════════════════════════════════ */
+.onboarding-container {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  width: 100%;
+  max-width: 580px;
+  margin: 0 auto;
+  text-align: left;
+  animation: fade-in-scale 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.onboarding-title {
+  font-size: 1.8rem;
+  font-weight: 700;
+  background: linear-gradient(
+    135deg,
+    hsl(0, 0%, 100%) 30%,
+    var(--color-primary)
+  );
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  margin-bottom: 0.5rem;
+}
+
+.onboarding-desc {
+  font-size: 0.95rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  margin-bottom: 1rem;
+}
+
+.onboarding-form {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+
+/* Slack Message Bubble */
+.slack-message {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  transition: background 0.15s ease;
+  padding: 4px 8px;
+  border-radius: 6px;
+}
+
+.slack-message:hover {
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.slack-message-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 4px;
+  color: white;
+  font-weight: bold;
+  font-size: 0.95rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+  font-family: var(--font-sans);
+}
+
+.slack-message-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.slack-message-header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.slack-message-sender {
+  font-weight: 700;
+  font-size: 0.95rem;
+  color: var(--text-primary);
+}
+
+.slack-message-time {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+/* Formatted bubble box */
+.slack-message-bubble {
+  background: hsl(222, 22%, 11%);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  color: var(--text-secondary);
+  font-size: 0.95rem;
+  line-height: 1.5;
+  max-width: 90%;
+  overflow-wrap: break-word;
+  white-space: pre-wrap;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
+.slack-message-sender-user {
+  background: hsl(242, 60%, 14%, 0.4);
+  border-color: hsl(242, 60%, 25%, 0.5);
+  color: var(--text-primary);
+}
+
+/* Chat Input Area */
+.slack-chat-input-container {
+  padding: 1rem 1.5rem 1.5rem;
+  background: hsl(224, 25%, 8%);
+  flex-shrink: 0;
+}
+
+.slack-chat-input-box {
+  background: hsl(222, 22%, 10%);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+/* Details Right Sidebar */
+.slack-details-sidebar {
+  width: 350px;
+  border-left: 1px solid var(--border-color);
+  background: hsl(224, 25%, 7%);
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  flex-shrink: 0;
+}
+
+.slack-details-header {
+  height: 60px;
+  border-bottom: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  padding: 0 1.25rem;
+  font-weight: 600;
+  font-size: 1rem;
+  flex-shrink: 0;
+}
+
+.slack-details-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+/* Artifacts styles in message */
+.slack-message-artifacts {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.slack-message-artifact-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: hsl(222, 22%, 7%);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 0.85rem;
+  min-width: 0;
+}
+
+.slack-message-artifact-card .artifact-details {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+
+.slack-message-artifact-card .artifact-filename {
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slack-message-artifact-card .artifact-description {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slack-artifact-download {
+  color: var(--color-info);
+  text-decoration: none;
+  font-weight: 600;
+  margin-left: 8px;
+  flex-shrink: 0;
+}
+
+.slack-artifact-download:hover {
+  text-decoration: underline;
+}
+
+.slack-chat-view-container {
+  display: flex;
+  flex-direction: row;
+  height: calc(100vh - 60px);
+  overflow: hidden;
+  width: 100%;
+
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.form-label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-secondary);
+}
+
+.onboarding-textarea {
+  resize: vertical;
+  min-height: 100px;
+}
+
+.file-upload-zone {
+  border: 2px dashed var(--border-color);
+  border-radius: 12px;
+  padding: 1.5rem;
+  text-align: center;
+  background: hsl(222, 22%, 5%);
+  cursor: pointer;
+  transition: var(--transition-smooth);
+  position: relative;
+}
+
+.file-upload-zone:hover {
+  border-color: var(--color-primary);
+  background: hsl(242, 60%, 10%, 0.15);
+}
+
+.file-upload-zone input[type="file"] {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.file-upload-text {
+  font-size: 0.9rem;
+  color: var(--text-secondary);
+}
+
+.file-upload-hint {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-top: 0.25rem;
+}
+
+.onboarding-actions {
+  display: flex;
+  gap: 1rem;
+  margin-top: 1rem;
+  justify-content: flex-end;
+}
+
+.btn-secondary {
+  background: transparent;
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  padding: 0.75rem 1.5rem;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: var(--transition-smooth);
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: hsl(222, 22%, 14%);
+  border-color: var(--text-secondary);
+}
+
+.btn-secondary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.guide-section {
+  margin-top: 1.5rem;
+  border-top: 1px solid var(--border-color);
+  padding-top: 1.5rem;
+}
+
+.guide-title {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 0.75rem;
+}
+
+.guide-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.75rem;
+}
+
+.guide-card {
+  background: hsl(222, 22%, 6%);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 0.75rem;
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+.guide-card-brand {
+  font-weight: bold;
+  margin-bottom: 0.25rem;
+}
+
+.guide-card-brand.chatgpt {
+  color: hsl(160, 75%, 45%);
+}
+
+.guide-card-brand.claude {
+  color: hsl(25, 80%, 60%);
+}
+
+.guide-card-brand.gemini {
+  color: hsl(210, 85%, 60%);
+}
+
+.guide-card-text {
+  color: var(--text-secondary);
+}
+
+.error-message {
+  color: var(--color-danger);
+  font-size: 0.85rem;
+  margin-top: 0.25rem;
+
+}

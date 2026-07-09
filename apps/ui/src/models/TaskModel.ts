@@ -34,7 +34,10 @@ export class TaskModel {
     return this.getElectronAPI().startTask(goal);
   }
 
-  static async resolveApproval(callId: string, approved: boolean): Promise<any> {
+  static async resolveApproval(
+    callId: string,
+    approved: boolean,
+  ): Promise<any> {
     return this.getElectronAPI().resolveApproval(callId, approved);
   }
 
@@ -46,14 +49,62 @@ export class TaskModel {
     return this.getElectronAPI().readTaskOrchestrator(taskId);
   }
 
+   * Retrieves the complete execution log and chat history messages for a specific task.
+   * @param {string} taskId - The unique identifier of the task.
+   * @returns {Promise<any[]>} A promise resolving to an array of log/chat message objects.
+   */
+  static async getTaskHistory(taskId: string): Promise<any[]> {
+    return this.getElectronAPI().getTaskHistory(taskId);
+  }
+
+  /**
+   * Retrieves the absolute path to the YAAA data directory.
+   */
   static async getYaaaDir(): Promise<string> {
     return this.getElectronAPI().getYaaaDir();
+  }
+
+  /**
+   * Checks the onboarding status (Mesh API keys and user profile details existence).
+   */
+  static async getOnboardingStatus(): Promise<{
+    hasKey: boolean;
+    hasProfile: boolean;
+    skipped: boolean;
+  }> {
+    return this.getElectronAPI().getOnboardingStatus();
+  }
+
+  /**
+   * Saves the Mesh API Access Key to the central config.
+   */
+  static async saveOnboardingKeys(key: string): Promise<{ success: boolean }> {
+    return this.getElectronAPI().saveOnboardingKeys(key);
+  }
+
+  /**
+   * Saves the user profile configuration details (name, profession, bio).
+   */
+  static async saveOnboardingProfile(profile: {
+    name?: string;
+    profession?: string;
+    description?: string;
+    skip?: boolean;
+  }): Promise<{ success: boolean }> {
+    return this.getElectronAPI().saveOnboardingProfile(profile);
+  }
+
+  /**
+   * Parses resume text content via the AI LLM parser subprocess.
+   */
+  static async parseResume(text: string): Promise<any> {
+    return this.getElectronAPI().parseResume(text);
   }
 
   static subscribeEvents(
     onEvent: (eventData: { topic: string; data: any }) => void,
     onApproval: (approvalData: { agentId: string; toolCall: any }) => void,
-    onComplete: (resultData: { success: boolean; summary: string }) => void
+    onComplete: (resultData: { success: boolean; summary: string }) => void,
   ): () => void {
     const api = this.getElectronAPI();
 
