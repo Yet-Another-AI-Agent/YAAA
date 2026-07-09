@@ -1,10 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { container } from "@yaaa/platform";
-import type { IMeshGateway } from "@yaaa/interfaces";
+import type { IMeshGateway, IBus } from "@yaaa/interfaces";
 import { Planner } from "./planner.js";
 
 describe("Planner", () => {
   let mockGateway: IMeshGateway;
+  let mockBus: IBus;
   let planner: Planner;
 
   beforeEach(() => {
@@ -13,7 +14,12 @@ describe("Planner", () => {
       chat: vi.fn(),
       chatStream: vi.fn(),
     };
+    mockBus = {
+      publish: vi.fn().mockResolvedValue(undefined),
+      subscribe: vi.fn().mockReturnValue(() => {}),
+    };
     container.register("IMeshGateway", mockGateway);
+    container.register("IBus", mockBus);
     planner = new Planner();
   });
 
@@ -69,5 +75,30 @@ describe("Planner", () => {
     await expect(planner.plan("Write report")).rejects.toThrow(
       "No JSON code block found in model output."
     );
+  });
+
+  it("publishes planner reasoning as a thought when a taskId is given", async () => {
+    (mockGateway.chat as any).mockImplementation(async (_msgs: any, opts: any) => {
+      opts.onReasoning?.("decomposing the goal");
+      return '```json\n{ "goal": "g", "subtasks": [] }\n```';
+    });
+
+    await planner.plan("Write report", "task-123");
+
+    expect(mockBus.publish).toHaveBeenCalledWith(
+      "task.task-123.agent.planner.thought",
+      expect.objectContaining({ kind: "thought", from: "planner", content: "decomposing the goal" })
+    );
+  });
+
+  it("does not publish reasoning when no taskId is given", async () => {
+    (mockGateway.chat as any).mockImplementation(async (_msgs: any, opts: any) => {
+      opts.onReasoning?.("thinking without a task");
+      return '```json\n{ "goal": "g", "subtasks": [] }\n```';
+    });
+
+    await planner.plan("Write report");
+
+    expect(mockBus.publish).not.toHaveBeenCalled();
   });
 });

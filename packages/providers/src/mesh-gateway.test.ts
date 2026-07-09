@@ -50,6 +50,47 @@ describe("MeshGateway", () => {
     expect(chunks.join("")).toContain("verification");
   });
 
+  it("should emit sample reasoning via onReasoning in Mock Mode", async () => {
+    const gateway = new MeshGateway({ apiKey: "" });
+    const onReasoning = vi.fn();
+    await gateway.chat(
+      [{ role: "user", content: "test" }],
+      { modelRole: "planner", onReasoning }
+    );
+    expect(onReasoning).toHaveBeenCalledTimes(1);
+    expect(onReasoning.mock.calls[0][0]).toEqual(expect.any(String));
+    expect((onReasoning.mock.calls[0][0] as string).length).toBeGreaterThan(0);
+  });
+
+  it("should forward provider reasoning_content to onReasoning", async () => {
+    const gateway = new MeshGateway({ apiKey: "some-key" });
+    mockCreate.mockResolvedValue({
+      choices: [
+        { message: { content: "the answer", reasoning_content: "let me think..." } },
+      ],
+    });
+    const onReasoning = vi.fn();
+    const response = await gateway.chat(
+      [{ role: "user", content: "hello" }],
+      { modelRole: "planner", onReasoning }
+    );
+    expect(response).toBe("the answer");
+    expect(onReasoning).toHaveBeenCalledWith("let me think...");
+  });
+
+  it("should not call onReasoning when the provider returns no reasoning", async () => {
+    const gateway = new MeshGateway({ apiKey: "some-key" });
+    mockCreate.mockResolvedValue({
+      choices: [{ message: { content: "plain answer" } }],
+    });
+    const onReasoning = vi.fn();
+    await gateway.chat(
+      [{ role: "user", content: "hello" }],
+      { modelRole: "planner", onReasoning }
+    );
+    expect(onReasoning).not.toHaveBeenCalled();
+  });
+
   it("should make a real OpenAI call if API key is provided", async () => {
     const gateway = new MeshGateway({ apiKey: "some-key" });
     

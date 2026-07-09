@@ -1,15 +1,28 @@
-import type { IMeshGateway, ChatMessage } from "@yaaa/interfaces";
+import type { IMeshGateway, IBus, ChatMessage } from "@yaaa/interfaces";
 import { container } from "@yaaa/platform";
 import { TaskPlanSchema, type TaskPlan } from "@yaaa/shared";
 
 export class Planner {
   private gateway: IMeshGateway;
+  private bus: IBus;
 
   constructor() {
     this.gateway = container.resolve<IMeshGateway>("IMeshGateway");
+    this.bus = container.resolve<IBus>("IBus");
   }
 
-  async plan(goal: string): Promise<TaskPlan> {
+  async plan(goal: string, taskId?: string): Promise<TaskPlan> {
+    // Surface the orchestrator's reasoning tokens as "thinking" for the UI.
+    const onReasoning = taskId
+      ? (reasoning: string) => {
+          void this.bus.publish(`task.${taskId}.agent.planner.thought`, {
+            kind: "thought",
+            from: "planner",
+            content: reasoning,
+          });
+        }
+      : undefined;
+
     const systemPrompt = `You are a central Task Planner for YAAA.
 Your job is to break down a user's task into a sequential, structured list of subtasks.
 Each subtask represents a step in a task graph and must declare its capabilities, dependencies, riskLevel, and success criteria.
@@ -56,6 +69,7 @@ DO NOT output any conversational text before or after the JSON. Only return a va
     let response = await this.gateway.chat(messages, {
       modelRole: "planner",
       temperature: 0.1,
+      onReasoning,
     });
 
     try {
@@ -73,6 +87,7 @@ DO NOT output any conversational text before or after the JSON. Only return a va
       response = await this.gateway.chat(messages, {
         modelRole: "planner",
         temperature: 0.1,
+        onReasoning,
       });
 
       return this.parseAndValidate(response);

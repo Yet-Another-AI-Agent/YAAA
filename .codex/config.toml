@@ -1,0 +1,9 @@
+[mcp_servers.code-review-graph]
+command = "/Users/krishnarajk/.local/bin/uvx"
+args = [
+    "code-review-graph",
+    "serve",
+]
+
+[mcp_servers.code-review-graph.env]
+CRG_DATA_DIR = "/Users/krishnarajk/.code-review-graph/yaaa"
