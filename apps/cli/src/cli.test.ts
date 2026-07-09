@@ -400,7 +400,6 @@ describe("YAAA CLI Integration & Features", () => {
       ];
       await bootstrap();
 
-      const loaded = auth.userProfession;
       const configLoaded = auth.loadConfig();
       expect(configLoaded.userProfession).toBe("Software Engineer");
       expect(logSpy).toHaveBeenCalledWith(
