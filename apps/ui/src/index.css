@@ -1926,6 +1926,7 @@ body {
   height: calc(100vh - 60px);
   overflow: hidden;
   width: 100%;
+}
 
 .form-group {
   display: flex;
