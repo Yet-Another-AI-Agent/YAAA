@@ -49,10 +49,16 @@ export class TaskModel {
     return this.getElectronAPI().readTaskOrchestrator(taskId);
   }
 
+  /**
+   * Retrieves the absolute path to the YAAA data directory.
+   */
   static async getYaaaDir(): Promise<string> {
     return this.getElectronAPI().getYaaaDir();
   }
 
+  /**
+   * Checks the onboarding status (Mesh API keys and user profile details existence).
+   */
   static async getOnboardingStatus(): Promise<{
     hasKey: boolean;
     hasProfile: boolean;
@@ -61,10 +67,16 @@ export class TaskModel {
     return this.getElectronAPI().getOnboardingStatus();
   }
 
+  /**
+   * Saves the Mesh API Access Key to the central config.
+   */
   static async saveOnboardingKeys(key: string): Promise<{ success: boolean }> {
     return this.getElectronAPI().saveOnboardingKeys(key);
   }
 
+  /**
+   * Saves the user profile configuration details (name, profession, bio).
+   */
   static async saveOnboardingProfile(profile: {
     name?: string;
     profession?: string;
@@ -74,6 +86,9 @@ export class TaskModel {
     return this.getElectronAPI().saveOnboardingProfile(profile);
   }
 
+  /**
+   * Parses resume text content via the AI LLM parser subprocess.
+   */
   static async parseResume(text: string): Promise<any> {
     return this.getElectronAPI().parseResume(text);
   }

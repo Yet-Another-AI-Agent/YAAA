@@ -217,7 +217,10 @@ ipcMain.handle("get-yaaa-dir", async (event) => {
   return process.env.YAAA_DATA_DIR || path.join(os.homedir(), ".yaaa");
 });
 
-// Config helpers
+/**
+ * Loads the local configuration from config.json.
+ * @returns {object} The parsed configuration object.
+ */
 function loadConfig() {
   const yaaaDir = process.env.YAAA_DATA_DIR || path.join(os.homedir(), ".yaaa");
   const configPath = path.join(yaaaDir, "config.json");
@@ -232,6 +235,10 @@ function loadConfig() {
   }
 }
 
+/**
+ * Saves the configuration object to config.json.
+ * @param {object} config - The configuration data to save.
+ */
 function saveConfig(config) {
   const yaaaDir = process.env.YAAA_DATA_DIR || path.join(os.homedir(), ".yaaa");
   if (!fs.existsSync(yaaaDir)) {
@@ -241,6 +248,9 @@ function saveConfig(config) {
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
 }
 
+/**
+ * IPC handler to check if user has Mesh key and personalization profile set up.
+ */
 ipcMain.handle("get-onboarding-status", async () => {
   const config = loadConfig();
   return {
@@ -250,6 +260,9 @@ ipcMain.handle("get-onboarding-status", async () => {
   };
 });
 
+/**
+ * IPC handler to save the Mesh API access key.
+ */
 ipcMain.handle("save-onboarding-keys", async (event, key) => {
   const config = loadConfig();
   config.accessToken = key;
@@ -257,6 +270,9 @@ ipcMain.handle("save-onboarding-keys", async (event, key) => {
   return { success: true };
 });
 
+/**
+ * IPC handler to save onboarding personalization details.
+ */
 ipcMain.handle(
   "save-onboarding-profile",
   async (event, { name, profession, description, skip }) => {
@@ -272,6 +288,9 @@ ipcMain.handle(
   },
 );
 
+/**
+ * IPC handler to parse resume content via CLI utility.
+ */
 ipcMain.handle("parse-resume", async (event, text) => {
   return new Promise((resolve) => {
     const cliPath = path.resolve(__dirname, "../cli/dist/index.js");
