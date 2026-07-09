@@ -184,6 +184,9 @@ ipcMain.handle("list-tasks", async (event) => {
   });
 });
 
+/**
+ * IPC handler to retrieve the chat history messages for a specific task using CLI.
+ */
 ipcMain.handle("get-task-history", async (event, taskId) => {
   if (typeof taskId !== "string" || !/^[a-zA-Z0-9-]+$/.test(taskId)) {
     console.error(`Invalid taskId: ${taskId}`);

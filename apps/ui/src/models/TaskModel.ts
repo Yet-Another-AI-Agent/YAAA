@@ -46,6 +46,11 @@ export class TaskModel {
     return this.getElectronAPI().readTaskOrchestrator(taskId);
   }
 
+  /**
+   * Retrieves the complete execution log and chat history messages for a specific task.
+   * @param {string} taskId - The unique identifier of the task.
+   * @returns {Promise<any[]>} A promise resolving to an array of log/chat message objects.
+   */
   static async getTaskHistory(taskId: string): Promise<any[]> {
     return this.getElectronAPI().getTaskHistory(taskId);
   }
