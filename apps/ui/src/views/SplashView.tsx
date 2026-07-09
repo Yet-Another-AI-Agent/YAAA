@@ -20,12 +20,15 @@ export function SplashView({ onAnimationEnd }: SplashViewProps) {
   const [isParsing, setIsParsing] = React.useState(false);
 
   React.useEffect(() => {
+    let active = true;
     let timerEnded = false;
     let fetchedStatus: any = null;
 
     const timer = setTimeout(() => {
-      timerEnded = true;
-      checkTransition();
+      if (active) {
+        timerEnded = true;
+        checkTransition();
+      }
     }, 3000);
 
     if (!(window as any).electronAPI) {
@@ -34,18 +37,22 @@ export function SplashView({ onAnimationEnd }: SplashViewProps) {
     } else {
       TaskModel.getOnboardingStatus()
         .then((s) => {
-          fetchedStatus = s;
-          checkTransition();
+          if (active) {
+            fetchedStatus = s;
+            checkTransition();
+          }
         })
         .catch((err) => {
           console.error("Failed to check onboarding status:", err);
-          fetchedStatus = { hasKey: true, hasProfile: true, skipped: true };
-          checkTransition();
+          if (active) {
+            fetchedStatus = { hasKey: true, hasProfile: true, skipped: true };
+            checkTransition();
+          }
         });
     }
 
     function checkTransition() {
-      if (timerEnded && fetchedStatus) {
+      if (active && timerEnded && fetchedStatus) {
         if (
           fetchedStatus.hasKey &&
           (fetchedStatus.hasProfile || fetchedStatus.skipped)
@@ -59,7 +66,10 @@ export function SplashView({ onAnimationEnd }: SplashViewProps) {
       }
     }
 
-    return () => clearTimeout(timer);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
   }, [onAnimationEnd]);
 
   const handleSaveKey = async (e: React.FormEvent) => {
@@ -163,8 +173,9 @@ export function SplashView({ onAnimationEnd }: SplashViewProps) {
           </p>
           <form onSubmit={handleSaveKey} className="onboarding-form">
             <div className="form-group">
-              <label className="form-label">Mesh API Access Key</label>
+              <label className="form-label" htmlFor="mesh-api-key">Mesh API Access Key</label>
               <input
+                id="mesh-api-key"
                 type="password"
                 className="task-input"
                 placeholder="Enter Mesh API Key (e.g. mesh_...)"
@@ -219,8 +230,9 @@ export function SplashView({ onAnimationEnd }: SplashViewProps) {
           </div>
 
           <div className="form-group">
-            <label className="form-label">Full Name</label>
+            <label className="form-label" htmlFor="user-name">Full Name</label>
             <input
+              id="user-name"
               type="text"
               className="task-input"
               placeholder="e.g. Alice Smith"
@@ -230,8 +242,9 @@ export function SplashView({ onAnimationEnd }: SplashViewProps) {
           </div>
 
           <div className="form-group">
-            <label className="form-label">Profession</label>
+            <label className="form-label" htmlFor="user-profession">Profession</label>
             <input
+              id="user-profession"
               type="text"
               className="task-input"
               placeholder="e.g. Principal Software Engineer"
@@ -241,8 +254,9 @@ export function SplashView({ onAnimationEnd }: SplashViewProps) {
           </div>
 
           <div className="form-group">
-            <label className="form-label">Biography / Guidelines</label>
+            <label className="form-label" htmlFor="user-bio">Biography / Guidelines</label>
             <textarea
+              id="user-bio"
               className="task-input onboarding-textarea"
               placeholder="Describe your background, skills, and coding preferences."
               value={description}

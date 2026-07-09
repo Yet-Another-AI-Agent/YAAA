@@ -497,12 +497,38 @@ export async function bootstrap() {
       process.exit(0);
       return;
     } else if (subFlag === "--parse-resume") {
-      const text = cleanArgs[2];
+      rl.close();
+      let text = cleanArgs[2] || "";
+      if (!text) {
+        const chunks: string[] = [];
+        text = await new Promise<string>((resolve) => {
+          let resolved = false;
+          const onData = (chunk: any) => {
+            chunks.push(chunk.toString());
+          };
+          const onEnd = () => {
+            if (!resolved) {
+              resolved = true;
+              resolve(chunks.join("").trim());
+            }
+          };
+          process.stdin.on("data", onData);
+          process.stdin.on("end", onEnd);
+          setTimeout(() => {
+            if (!resolved) {
+              resolved = true;
+              process.stdin.removeListener("data", onData);
+              process.stdin.removeListener("end", onEnd);
+              resolve("");
+            }
+          }, 1000);
+        });
+      }
+
       if (!text) {
         console.error(
-          'Error: Please provide resume text. Example: npm start config --parse-resume "<text>"',
+          "Error: Please provide resume text. Example: npm start config --parse-resume",
         );
-        rl.close();
         process.exit(1);
         return;
       }
@@ -558,7 +584,10 @@ export async function bootstrap() {
       console.log(
         "\n=================== YAAA CONFIGURATION ===================",
       );
-      console.log(`Access Token:      ${config.accessToken || "(Not set)"}`);
+      const maskedToken = config.accessToken
+        ? `${"*".repeat(Math.max(config.accessToken.length - 4, 0))}${config.accessToken.slice(-4)}`
+        : "(Not set)";
+      console.log(`Access Token:      ${maskedToken}`);
       console.log(`User Name:         ${config.userName || "(Not set)"}`);
       console.log(`User Profession:   ${config.userProfession || "(Not set)"}`);
       console.log(

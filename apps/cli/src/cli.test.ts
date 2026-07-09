@@ -405,7 +405,7 @@ describe("YAAA CLI Integration & Features", () => {
         expect.stringContaining("YAAA CONFIGURATION"),
       );
       expect(logSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Access Token:      test-token-xyz"),
+        expect.stringContaining("Access Token:      **********-xyz"),
       );
       expect(logSpy).toHaveBeenCalledWith(
         expect.stringContaining("User Name:         Bob Jones"),

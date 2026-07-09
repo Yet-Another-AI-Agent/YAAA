@@ -275,7 +275,7 @@ ipcMain.handle("save-onboarding-keys", async (event, key) => {
  */
 ipcMain.handle(
   "save-onboarding-profile",
-  async (event, { name, profession, description, skip }) => {
+  async (event, { name, profession, description, skip } = {}) => {
     const config = loadConfig();
     if (name !== undefined) config.userName = name;
     if (profession !== undefined) config.userProfession = profession;
@@ -294,12 +294,22 @@ ipcMain.handle(
 ipcMain.handle("parse-resume", async (event, text) => {
   return new Promise((resolve) => {
     const cliPath = path.resolve(__dirname, "../cli/dist/index.js");
-    const child = spawn("node", [cliPath, "config", "--parse-resume", text], {
+    const child = spawn("node", [cliPath, "config", "--parse-resume"], {
       cwd: path.resolve(__dirname, "../cli"),
     });
 
     let output = "";
     let errorOutput = "";
+
+    const timeout = setTimeout(() => {
+      console.error("parse-resume process timed out. Killing child.");
+      child.kill();
+      resolve({ error: "Resume parsing timed out" });
+    }, 30000);
+
+    // Write resume text to CLI stdin
+    child.stdin.write(text || "");
+    child.stdin.end();
 
     child.stdout.on("data", (data) => {
       output += data.toString();
@@ -310,6 +320,7 @@ ipcMain.handle("parse-resume", async (event, text) => {
     });
 
     child.on("close", (code) => {
+      clearTimeout(timeout);
       try {
         const startIndex = output.indexOf("{");
         if (startIndex !== -1) {
@@ -328,6 +339,7 @@ ipcMain.handle("parse-resume", async (event, text) => {
     });
 
     child.on("error", (err) => {
+      clearTimeout(timeout);
       resolve({ error: err.message });
     });
   });
