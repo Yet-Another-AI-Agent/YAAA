@@ -1,0 +1,4 @@
+
+# Playwright output
+test-results/
+e2e/artifacts/

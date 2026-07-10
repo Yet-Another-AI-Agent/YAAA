@@ -129,6 +129,17 @@ function makeApprovalHandler(taskId) {
 
 // ------------------------------------------------------------------ IPC: tasks
 
+// Conversational NLP gate: the renderer routes every message through this
+// before start-task. "hi" gets a chat reply and never creates a task.
+ipcMain.handle("route-user-message", async (_event, message) => {
+  try {
+    return await workspace.routeUserMessage(String(message ?? ""));
+  } catch {
+    // Never block a real request on classifier failure — treat it as work.
+    return { kind: "task" };
+  }
+});
+
 ipcMain.handle("start-task", async (_event, goal) => {
   // Scaffold synchronously so we can hand the id back before the run streams.
   const task = workspace.createTask(goal);
@@ -246,12 +257,35 @@ ipcMain.handle("post-conversation-message", async (_event, message) =>
   workspace.postConversationMessage(message),
 );
 
+ipcMain.handle("resume-agent", async (_event, agentId) =>
+  ({ resumed: workspace.resumeAgent(agentId) }),
+);
+
+ipcMain.handle("get-paused-agents", async () => workspace.getPausedAgents());
+
+ipcMain.handle("list-mcp-integrations", async (_event, taskId) => [
+  ...workspace.listMcpIntegrations({ kind: "global" }),
+  ...(taskId
+    ? workspace.listMcpIntegrations({ kind: "task", taskId })
+    : []),
+]);
+
 ipcMain.handle("read-task-orchestrator", async (_event, taskId) =>
   workspace.readOrchestrator(taskId),
 );
 
 ipcMain.handle("read-artifact", async (_event, { taskId, artifactPath }) =>
   workspace.readArtifact(taskId, artifactPath),
+);
+
+ipcMain.handle("read-artifact-binary", async (_event, { taskId, artifactPath }) =>
+  workspace.readArtifactBinary(taskId, artifactPath),
+);
+
+ipcMain.handle(
+  "save-artifact-annotations",
+  async (_event, { taskId, artifactPath, annotations }) =>
+    workspace.saveArtifactAnnotations(taskId, artifactPath, annotations ?? []),
 );
 
 ipcMain.handle("get-yaaa-dir", async () => workspace.getYaaaDir());

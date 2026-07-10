@@ -4,6 +4,8 @@ import path from "node:path";
 import crypto from "node:crypto";
 import Database from "better-sqlite3";
 import { SqliteStore, MeshGateway } from "@yaaa/providers";
+import { pauseController } from "@yaaa/platform";
+import { IntentRouter } from "@yaaa/orchestrator";
 import {
   ORCHESTRATOR_MD_HEADERS,
   type AgentMessage,
@@ -24,6 +26,12 @@ import {
   type RegisteredMcpIntegration,
   validateMcpIntegrationDefinition,
 } from "./mcp-integrations.js";
+import {
+  McpProvisioner,
+  type CommandRunner,
+  type McpInstallSource,
+  type McpProvisionResult,
+} from "./mcp-provisioner.js";
 import { createRuntime } from "./runtime.js";
 import type { RuntimeEvent, TaskRunResult } from "./events.js";
 
@@ -554,11 +562,38 @@ export class Workspace {
     authorId: string;
     authorKind: ConversationAuthorKind;
     content: string;
-  }): Promise<{ message: ConversationMessage; routes: MentionRoute[] }> {
+  }): Promise<{
+    message: ConversationMessage;
+    routes: MentionRoute[];
+    pausedAgentIds: string[];
+  }> {
     this.requireTask(input.taskId);
-    return this.withConversationCoordinator((conversations) =>
+    const posted = await this.withConversationCoordinator((conversations) =>
       conversations.postMessage(input),
     );
+    // Blueprint: "@agent-name pauses that specific agent's execution loop and
+    // forces a sub-thread". Only user messages pause; agent/orchestrator
+    // chatter must never freeze a colleague.
+    const pausedAgentIds: string[] = [];
+    if (input.authorKind === "user") {
+      for (const route of posted.routes) {
+        if (route.recipientKind === "agent") {
+          pauseController.pause(route.recipientId);
+          pausedAgentIds.push(route.recipientId);
+        }
+      }
+    }
+    return { ...posted, pausedAgentIds };
+  }
+
+  /** Release a paused agent's execution loop (end of the sub-thread). */
+  resumeAgent(agentId: string): boolean {
+    return pauseController.resume(agentId);
+  }
+
+  /** Agent ids currently paused by @mentions. */
+  getPausedAgents(): string[] {
+    return pauseController.pausedAgents();
   }
 
   readOrchestrator(taskId: string): string | null {
@@ -595,6 +630,179 @@ export class Workspace {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Fetch and install a registered, trusted MCP server (git clone + npm
+   * install) into the global MCP directory, then enable it. This is the
+   * blueprint's "MCP Fetcher": registration records consent, provisioning
+   * performs the actual dynamic fetch. Untrusted integrations are refused.
+   */
+  async provisionMcpIntegration(
+    scope: McpIntegrationScope,
+    integrationId: string,
+    source: McpInstallSource,
+    runCommand?: CommandRunner,
+  ): Promise<McpProvisionResult> {
+    const integration = this.getMcpIntegration(scope, integrationId);
+    if (!integration) throw new Error("MCP integration not found.");
+    const provisioner = new McpProvisioner(
+      path.join(this.yaaaDir, "mcp-servers"),
+      runCommand,
+    );
+    const result = await provisioner.provision(integration, source);
+    this.updateMcpIntegrationState(scope, integrationId, { enabled: true });
+    return result;
+  }
+
+  // ------------------------------------------------------------ intent routing
+
+  /**
+   * Classify a user message BEFORE any task machinery runs. Conversational
+   * messages ("hi", "thanks", "what can you do?") get an orchestrator reply
+   * and never create a task folder, DB row, UUID channel, or plan. Only
+   * genuine work requests should proceed to {@link createTask}.
+   */
+  async routeUserMessage(
+    message: string,
+  ): Promise<{ kind: "conversation"; reply: string } | { kind: "task" }> {
+    const config = this.loadConfig();
+    const gateway = new MeshGateway({
+      apiKey: config.accessToken ?? process.env.MESH_API_KEY ?? undefined,
+      modelMapping: config.preferredModels as any,
+    });
+    const router = new IntentRouter(gateway);
+    const decision = await router.route(message, { userName: config.userName });
+    if (decision.intent === "conversation") {
+      return {
+        kind: "conversation",
+        reply:
+          decision.reply ??
+          "Hello! I'm the YAAA orchestrator. What are we building or working on today?",
+      };
+    }
+    return { kind: "task" };
+  }
+
+  /**
+   * Read a binary artifact (image) as a data-URL for in-app preview. Applies
+   * the same containment rules as {@link readArtifact}; refuses non-image
+   * extensions and files over 8 MB.
+   */
+  readArtifactBinary(
+    taskId: string,
+    artifactPath: string,
+  ): { dataUrl: string; mimeType: string } | null {
+    const IMAGE_MIME: Record<string, string> = {
+      ".png": "image/png",
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".gif": "image/gif",
+      ".webp": "image/webp",
+      ".svg": "image/svg+xml",
+    };
+    if (!this.getTask(taskId)) return null;
+    const mimeType = IMAGE_MIME[path.extname(artifactPath).toLowerCase()];
+    if (!mimeType) return null;
+    try {
+      const workingDir = fs.realpathSync(
+        path.join(this.tasksDir, taskId, "working"),
+      );
+      const filePath = fs.realpathSync(path.resolve(workingDir, artifactPath));
+      const relativePath = path.relative(workingDir, filePath);
+      if (
+        relativePath === "" ||
+        relativePath.startsWith(`..${path.sep}`) ||
+        path.isAbsolute(relativePath)
+      ) {
+        return null;
+      }
+      const stats = fs.statSync(filePath);
+      if (!stats.isFile() || stats.size > 8 * 1024 * 1024) return null;
+      const base64 = fs.readFileSync(filePath).toString("base64");
+      return { dataUrl: `data:${mimeType};base64,${base64}`, mimeType };
+    } catch {
+      return null;
+    }
+  }
+
+  // ------------------------------------------------------- visual annotations
+
+  /**
+   * Persist canvas-commenter bounding boxes for an artifact and route the
+   * JSON payload to @orchestrator through the mission's public conversation,
+   * so the orchestrator can forward the visual fix to the owning agent.
+   */
+  async saveArtifactAnnotations(
+    taskId: string,
+    artifactPath: string,
+    annotations: Array<{
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+      comment: string;
+    }>,
+  ): Promise<{ annotationPath: string; routes: MentionRoute[] }> {
+    const task = this.requireTask(taskId);
+    if (this.readArtifact(taskId, artifactPath) === null) {
+      // Binary artifacts (images/PDFs) can't be read as text but are still
+      // annotatable — verify containment + existence without reading.
+      const workingDir = fs.realpathSync(path.join(task.path, "working"));
+      let resolved: string;
+      try {
+        resolved = fs.realpathSync(path.resolve(workingDir, artifactPath));
+      } catch {
+        throw new Error("Annotated artifact was not found.");
+      }
+      const relative = path.relative(workingDir, resolved);
+      if (
+        relative === "" ||
+        relative.startsWith(`..${path.sep}`) ||
+        path.isAbsolute(relative) ||
+        !fs.statSync(resolved).isFile()
+      ) {
+        throw new Error("Annotated artifact was not found.");
+      }
+    }
+    for (const box of annotations) {
+      const dimensionsValid = [box.x, box.y, box.width, box.height].every(
+        (value) => Number.isFinite(value) && value >= 0,
+      );
+      if (!dimensionsValid || typeof box.comment !== "string" || !box.comment.trim()) {
+        throw new Error("Each annotation needs a bounding box and a comment.");
+      }
+    }
+
+    const payload = {
+      artifactPath,
+      createdAt: new Date().toISOString(),
+      annotations,
+    };
+    const annotationsDir = path.join(task.path, "annotations");
+    fs.mkdirSync(annotationsDir, { recursive: true });
+    const annotationPath = path.join(
+      annotationsDir,
+      `${artifactPath.replace(/[^a-zA-Z0-9._-]/g, "_")}.json`,
+    );
+    fs.writeFileSync(annotationPath, JSON.stringify(payload, null, 2), "utf-8");
+
+    const routed = await this.withConversationCoordinator(async (conversations) => {
+      const existing = (await conversations.listConversations(taskId)).find(
+        (conversation) => conversation.kind === "public" && !conversation.archivedAt,
+      );
+      const conversation =
+        existing ?? (await conversations.createPublicConversation({ taskId }));
+      return conversations.postMessage({
+        taskId,
+        conversationId: conversation.id,
+        authorId: "user",
+        authorKind: "user",
+        content: `@orchestrator Visual feedback on ${artifactPath}: ${JSON.stringify(annotations)}`,
+      });
+    });
+
+    return { annotationPath, routes: routed.routes };
   }
 
   // --------------------------------------------------------- task lifecycle

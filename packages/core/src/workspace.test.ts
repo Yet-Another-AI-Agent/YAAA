@@ -217,6 +217,184 @@ describe("Workspace", () => {
     expect(fs.existsSync(task.taskDir)).toBe(false);
   });
 
+  it("answers a greeting conversationally without creating any task state", async () => {
+    const workspace = createWorkspace();
+
+    const routed = await workspace.routeUserMessage("hi");
+
+    expect(routed.kind).toBe("conversation");
+    if (routed.kind === "conversation") {
+      expect(routed.reply.length).toBeGreaterThan(0);
+    }
+    // The "Hi" bug: no task row, folder, or plan may exist after small talk.
+    expect(workspace.listTasks()).toHaveLength(0);
+    expect(fs.existsSync(path.join(workspace.getYaaaDir(), "tasks"))).toBe(
+      false,
+    );
+  });
+
+  it("routes an actionable request to the task pipeline", async () => {
+    const workspace = createWorkspace();
+
+    const routed = await workspace.routeUserMessage(
+      "Create a file named workspace.txt with a short note",
+    );
+
+    expect(routed).toEqual({ kind: "task" });
+  });
+
+  it("reads an image artifact as a data URL and refuses non-images and escapes", () => {
+    const workspace = createWorkspace();
+    const task = workspace.createTask("Design a logo");
+    // Minimal valid PNG header bytes are irrelevant — only containment and
+    // encoding are under test here.
+    fs.writeFileSync(path.join(task.workingDir, "logo.png"), Buffer.from([1, 2, 3]));
+
+    const image = workspace.readArtifactBinary(task.taskId, "logo.png");
+    expect(image?.mimeType).toBe("image/png");
+    expect(image?.dataUrl).toBe(
+      `data:image/png;base64,${Buffer.from([1, 2, 3]).toString("base64")}`,
+    );
+
+    expect(workspace.readArtifactBinary(task.taskId, "missing.png")).toBeNull();
+    expect(workspace.readArtifactBinary(task.taskId, "notes.txt")).toBeNull();
+    expect(
+      workspace.readArtifactBinary(task.taskId, "../orchestrator.md"),
+    ).toBeNull();
+  });
+
+  it("saves artifact annotations and routes the JSON payload to the orchestrator", async () => {
+    const workspace = createWorkspace();
+    const task = workspace.createTask("Design a pamphlet");
+    fs.writeFileSync(path.join(task.workingDir, "pamphlet.md"), "# Draft", "utf-8");
+
+    const result = await workspace.saveArtifactAnnotations(
+      task.taskId,
+      "pamphlet.md",
+      [{ x: 10, y: 20, width: 120, height: 40, comment: "Logo is misaligned" }],
+    );
+
+    const saved = JSON.parse(fs.readFileSync(result.annotationPath, "utf-8"));
+    expect(saved.artifactPath).toBe("pamphlet.md");
+    expect(saved.annotations[0].comment).toBe("Logo is misaligned");
+    expect(result.routes).toEqual([
+      expect.objectContaining({ recipientKind: "orchestrator" }),
+    ]);
+
+    // The payload landed in the mission's public conversation.
+    const conversations = await workspace.getTaskConversations(task.taskId);
+    const publicChannel = conversations.find((c) => c.kind === "public");
+    expect(publicChannel).toBeDefined();
+    const messages = await workspace.getConversationMessages(
+      task.taskId,
+      publicChannel!.id,
+    );
+    expect(messages[0].content).toContain("Visual feedback on pamphlet.md");
+    expect(messages[0].content).toContain("Logo is misaligned");
+  });
+
+  it("rejects annotations for missing artifacts or empty comments", async () => {
+    const workspace = createWorkspace();
+    const task = workspace.createTask("Design a pamphlet");
+    fs.writeFileSync(path.join(task.workingDir, "pamphlet.md"), "# Draft", "utf-8");
+
+    await expect(
+      workspace.saveArtifactAnnotations(task.taskId, "missing.png", [
+        { x: 0, y: 0, width: 10, height: 10, comment: "hello" },
+      ]),
+    ).rejects.toThrow("not found");
+    await expect(
+      workspace.saveArtifactAnnotations(task.taskId, "../orchestrator.md", [
+        { x: 0, y: 0, width: 10, height: 10, comment: "escape" },
+      ]),
+    ).rejects.toThrow("not found");
+    await expect(
+      workspace.saveArtifactAnnotations(task.taskId, "pamphlet.md", [
+        { x: 0, y: 0, width: 10, height: 10, comment: "   " },
+      ]),
+    ).rejects.toThrow("bounding box and a comment");
+    await expect(
+      workspace.saveArtifactAnnotations(task.taskId, "pamphlet.md", [
+        { x: Number.NaN, y: 0, width: 10, height: 10, comment: "bad box" },
+      ]),
+    ).rejects.toThrow("bounding box and a comment");
+  });
+
+  it("provisions a trusted MCP integration and enables it, refusing untrusted ones", async () => {
+    const workspace = createWorkspace();
+    const scope = { kind: "global" } as const;
+    workspace.registerMcpIntegration(scope, {
+      id: "code-review-graph",
+      displayName: "Code Review Graph",
+      transport: { kind: "stdio", command: "node" },
+    });
+    const runner = async (command: string, args: string[]) => {
+      if (command === "git") {
+        fs.mkdirSync(args[args.length - 1], { recursive: true });
+      }
+    };
+
+    // Consent has not been granted yet — the fetcher must refuse.
+    await expect(
+      workspace.provisionMcpIntegration(
+        scope,
+        "code-review-graph",
+        { repoUrl: "https://github.com/example/mcp.git" },
+        runner,
+      ),
+    ).rejects.toThrow("must be trusted");
+
+    workspace.updateMcpIntegrationState(scope, "code-review-graph", {
+      trust: "trusted",
+    });
+    const result = await workspace.provisionMcpIntegration(
+      scope,
+      "code-review-graph",
+      { repoUrl: "https://github.com/example/mcp.git" },
+      runner,
+    );
+
+    expect(result.installDir).toContain("mcp-servers");
+    expect(
+      workspace.getMcpIntegration(scope, "code-review-graph")?.state,
+    ).toEqual({ trust: "trusted", enabled: true });
+  });
+
+  it("pauses a mentioned agent's loop and resumes it explicitly", async () => {
+    const workspace = createWorkspace();
+    const task = workspace.createTask("Create a file named notes.txt");
+    await workspace.prepareTask("Create a file named notes.txt", task);
+    await workspace.confirmTask(task.taskId);
+
+    const agents = await workspace.getTaskAgents(task.taskId);
+    const worker = agents.find((agent) => agent.handle === "@sage-1");
+    expect(worker).toBeDefined();
+
+    const conversation = await workspace.createPublicConversation(task.taskId);
+    const posted = await workspace.postConversationMessage({
+      taskId: task.taskId,
+      conversationId: conversation.id,
+      authorId: "user-1",
+      authorKind: "user",
+      content: `${worker!.handle} please pause and explain your approach`,
+    });
+
+    expect(posted.pausedAgentIds).toEqual([worker!.id]);
+    expect(workspace.getPausedAgents()).toContain(worker!.id);
+    expect(workspace.resumeAgent(worker!.id)).toBe(true);
+    expect(workspace.getPausedAgents()).not.toContain(worker!.id);
+
+    // Agent-authored messages never pause colleagues.
+    const fromAgent = await workspace.postConversationMessage({
+      taskId: task.taskId,
+      conversationId: conversation.id,
+      authorId: worker!.id,
+      authorKind: "agent",
+      content: `@orchestrator and ${worker!.handle} are discussing`,
+    });
+    expect(fromAgent.pausedAgentIds).toEqual([]);
+  });
+
   it("persists a mission chat and exposes its routed orchestrator mention", async () => {
     const workspace = createWorkspace();
     const task = workspace.createTask("Coordinate a release");

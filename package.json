@@ -12,10 +12,12 @@
     "format": "biome format . --write",
     "test": "vitest run --coverage",
     "dev:ui": "npm run dev:electron --workspace=apps/ui",
-    "rebuild:electron": "electron-rebuild -f -w better-sqlite3 --module-dir apps/ui"
+    "rebuild:electron": "electron-rebuild -f -w better-sqlite3 --module-dir apps/ui",
+    "e2e": "playwright test"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.8.3",
+    "@playwright/test": "^1.61.1",
     "@vitest/coverage-v8": "^1.6.0",
     "jsdom": "^26.1.0",
     "typescript": "^5.5.4",

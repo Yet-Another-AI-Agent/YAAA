@@ -64,6 +64,18 @@ const workspaceInstance = {
   parseResume: vi
     .fn()
     .mockResolvedValue({ name: "N", profession: "P", description: "D" }),
+  routeUserMessage: vi
+    .fn()
+    .mockResolvedValue({ kind: "conversation", reply: "Hello!" }),
+  saveArtifactAnnotations: vi
+    .fn()
+    .mockResolvedValue({ annotationPath: "/tmp/a.json", routes: [] }),
+  readArtifactBinary: vi
+    .fn()
+    .mockReturnValue({ dataUrl: "data:image/png;base64,AQID", mimeType: "image/png" }),
+  resumeAgent: vi.fn().mockReturnValue(true),
+  getPausedAgents: vi.fn().mockReturnValue([]),
+  listMcpIntegrations: vi.fn().mockReturnValue([]),
 };
 
 vi.mock("@yaaa/core", () => ({
@@ -83,6 +95,12 @@ describe("Electron main (in-process, no CLI subprocess)", () => {
 
     expect(app.whenReady).toHaveBeenCalled();
     for (const channel of [
+      "route-user-message",
+      "read-artifact-binary",
+      "resume-agent",
+      "get-paused-agents",
+      "list-mcp-integrations",
+      "save-artifact-annotations",
       "start-task",
       "confirm-task",
       "resolve-approval",
@@ -103,6 +121,42 @@ describe("Electron main (in-process, no CLI subprocess)", () => {
     ]) {
       expect(ipcHandlers.has(channel)).toBe(true);
     }
+  });
+
+  it("route-user-message returns the workspace's conversational verdict", async () => {
+    await import("./main.js");
+    const route = ipcHandlers.get("route-user-message");
+
+    const res = await route({}, "hi");
+
+    expect(res).toEqual({ kind: "conversation", reply: "Hello!" });
+    expect(workspaceInstance.routeUserMessage).toHaveBeenCalledWith("hi");
+    expect(workspaceInstance.createTask).not.toHaveBeenCalled();
+  });
+
+  it("route-user-message falls back to task intent when classification fails", async () => {
+    workspaceInstance.routeUserMessage.mockRejectedValueOnce(
+      new Error("classifier offline"),
+    );
+    await import("./main.js");
+    const route = ipcHandlers.get("route-user-message");
+
+    await expect(route({}, "build a thing")).resolves.toEqual({ kind: "task" });
+  });
+
+  it("save-artifact-annotations delegates the payload to the workspace", async () => {
+    await import("./main.js");
+    const save = ipcHandlers.get("save-artifact-annotations");
+    const annotations = [{ x: 1, y: 2, width: 3, height: 4, comment: "fix" }];
+
+    const res = await save({}, { taskId: "task-123", artifactPath: "a.png", annotations });
+
+    expect(res).toEqual({ annotationPath: "/tmp/a.json", routes: [] });
+    expect(workspaceInstance.saveArtifactAnnotations).toHaveBeenCalledWith(
+      "task-123",
+      "a.png",
+      annotations,
+    );
   });
 
   it("start-task scaffolds via the workspace and returns the real task id", async () => {
