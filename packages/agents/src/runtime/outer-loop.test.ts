@@ -178,4 +178,67 @@ describe("OuterLoop Manager", () => {
       "Task execution failed due to subtask failure."
     );
   });
+
+  const singleSubtaskPlan = (): TaskPlan => ({
+    goal: "Kill switch task",
+    subtasks: [
+      {
+        id: "task-1",
+        title: "Write the report file",
+        capability: "files",
+        dependsOn: [],
+        riskLevel: "low",
+        successCriteria: "report exists",
+        state: "pending",
+      },
+    ],
+  });
+
+  it("trips the kill switch after 3 identical errors and retries once with a different approach", async () => {
+    (mockGateway.chat as any).mockRejectedValue(new Error("segfault in strategy A"));
+
+    await expect(outerLoop.run("task-loop", singleSubtaskPlan())).rejects.toThrow(
+      "Task execution failed due to subtask failure."
+    );
+
+    // Hard interrupt was broadcast to the channel/Agent Space.
+    expect(mockBus.publish).toHaveBeenCalledWith(
+      "task.task-loop.started",
+      expect.objectContaining({
+        kind: "status",
+        note: expect.stringContaining("Kill switch"),
+      }),
+    );
+
+    // The replacement agent was explicitly ordered to change approach.
+    const instructions = (mockGateway.chat as any).mock.calls.map(
+      (call: any[]) => call[0].map((m: any) => m.content).join("\n"),
+    );
+    expect(
+      instructions.some((text: string) => text.includes("COMPLETELY DIFFERENT")),
+    ).toBe(true);
+
+    // 3 identical failures + 1 different-approach attempt = 4 agents, all failed.
+    const savedAgents = (mockStore.saveAgent as any).mock.calls.map((c: any[]) => c[1]);
+    const failedAgents = savedAgents.filter((agent: any) => agent.status === "failed");
+    expect(failedAgents).toHaveLength(4);
+  });
+
+  it("recovers when a retry succeeds before the kill switch trips", async () => {
+    (mockGateway.chat as any)
+      .mockRejectedValueOnce(new Error("transient timeout"))
+      .mockResolvedValue(`\`\`\`json
+{"result": {"artifacts": [], "summary": "Recovered on retry."}}
+\`\`\``);
+
+    await expect(outerLoop.run("task-retry", singleSubtaskPlan())).resolves.not.toThrow();
+
+    const savedAgents = (mockStore.saveAgent as any).mock.calls.map((c: any[]) => c[1]);
+    expect(savedAgents.some((agent: any) => agent.status === "completed")).toBe(true);
+    // No kill-switch broadcast for a one-off transient failure.
+    const killSwitchNotes = (mockBus.publish as any).mock.calls.filter(
+      (call: any[]) => typeof call[1]?.note === "string" && call[1].note.includes("Kill switch"),
+    );
+    expect(killSwitchNotes).toHaveLength(0);
+  });
 });

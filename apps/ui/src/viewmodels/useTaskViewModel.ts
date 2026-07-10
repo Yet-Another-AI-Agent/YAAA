@@ -16,6 +16,11 @@ export function useTaskViewModel() {
   const [success, setSuccess] = useState<boolean | null>(null);
   const [tasks, setTasks] = useState<UITask[]>([]);
   const [channelTopic, setChannelTopic] = useState<string | null>(null);
+  // Casual conversation with @orchestrator (the "#general" channel). These
+  // exchanges never create a task, a UUID channel, or a plan.
+  const [chatMessages, setChatMessages] = useState<
+    Array<{ id: string; sender: string; content: string; time: string }>
+  >([]);
 
   // Controls the shared API-key modal. "funds" is set automatically when a run
   // stops for lack of balance; "manual" is opened from the Settings button.
@@ -53,6 +58,25 @@ export function useTaskViewModel() {
   const startTask = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (!goal.trim() || running || awaitingConfirmation) return;
+
+    // Conversational NLP gate: greetings/small talk get an orchestrator chat
+    // reply and stop here — no task folder, no UUID channel, no plan.
+    const submitted = goal;
+    try {
+      const route = await TaskModel.routeUserMessage(submitted);
+      if (route.kind === "conversation") {
+        const now = new Date().toLocaleTimeString();
+        setChatMessages((prev) => [
+          ...prev,
+          { id: `chat-user-${prev.length}`, sender: "User", content: submitted, time: now },
+          { id: `chat-orch-${prev.length}`, sender: "@orchestrator", content: route.reply, time: now },
+        ]);
+        setGoal("");
+        return;
+      }
+    } catch {
+      // Classifier unavailable — fall through and treat the message as work.
+    }
 
     // Reset previous states
     setTaskId(null);
@@ -241,6 +265,7 @@ export function useTaskViewModel() {
     summary,
     success,
     channelTopic,
+    chatMessages,
     startTask,
     confirmPlan,
     resolveApproval,

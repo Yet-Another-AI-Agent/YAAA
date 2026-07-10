@@ -200,6 +200,14 @@ export class MeshGateway implements IMeshGateway {
 
     if (role === "utility") {
       const systemMsg = messages.find((m) => m.role === "system")?.content || "";
+      if (systemMsg.includes("intent classifier")) {
+        // Mock mode has no real NLP — report "task" and let the caller's
+        // deterministic heuristics own the conversational path.
+        return `{"intent": "task", "reply": ""}`;
+      }
+      if (systemMsg.includes("Team Lead")) {
+        return "Hello! I'm the YAAA orchestrator. What are we building or working on today?";
+      }
       if (systemMsg.includes("channel topic")) {
         const userMsg = messages.find((m) => m.role === "user")?.content || "mission";
         return userMsg

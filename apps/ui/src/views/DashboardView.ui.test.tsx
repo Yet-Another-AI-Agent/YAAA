@@ -20,6 +20,7 @@ const makeViewModel = (overrides = {}) => ({
   summary: null,
   success: null,
   channelTopic: null,
+  chatMessages: [],
   startTask: vi.fn(),
   confirmPlan: vi.fn(),
   resolveApproval: vi.fn(),
@@ -40,6 +41,7 @@ describe("DashboardView", () => {
       getOnboardingProfile: vi.fn().mockResolvedValue({ name: "", profession: "", description: "" }),
       readTaskOrchestrator: vi.fn().mockResolvedValue(null),
       readArtifact: vi.fn().mockResolvedValue("# Report\n\nAll done."),
+      listMcpIntegrations: vi.fn().mockResolvedValue([]),
     };
   });
 
@@ -255,6 +257,28 @@ describe("DashboardView", () => {
     expect(screen.getAllByText("agents / builder")).toHaveLength(2);
   });
 
+  it("lists registered MCP servers in Active Integrations with their consent state", async () => {
+    (window as any).electronAPI.listMcpIntegrations.mockResolvedValue([
+      {
+        definition: { id: "code-review-graph", displayName: "Code Review Graph" },
+        state: { trust: "trusted", enabled: true },
+      },
+      {
+        definition: { id: "sketchy", displayName: "Sketchy Server" },
+        state: { trust: "untrusted", enabled: false },
+      },
+    ]);
+
+    await act(async () => {
+      render(<DashboardView viewModel={makeViewModel({ taskId: "task-1" })} />);
+    });
+
+    expect(screen.getByText("Code Review Graph")).toBeTruthy();
+    expect(screen.getByText("MCP · connected")).toBeTruthy();
+    expect(screen.getByText("Sketchy Server")).toBeTruthy();
+    expect(screen.getByText("MCP · needs consent")).toBeTruthy();
+  });
+
   it("shows an honest empty state for Active Integrations when the plan has no subtasks yet", () => {
     render(<DashboardView viewModel={makeViewModel({ taskId: "task-1", subtasks: [] })} />);
     expect(screen.getByText("No capabilities assigned yet.")).toBeTruthy();
@@ -269,11 +293,13 @@ describe("DashboardView", () => {
       ],
     })} />);
 
-    expect(screen.getByText("System log (2)")).toBeTruthy();
+    expect(screen.getByText(/System Logs \(Click to expand\)/)).toBeTruthy();
     expect(screen.getByText(/Submitting task to supervisor/)).toBeTruthy();
     // Collapsed by default: no `open` attribute on the <details> block.
-    const block = screen.getByText("System log (2)").closest("details") as HTMLDetailsElement;
+    const block = screen.getByText(/System Logs \(Click to expand\)/).closest("details") as HTMLDetailsElement;
     expect(block.open).toBe(false);
+    // Raw logs live inside the blueprint's encapsulation wrapper.
+    expect(block.querySelector(".raw-logs")).toBeTruthy();
   });
 
   it("shows the LLM-generated channel topic instead of the raw task id once available", () => {
@@ -294,6 +320,65 @@ describe("DashboardView", () => {
     })} />);
 
     expect(screen.getByText("This plan has no subtasks to review.")).toBeTruthy();
+  });
+
+  it("renders a casual conversation as the #general channel with orchestrator bubbles", () => {
+    render(<DashboardView viewModel={makeViewModel({
+      chatMessages: [
+        { id: "c1", sender: "User", content: "hi", time: "10:00" },
+        { id: "c2", sender: "@orchestrator", content: "Hello! What are we building today?", time: "10:00" },
+      ],
+    })} />);
+
+    // Conversation renders in the chat view, not the home hero.
+    expect(screen.queryByText(/Yet Another AI Agent/)).toBeNull();
+    expect(screen.getByText("general")).toBeTruthy();
+    expect(screen.getByText("@orchestrator")).toBeTruthy();
+    expect(screen.getByText("Hello! What are we building today?")).toBeTruthy();
+    // No plan/confirmation machinery appears for small talk.
+    expect(screen.queryByText(/Plan ready/)).toBeNull();
+  });
+
+  it("never renders a raw UUID fragment in fallback channel names", () => {
+    const tasks = [
+      { id: "1b154a77-9f21-4a52-8a5e-0b2f3d4c5e6f", prompt: "hi", status: "success", created_at: "2026-07-10T01:00:00Z", topic: null },
+    ];
+    render(<DashboardView viewModel={makeViewModel({ tasks })} />);
+
+    expect(screen.getAllByText("hi").length).toBeGreaterThan(0);
+    expect(screen.queryByText(/1b154a/)).toBeNull();
+    expect(screen.queryByText("hi-1b154a")).toBeNull();
+  });
+
+  it("offers a permanently accessible Delete Workspace button that purges the active workspace after confirm", async () => {
+    const deleteTask = vi.fn().mockResolvedValue(undefined);
+    render(<DashboardView viewModel={makeViewModel({ taskId: "task-1", deleteTask })} />);
+
+    fireEvent.click(screen.getByTitle("Delete Workspace"));
+    expect(deleteTask).not.toHaveBeenCalled(); // first click only arms the confirm
+    expect(screen.getByText(/kill agents, and purge history/)).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(screen.getByTitle("Confirm delete workspace"));
+    });
+    expect(deleteTask).toHaveBeenCalledWith("task-1");
+  });
+
+  it("disables the Delete Workspace button when no workspace is active", () => {
+    render(<DashboardView viewModel={makeViewModel()} />);
+    const btn = screen.getByTitle("Delete Workspace") as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+  });
+
+  it("cancels a Delete Workspace confirm without purging", () => {
+    const deleteTask = vi.fn();
+    render(<DashboardView viewModel={makeViewModel({ taskId: "task-1", deleteTask })} />);
+
+    fireEvent.click(screen.getByTitle("Delete Workspace"));
+    fireEvent.click(screen.getByTitle("Cancel delete workspace"));
+
+    expect(deleteTask).not.toHaveBeenCalled();
+    expect(screen.getByTitle("Delete Workspace")).toBeTruthy();
   });
 
   it("shows public join and exit notices in the channel", () => {

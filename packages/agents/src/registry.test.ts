@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { AGENT_REGISTRY } from "./registry.js";
+import { AGENT_REGISTRY, selectAgentTemplate } from "./registry.js";
 
 describe("AGENT_REGISTRY", () => {
   const entries = Object.entries(AGENT_REGISTRY);
@@ -45,6 +45,76 @@ describe("AGENT_REGISTRY", () => {
 
     it("has a non-empty systemPrompt", () => {
       expect(agent.systemPrompt.trim().length).toBeGreaterThan(0);
+    });
+  });
+
+  describe("blueprint roster", () => {
+    const ROSTER_HANDLES = [
+      "@principal-swe",
+      "@ui-architect",
+      "@3d-graphics-engineer",
+      "@researcher",
+      "@ad-strategist",
+      "@designer",
+      "@devops",
+      "@qa-tester",
+      "@cv-tester",
+    ];
+
+    it("registers every blueprint specialist with a mention handle", () => {
+      const handles = entries
+        .map(([, template]) => template.handle)
+        .filter(Boolean);
+      for (const handle of ROSTER_HANDLES) {
+        expect(handles).toContain(handle);
+      }
+    });
+
+    it("gives QA and CV testers the independent verifier model role", () => {
+      expect(AGENT_REGISTRY.QaTesterAgent.modelRole).toBe("verifier");
+      expect(AGENT_REGISTRY.CvTesterAgent.modelRole).toBe("verifier");
+    });
+
+    it("enforces the 95% coverage mandate in the QA prompt", () => {
+      expect(AGENT_REGISTRY.QaTesterAgent.systemPrompt).toContain("95%");
+    });
+  });
+
+  describe("selectAgentTemplate", () => {
+    it("routes verification subtasks to the QA tester", () => {
+      expect(
+        selectAgentTemplate({
+          capability: "verify",
+          title: "Verify summary contents",
+        }),
+      ).toBe("QaTesterAgent");
+    });
+
+    it("routes visual verification to the CV tester", () => {
+      expect(
+        selectAgentTemplate({
+          capability: "verify",
+          title: "Verify the GUI screenshot alignment",
+        }),
+      ).toBe("CvTesterAgent");
+    });
+
+    it.each([
+      [
+        "Migrate the legacy database to Kafka microservices",
+        "PrincipalSweAgent",
+      ],
+      ["Build the React dashboard layout with CSS grid", "UiArchitectAgent"],
+      ["Implement the WebGL aligner mesh viewer", "GraphicsEngineerAgent"],
+      ["Research competitor pricing for clear aligners", "ResearcherAgent"],
+      ["Plan the Meta ad campaign for the dental clinic", "AdStrategistAgent"],
+      ["Design the promotional pamphlet layout", "DesignerAgent"],
+      ["Set up the Docker and CI/CD pipeline", "DevOpsAgent"],
+      ["Write a summary file of battery facts", "FilesAgent"],
+    ])("routes %j to %s", (title, expected) => {
+      expect(selectAgentTemplate({ capability: "files", title })).toBe(
+        expected,
+      );
     });
   });
 

@@ -2,6 +2,8 @@ import { useRef, useEffect, useState, useMemo } from "react";
 import logoImg from "../assets/logo.jpg";
 import type { TaskViewModel } from "../viewmodels/useTaskViewModel";
 import { TaskModel } from "../models/TaskModel";
+import { AnnotationOverlay } from "../components/AnnotationOverlay";
+import { ArchitectureViewer, getMediaKind } from "../components/ArchitectureViewer";
 import { ApiKeyModal } from "../components/ApiKeyModal";
 import { MissionInput } from "../components/MissionInput";
 import { ThinkingPanel } from "../components/ThinkingPanel";
@@ -203,22 +205,19 @@ function formatCapabilityLabel(capability: string): string {
   return CAPABILITY_LABELS[capability] || capability;
 }
 
-function formatChannelName(prompt: string, taskId?: string): string {
-  if (!prompt) return "channel";
-  let slug = prompt
+/**
+ * Fallback channel name while the LLM topic is still generating. Raw UUIDs
+ * (or fragments of them) are strictly forbidden from rendering, so this is a
+ * pure prompt slug — never suffixed with the task id.
+ */
+function formatChannelName(prompt: string): string {
+  const slug = prompt
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
     .trim()
     .replace(/\s+/g, "-")
     .substring(0, 30);
-  if (!slug) {
-    slug = "channel";
-  }
-  if (taskId) {
-    const suffix = taskId.substring(0, 6);
-    return `${slug}-${suffix}`;
-  }
-  return slug;
+  return slug || "new-mission";
 }
 
 function getArtifactHref(yaaaDir: string, activeTaskId: string | null, artPath: string): string {
@@ -227,9 +226,9 @@ function getArtifactHref(yaaaDir: string, activeTaskId: string | null, artPath: 
   return `file://${yaaaDir}/tasks/${activeTaskId}/working/${encodedPath}`;
 }
 
-/** Only Markdown/plaintext artifacts get an in-app preview for now — PPT/PDF/Excel rendering is a separate, larger feature. */
+/** Markdown/plaintext, images, and graphTD diagrams preview in-app — PPT/PDF/Excel rendering is a separate, larger feature. */
 function isPreviewableArtifact(artPath: string): boolean {
-  return /\.(md|markdown|txt)$/i.test(artPath);
+  return /\.(md|markdown|txt|mmd|mermaid|png|jpe?g|gif|webp|svg)$/i.test(artPath);
 }
 
 export function DashboardView({ viewModel }: DashboardViewProps) {
@@ -248,6 +247,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     summary,
     success,
     channelTopic,
+    chatMessages = [],
     startTask,
     confirmPlan,
     resolveApproval,
@@ -267,15 +267,23 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   // Channel id currently showing its inline "confirm delete?" affordance.
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  // Global Delete Workspace button showing its inline confirm affordance.
+  const [confirmWorkspaceDelete, setConfirmWorkspaceDelete] = useState(false);
   const [orchestratorMd, setOrchestratorMd] = useState<string | null>(null);
   const [historyMessages, setHistoryMessages] = useState<any[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const activeHistoryRequestRef = useRef<string | null>(null);
 
   // Split-screen artifact preview (Markdown/plaintext only for now).
-  const [artifactPreview, setArtifactPreview] = useState<{ path: string; content: string } | null>(null);
+  const [artifactPreview, setArtifactPreview] = useState<{
+    path: string;
+    content: string;
+    kind?: "text" | "image" | "diagram";
+    dataUrl?: string;
+  } | null>(null);
   const [artifactPreviewLoading, setArtifactPreviewLoading] = useState(false);
   const [artifactPreviewError, setArtifactPreviewError] = useState<string | null>(null);
+  const [annotating, setAnnotating] = useState(false);
   const activeArtifactRequestRef = useRef(0);
 
   // YAAA data directory state
@@ -283,6 +291,18 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
 
   // User's name from onboarding profile
   const [userName, setUserName] = useState("");
+
+  // Registered MCP servers for the Active Integrations panel.
+  const [mcpIntegrations, setMcpIntegrations] = useState<
+    Array<{ definition: { id: string; displayName: string }; state: { trust: string; enabled: boolean } }>
+  >([]);
+
+  useEffect(() => {
+    const activeId = selectedTaskId || taskId || undefined;
+    TaskModel.listMcpIntegrations(activeId)
+      .then((list) => setMcpIntegrations(list || []))
+      .catch(() => setMcpIntegrations([]));
+  }, [selectedTaskId, taskId]);
 
   // Fetch yaaaDir on mount
   useEffect(() => {
@@ -415,16 +435,27 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     if (!activeTaskId) return;
     const requestId = activeArtifactRequestRef.current + 1;
     activeArtifactRequestRef.current = requestId;
+    const kind = getMediaKind(artPath);
     setArtifactPreviewError(null);
     setArtifactPreviewLoading(true);
-    setArtifactPreview({ path: artPath, content: "" });
+    setArtifactPreview({ path: artPath, content: "", kind });
     try {
-      const content = await TaskModel.readArtifact(activeTaskId, artPath);
-      if (activeArtifactRequestRef.current !== requestId) return;
-      if (content === null) {
-        setArtifactPreviewError("Could not read this file.");
+      if (kind === "image") {
+        const binary = await TaskModel.readArtifactBinary(activeTaskId, artPath);
+        if (activeArtifactRequestRef.current !== requestId) return;
+        if (!binary) {
+          setArtifactPreviewError("Could not read this file.");
+        } else {
+          setArtifactPreview({ path: artPath, content: "", kind, dataUrl: binary.dataUrl });
+        }
       } else {
-        setArtifactPreview({ path: artPath, content });
+        const content = await TaskModel.readArtifact(activeTaskId, artPath);
+        if (activeArtifactRequestRef.current !== requestId) return;
+        if (content === null) {
+          setArtifactPreviewError("Could not read this file.");
+        } else {
+          setArtifactPreview({ path: artPath, content, kind });
+        }
       }
     } catch (err: any) {
       if (activeArtifactRequestRef.current !== requestId) return;
@@ -440,6 +471,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     activeArtifactRequestRef.current += 1;
     setArtifactPreview(null);
     setArtifactPreviewError(null);
+    setAnnotating(false);
   };
 
   const handleNewMission = () => {
@@ -466,20 +498,26 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
 
   // Pre-process display messages, subtasks, and artifacts
   const selectedTask = selectedTaskId ? tasks.find(t => t.id === selectedTaskId) : null;
+  // Casual conversation with @orchestrator renders as the #general channel —
+  // no task, no UUID, no plan machinery.
+  const inConversationView = !selectedTaskId && !showTaskView && chatMessages.length > 0;
   // channelTopic (live event) is the fastest path; the tasks list (refreshed
   // independently via loadTasks) is the fallback if that event arrives after
   // the mission's event subscription has already been torn down.
   const liveTask = taskId ? tasks.find(t => t.id === taskId) : null;
   const currentChannelName = selectedTask
-    ? (selectedTask.topic || formatChannelName(selectedTask.prompt, selectedTask.id))
-    : (taskId ? (channelTopic || liveTask?.topic || formatChannelName(goal, taskId)) : "general");
+    ? (selectedTask.topic || formatChannelName(selectedTask.prompt))
+    : (taskId ? (channelTopic || liveTask?.topic || formatChannelName(goal)) : "general");
 
   const memoizedData = useMemo(() => {
     let displayMessages: any[] = [];
     let systemLogEntries: any[] = [];
     const parsedOrchestrator = parseOrchestratorMd(orchestratorMd);
 
-    if (selectedTaskId) {
+    if (inConversationView) {
+      // #general — casual chat with @orchestrator; plain bubbles only.
+      displayMessages = chatMessages.map((m) => ({ ...m, kind: "message", artifacts: [] }));
+    } else if (selectedTaskId) {
       // Prepend user's prompt as the first message
       if (selectedTask) {
         displayMessages.push({
@@ -603,7 +641,9 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     artifacts,
     running,
     awaitingConfirmation,
-    success
+    success,
+    inConversationView,
+    chatMessages
   ]);
 
   const { displayMessages, systemLogEntries, displaySubtasks, displayArtifacts, currentStatus } = memoizedData;
@@ -663,7 +703,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                 const isActive = (showTaskView && t.id === taskId) || (selectedTaskId === t.id);
                 const isWaiting = t.id === taskId && running && pendingApproval;
                 const status = isWaiting ? "waiting" : (t.id === taskId && awaitingConfirmation ? "awaiting_confirmation" : (t.id === taskId && running ? "running" : t.status));
-                const channelName = t.topic || formatChannelName(t.prompt, t.id);
+                const channelName = t.topic || formatChannelName(t.prompt);
                 return (
                   <div key={t.id} className={`slack-channel-item-row ${isActive ? "active" : ""}`}>
                     <button
@@ -739,6 +779,51 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
           </div>
 
           <div className="dash-topbar-right">
+            {/* Session Management: permanently accessible Delete Workspace control.
+                Recursively deletes the active workspace directory, cancels its
+                agents, and purges chat/context state. */}
+            {confirmWorkspaceDelete ? (
+              <div className="workspace-delete-confirm" role="alertdialog" aria-label="Confirm workspace deletion">
+                <span className="workspace-delete-confirm-text">Delete workspace, kill agents, and purge history?</span>
+                <button
+                  className="slack-channel-delete-confirm-btn"
+                  title="Confirm delete workspace"
+                  onClick={async () => {
+                    const activeWorkspaceId = selectedTaskId || taskId;
+                    setConfirmWorkspaceDelete(false);
+                    if (!activeWorkspaceId) return;
+                    setSelectedTaskId(null);
+                    setShowTaskView(false);
+                    await deleteTask(activeWorkspaceId);
+                  }}
+                >
+                  Delete
+                </button>
+                <button
+                  className="slack-channel-delete-cancel-btn"
+                  title="Cancel delete workspace"
+                  onClick={() => setConfirmWorkspaceDelete(false)}
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <button
+                className="icon-btn workspace-delete-btn"
+                title="Delete Workspace"
+                aria-label="Delete Workspace"
+                disabled={!(selectedTaskId || taskId)}
+                onClick={() => setConfirmWorkspaceDelete(true)}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="3 6 5 6 21 6" />
+                  <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                  <path d="M10 11v6" />
+                  <path d="M14 11v6" />
+                  <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+                </svg>
+              </button>
+            )}
             <button
               className="icon-btn"
               title="API key settings"
@@ -756,7 +841,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
           </div>
         </div>
 
-        {(!selectedTaskId && !showTaskView) ? (
+        {(!selectedTaskId && !showTaskView && !inConversationView) ? (
           /* ─── HOME VIEW ─── */
           <div className="dash-home">
             <div className="dash-hero">
@@ -833,13 +918,15 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                 {/* System status noise, collapsed and minimized by default */}
                 {!loadingHistory && systemLogEntries.length > 0 && (
                   <details className="slack-system-log-block">
-                    <summary>System log ({systemLogEntries.length})</summary>
-                    {systemLogEntries.map((log) => (
-                      <div className="slack-system-log-row" key={log.id}>
-                        <span className="slack-system-log-time">{log.time}</span>
-                        <span className="slack-system-log-text">{log.content}</span>
-                      </div>
-                    ))}
+                    <summary>System Logs (Click to expand) · {systemLogEntries.length}</summary>
+                    <div className="raw-logs">
+                      {systemLogEntries.map((log) => (
+                        <div className="slack-system-log-row" key={log.id}>
+                          <span className="slack-system-log-time">{log.time}</span>
+                          <span className="slack-system-log-text">{log.content}</span>
+                        </div>
+                      ))}
+                    </div>
                   </details>
                 )}
 
@@ -989,11 +1076,12 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                 <div className="slack-chat-input-box">
                   <span>
                     {selectedTaskId && "🔒 Archived channel — send a message to start a new mission."}
-                    {!selectedTaskId && awaitingConfirmation && "🗺️ Plan ready. Review Todo and Progress, then confirm to start agents."}
-                    {!selectedTaskId && running && "⚡ Mission in progress... Agent is running and printing thoughts."}
-                    {!selectedTaskId && !running && success === true && "✅ Mission completed."}
-                    {!selectedTaskId && !running && success === false && "❌ Mission failed."}
-                    {!selectedTaskId && !running && success === null && "⚡ Channel initialized. Ready to execute."}
+                    {inConversationView && "💬 Chatting with @orchestrator — describe a mission to assemble the team."}
+                    {!selectedTaskId && !inConversationView && awaitingConfirmation && "🗺️ Plan ready. Review Todo and Progress, then confirm to start agents."}
+                    {!selectedTaskId && !inConversationView && running && "⚡ Mission in progress... Agent is running and printing thoughts."}
+                    {!selectedTaskId && !inConversationView && !running && success === true && "✅ Mission completed."}
+                    {!selectedTaskId && !inConversationView && !running && success === false && "❌ Mission failed."}
+                    {!selectedTaskId && !inConversationView && !running && success === null && "⚡ Channel initialized. Ready to execute."}
                   </span>
                 </div>
                 <MissionInput
@@ -1155,8 +1243,10 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                 {/* ── 2. Working folder (HARDCODED placeholder) ── */}
                 <div className="slack-details-section">
                   <div className="slack-section-title">Working folder</div>
+                  {/* Raw task UUIDs are forbidden on screen — identify the
+                      folder by its channel name instead of its id. */}
                   <div className="working-folder-path">
-                    ~/.yaaa/tasks/{(selectedTaskId || taskId || "current").toString().substring(0, 8)}
+                    ~/.yaaa/tasks/#{currentChannelName}
                   </div>
                   <div className="working-folder-list">
                     <div className="working-folder-row">
@@ -1186,7 +1276,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                         ? "No subtasks recorded."
                         : (running
                           ? "Generating plan..."
-                          : (awaitingConfirmation ? "This plan has no subtasks to review." : "Awaiting plan..."))}
+                          : (awaitingConfirmation ? "This plan has no subtasks to review." : "Send a mission to generate a plan."))}
                     </div>
                   ) : (
                     <div className="subtask-list">
@@ -1225,7 +1315,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                 {/* ── 5. Active Integrations: the plan's real capabilities, not a fake fixed list ── */}
                 <div className="slack-details-section">
                   <div className="slack-section-title">Active Integrations</div>
-                  {activeCapabilities.length === 0 ? (
+                  {activeCapabilities.length === 0 && mcpIntegrations.length === 0 ? (
                     <div className="slack-section-empty">No capabilities assigned yet.</div>
                   ) : (
                     <div className="integration-list">
@@ -1233,6 +1323,20 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                         <div className="integration-row" key={capability}>
                           <span className="integration-name">{formatCapabilityLabel(capability)}</span>
                           <span className="integration-status connected">in plan</span>
+                        </div>
+                      ))}
+                      {mcpIntegrations.map((integration) => (
+                        <div className="integration-row" key={`mcp-${integration.definition.id}`}>
+                          <span className="integration-name">{integration.definition.displayName}</span>
+                          <span
+                            className={`integration-status ${integration.state.enabled ? "connected" : ""}`}
+                          >
+                            {integration.state.enabled
+                              ? "MCP · connected"
+                              : integration.state.trust === "trusted"
+                                ? "MCP · trusted"
+                                : "MCP · needs consent"}
+                          </span>
                         </div>
                       ))}
                     </div>
@@ -1280,6 +1384,15 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
           <div className="artifact-preview-panel" onClick={(e) => e.stopPropagation()}>
             <div className="artifact-preview-header">
               <span className="artifact-preview-title">{artifactPreview.path.split("/").pop()}</span>
+              {!artifactPreviewLoading && !artifactPreviewError && (
+                <button
+                  type="button"
+                  className="artifact-preview-annotate"
+                  onClick={() => setAnnotating((v) => !v)}
+                >
+                  {annotating ? "Stop annotating" : "Annotate"}
+                </button>
+              )}
               <button
                 type="button"
                 className="artifact-preview-close"
@@ -1299,7 +1412,26 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
               ) : artifactPreviewError ? (
                 <div className="panel-empty">{artifactPreviewError}</div>
               ) : (
-                <div className="markdown-preview">{renderMarkdown(artifactPreview.content)}</div>
+                <div className="annotation-preview-wrap">
+                  {artifactPreview.kind === "image" && artifactPreview.dataUrl ? (
+                    <img
+                      className="artifact-image-preview"
+                      src={artifactPreview.dataUrl}
+                      alt={artifactPreview.path.split("/").pop()}
+                    />
+                  ) : artifactPreview.kind === "diagram" ? (
+                    <ArchitectureViewer source={artifactPreview.content} />
+                  ) : (
+                    <div className="markdown-preview">{renderMarkdown(artifactPreview.content)}</div>
+                  )}
+                  {annotating && (selectedTaskId || taskId) && (
+                    <AnnotationOverlay
+                      taskId={(selectedTaskId || taskId) as string}
+                      artifactPath={artifactPreview.path}
+                      onClose={() => setAnnotating(false)}
+                    />
+                  )}
+                </div>
               )}
             </div>
           </div>

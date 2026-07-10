@@ -1972,6 +1972,159 @@ body {
   font-size: 1.1rem;
 }
 
+/* Global Delete Workspace control (topbar, permanently accessible) */
+.workspace-delete-btn:hover:not(:disabled) {
+  background: rgba(255, 80, 80, 0.15);
+  color: #ff6b6b;
+}
+
+.workspace-delete-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.workspace-delete-confirm {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  background: rgba(255, 80, 80, 0.08);
+  border: 1px solid rgba(255, 107, 107, 0.35);
+}
+
+.workspace-delete-confirm-text {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* Canvas commenter: annotation overlay on the artifact preview */
+.annotation-preview-wrap {
+  position: relative;
+}
+
+.annotation-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  z-index: 5;
+}
+
+.annotation-surface {
+  position: relative;
+  flex: 1;
+  cursor: crosshair;
+  background: rgba(20, 24, 34, 0.25);
+}
+
+.annotation-box {
+  position: absolute;
+  border: 2px solid #ecb22e;
+  background: rgba(236, 178, 46, 0.12);
+  border-radius: 3px;
+  pointer-events: none;
+}
+
+.annotation-box.draft {
+  border-style: dashed;
+}
+
+.annotation-box-index {
+  position: absolute;
+  top: -10px;
+  left: -10px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #ecb22e;
+  color: #1a1405;
+  font-size: 0.7rem;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.annotation-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--bg-secondary, #12151d);
+  border-top: 1px solid var(--border-color);
+}
+
+.annotation-comment-input {
+  flex: 1;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 0.8rem;
+}
+
+.annotation-hint {
+  flex: 1;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.annotation-error {
+  font-size: 0.75rem;
+  color: #ff6b6b;
+}
+
+.artifact-preview-annotate {
+  margin-left: auto;
+  margin-right: 8px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+.artifact-preview-annotate:hover {
+  border-color: #ecb22e;
+  color: #ecb22e;
+}
+
+.artifact-image-preview {
+  max-width: 100%;
+  display: block;
+  border-radius: 6px;
+}
+
+.architecture-viewer {
+  overflow: auto;
+  padding: 8px;
+}
+
+.architecture-viewer svg {
+  max-width: 100%;
+}
+
+.architecture-viewer-error {
+  padding: 12px;
+  color: #ff6b6b;
+  font-size: 0.85rem;
+}
+
+.architecture-viewer-source {
+  margin-top: 8px;
+  padding: 8px;
+  border-radius: 6px;
+  background: rgba(20, 24, 34, 0.6);
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  overflow: auto;
+}
+
 .slack-channel-name {
   flex: 1;
   overflow: hidden;

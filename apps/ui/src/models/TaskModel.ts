@@ -67,6 +67,17 @@ export class TaskModel {
     return api;
   }
 
+  /**
+   * Ask the orchestrator's NLP layer whether a message is casual conversation
+   * or an actionable mission. Conversational messages come back with a reply
+   * and must not start a task.
+   */
+  static async routeUserMessage(
+    message: string,
+  ): Promise<{ kind: "conversation"; reply: string } | { kind: "task" }> {
+    return this.getElectronAPI().routeUserMessage(message);
+  }
+
   static async startTask(goal: string): Promise<string> {
     return this.getElectronAPI().startTask(goal);
   }
@@ -96,6 +107,36 @@ export class TaskModel {
 
   static async readArtifact(taskId: string, artifactPath: string): Promise<string | null> {
     return this.getElectronAPI().readArtifact(taskId, artifactPath);
+  }
+
+  /** Registered MCP servers (global + task scope) for the Active Integrations panel. */
+  static async listMcpIntegrations(taskId?: string): Promise<
+    Array<{
+      definition: { id: string; displayName: string };
+      state: { trust: "trusted" | "untrusted"; enabled: boolean };
+    }>
+  > {
+    return this.getElectronAPI().listMcpIntegrations(taskId);
+  }
+
+  /** Read a binary artifact (image) as a data URL for in-app preview. */
+  static async readArtifactBinary(
+    taskId: string,
+    artifactPath: string,
+  ): Promise<{ dataUrl: string; mimeType: string } | null> {
+    return this.getElectronAPI().readArtifactBinary(taskId, artifactPath);
+  }
+
+  /**
+   * Persist canvas-commenter bounding boxes for an artifact; the backend
+   * routes the JSON payload to @orchestrator for the owning agent to fix.
+   */
+  static async saveArtifactAnnotations(
+    taskId: string,
+    artifactPath: string,
+    annotations: Array<{ x: number; y: number; width: number; height: number; comment: string }>,
+  ): Promise<{ annotationPath: string; routes: unknown[] }> {
+    return this.getElectronAPI().saveArtifactAnnotations(taskId, artifactPath, annotations);
   }
   /**
    * Retrieves the complete execution log and chat history messages for a specific task.

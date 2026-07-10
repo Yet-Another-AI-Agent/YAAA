@@ -1,5 +1,5 @@
 import type { IMeshGateway, IBus, ChatMessage } from "@yaaa/interfaces";
-import { container, PermissionEngine } from "@yaaa/platform";
+import { container, PermissionEngine, pauseController } from "@yaaa/platform";
 import type { AgentMessage, ToolCall } from "@yaaa/shared";
 import { AGENT_REGISTRY, type AgentTemplate } from "../registry.js";
 
@@ -55,6 +55,9 @@ export class InnerLoop {
     });
 
     for (let turn = 1; turn <= turns; turn++) {
+      // An @mention in chat pauses this specific agent; block here (before
+      // the next model turn) until the sub-thread conversation resumes it.
+      await pauseController.waitIfPaused(agentId);
       // Get next action from model. Reasoning tokens (when the model exposes
       // them) are streamed to the UI as "thinking"; the raw JSON answer is kept
       // out of the thinking stream and parsed for the actual tool call/result.
