@@ -41,6 +41,8 @@ describe("OuterLoop Manager", () => {
       getLedgerEntries: vi.fn(),
       saveAuditLog: vi.fn(),
       getAuditLogs: vi.fn(),
+      saveAgent: vi.fn(),
+      getAgents: vi.fn(),
     };
 
     permissions = new PermissionEngine();
@@ -107,6 +109,10 @@ describe("OuterLoop Manager", () => {
     expect(mockBus.publish).toHaveBeenCalledWith("task.task-123.started", expect.objectContaining({
       kind: "status",
       state: "working",
+    }));
+    expect(mockStore.saveAgent).toHaveBeenCalledWith("task-123", expect.objectContaining({
+      handle: "@sage-1",
+      status: "working",
     }));
   });
 

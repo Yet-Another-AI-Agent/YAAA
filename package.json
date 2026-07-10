@@ -6,16 +6,18 @@
     "apps/*"
   ],
   "scripts": {
-    "start": "npm run dev:ui",
+    "start": "bash scripts/start-ui.sh",
     "build": "tsc -b",
     "lint": "biome lint .",
     "format": "biome format . --write",
     "test": "vitest run --coverage",
-    "dev:ui": "npm run dev:electron --workspace=apps/ui"
+    "dev:ui": "npm run dev:electron --workspace=apps/ui",
+    "rebuild:electron": "electron-rebuild -f -w better-sqlite3 --module-dir apps/ui"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.8.3",
     "@vitest/coverage-v8": "^1.6.0",
+    "jsdom": "^26.1.0",
     "typescript": "^5.5.4",
     "vitest": "^1.6.0"
   }

@@ -1,7 +1,9 @@
 import type { IBus, IStore } from "@yaaa/interfaces";
 import { container } from "@yaaa/platform";
-import { type TaskPlan, type LedgerEntry, type Subtask, isInsufficientFundsError } from "@yaaa/shared";
+import { type AgentRun, type Subtask, type TaskPlan, type LedgerEntry, isInsufficientFundsError } from "@yaaa/shared";
 import { InnerLoop } from "./inner-loop.js";
+
+const AGENT_DISPLAY_NAMES = ["Sage", "Quill", "Harbor", "Nova", "Rowan", "Cedar"];
 
 export class OuterLoop {
   private bus: IBus;
@@ -12,6 +14,35 @@ export class OuterLoop {
     this.bus = container.resolve<IBus>("IBus");
     this.store = container.resolve<IStore>("IStore");
     this.innerLoop = new InnerLoop();
+  }
+
+  private selectTemplate(subtask: Subtask): "FilesAgent" | "VerifierAgent" {
+    return subtask.capability === "verify" ? "VerifierAgent" : "FilesAgent";
+  }
+
+  private createAgentRun(taskId: string, subtask: Subtask, step: number): AgentRun {
+    const displayName = AGENT_DISPLAY_NAMES[(step - 1) % AGENT_DISPLAY_NAMES.length];
+    const templateName = this.selectTemplate(subtask);
+    return {
+      id: `${subtask.capability}-agent-${Math.random().toString(36).slice(2, 6)}`,
+      handle: `@${displayName.toLowerCase()}-${step}`,
+      displayName,
+      taskId,
+      subtaskId: subtask.id,
+      role: templateName,
+      modelRole: templateName === "VerifierAgent" ? "verifier" : "worker",
+      status: "working",
+      startedAt: new Date().toISOString(),
+    };
+  }
+
+  private async recordAgentLifecycle(agent: AgentRun): Promise<void> {
+    // A lifecycle event is an immutable observation.  Copy before handing it
+    // to persistence/subscribers because the live assignment is updated as
+    // the inner loop progresses.
+    const snapshot = { ...agent };
+    await this.store.saveAgent(snapshot.taskId, snapshot);
+    await this.bus.publish(`task.${snapshot.taskId}.agent.${snapshot.id}.lifecycle`, snapshot);
   }
 
   async run(taskId: string, plan: TaskPlan): Promise<void> {
@@ -66,15 +97,13 @@ export class OuterLoop {
           note: `Starting subtask: ${subtask.title}`
         });
 
-        // Spawn Worker
-        const agentId = `${subtask.capability}-agent-${Math.random().toString(36).substr(2, 4)}`;
-        
+        const agent = this.createAgentRun(taskId, subtask, step);
+        const templateName = this.selectTemplate(subtask);
+        await this.recordAgentLifecycle(agent);
+
         try {
-          // Choose appropriate template
-          const templateName = subtask.capability === "verify" ? "VerifierAgent" : "FilesAgent";
-          
           const result = await this.innerLoop.run({
-            agentId,
+            agentId: agent.id,
             taskId,
             templateName,
             instruction: `${subtask.title}. Goal: ${subtask.successCriteria}`,
@@ -84,6 +113,10 @@ export class OuterLoop {
           // Mark subtask as complete
           subtaskStates[subtask.id] = "completed";
           facts.push(`Subtask ${subtask.id} finished. Summary: ${result.summary || JSON.stringify(result)}`);
+          agent.status = "completed";
+          agent.finishedAt = new Date().toISOString();
+          agent.summary = result.summary || JSON.stringify(result);
+          await this.recordAgentLifecycle(agent);
           
         } catch (err: any) {
           // Out-of-funds is non-recoverable: abort the whole run immediately so
@@ -94,6 +127,11 @@ export class OuterLoop {
           }
           subtaskStates[subtask.id] = "failed";
           facts.push(`Subtask ${subtask.id} failed. Error: ${err.message}`);
+
+          agent.status = "failed";
+          agent.finishedAt = new Date().toISOString();
+          agent.summary = err.message;
+          await this.recordAgentLifecycle(agent);
 
           // Re-evaluate strategy or retry
           console.error(`Subtask ${subtask.id} failed:`, err);

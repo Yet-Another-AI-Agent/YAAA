@@ -1,8 +1,21 @@
-import type { IBus, IStore, ModelRole } from "@yaaa/interfaces";
+import type {
+  ChatMessage,
+  ChatOptions,
+  IBus,
+  IFiles,
+  IMeshGateway,
+  IStore,
+  ModelRole,
+} from "@yaaa/interfaces";
 import { container, MessageBus, PermissionEngine } from "@yaaa/platform";
 import { SqliteStore, FilesFs, MeshGateway } from "@yaaa/providers";
 import { Supervisor } from "@yaaa/orchestrator";
-import { type RuntimeEvent, type TaskRunResult, mapBusEvent } from "./events.js";
+import type { AgentRun, Subtask, TaskPlan } from "@yaaa/shared";
+import {
+  type RuntimeEvent,
+  type TaskRunResult,
+  mapBusEvent,
+} from "./events.js";
 
 export interface RuntimeConfig {
   /** Stable id for this task; also the scope key for the task store. */
@@ -19,6 +32,8 @@ export interface RuntimeConfig {
   onEvent?: (event: RuntimeEvent) => void;
   /** Human-in-the-loop approval hook for gated tool calls. */
   onApproval?: (agentId: string, call: any) => Promise<boolean>;
+  /** Cooperative cancellation checked between model and file operations. */
+  isCancelled?: () => boolean;
 }
 
 /**
@@ -30,8 +45,84 @@ export interface RuntimeConfig {
 export interface Runtime {
   readonly store: IStore;
   readonly bus: IBus;
+  /** Create a durable draft plan; it does not start any agent work. */
+  plan(goal: string): Promise<TaskPlan>;
+  /** Execute a plan that was already reviewed by the user. */
+  runPlan(plan: TaskPlan): Promise<TaskRunResult>;
   run(goal: string): Promise<TaskRunResult>;
   dispose(): void;
+}
+
+function safePathSegment(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120) || "agent";
+}
+
+function writeAgentLifecycleDocument(
+  config: RuntimeConfig,
+  agent: AgentRun,
+  subtask?: Subtask,
+): void {
+  const agentDir = path.join(
+    config.tasksBaseDir,
+    safePathSegment(agent.taskId),
+    "agent-workspaces",
+    safePathSegment(agent.id),
+  );
+  fs.mkdirSync(agentDir, { recursive: true });
+
+  if (agent.status === "working") {
+    const handsOn = `# HANDS_ON
+
+- Task: ${agent.taskId}
+- Agent: ${agent.handle} (${agent.displayName})
+- Role: ${agent.role}
+- Subtask: ${agent.subtaskId}
+- Started: ${agent.startedAt ?? "Not recorded"}
+
+## Boundaries
+
+- Assigned objective: ${subtask?.title ?? "Complete the assigned subtask."}
+- Success criteria: ${subtask?.successCriteria ?? "Meet the reviewed plan's success criteria."}
+- Capability: ${subtask?.capability ?? agent.role}
+- Work only inside the task workspace and request approval for gated actions.
+- Report changed files, tests, residual risks, and follow-up work in HANDS_OFF.md.
+`;
+    fs.writeFileSync(path.join(agentDir, "HANDS_ON.md"), handsOn, "utf-8");
+    return;
+  }
+
+  if (["completed", "failed", "exited"].includes(agent.status)) {
+    const handsOff = `# HANDS_OFF
+
+- Task: ${agent.taskId}
+- Agent: ${agent.handle} (${agent.displayName})
+- Role: ${agent.role}
+- Subtask: ${agent.subtaskId}
+- Status: ${agent.status}
+- Finished: ${agent.finishedAt ?? "Not recorded"}
+
+## Summary
+
+${agent.summary?.trim() || "No summary was provided."}
+
+## Changed Files
+
+- _Record changed files here._
+
+## Tests
+
+- _Record tests run and their outcomes here._
+
+## Risks
+
+- _Record residual risks or write None identified._
+
+## Follow-up Work
+
+- _Record follow-up work or write None._
+`;
+    fs.writeFileSync(path.join(agentDir, "HANDS_OFF.md"), handsOff, "utf-8");
+  }
 }
 
 /**
@@ -45,14 +136,54 @@ export interface Runtime {
  * implementations are bound to interfaces.
  */
 export function createRuntime(config: RuntimeConfig): Runtime {
+  const assertActive = () => {
+    if (config.isCancelled?.()) throw new Error("Task was cancelled.");
+  };
+  assertActive();
   const store = new SqliteStore(config.tasksBaseDir);
   const bus = new MessageBus();
   const permissions = new PermissionEngine();
-  const gateway = new MeshGateway({
+  const meshGateway = new MeshGateway({
     apiKey: config.apiKey,
     modelMapping: config.modelMapping as Record<ModelRole, string> | undefined,
   });
-  const files = new FilesFs(config.workingDir);
+  const filesProvider = new FilesFs(config.workingDir);
+  const gateway: IMeshGateway = {
+    async chat(messages: ChatMessage[], options: ChatOptions): Promise<string> {
+      assertActive();
+      const response = await meshGateway.chat(messages, options);
+      assertActive();
+      return response;
+    },
+    async *chatStream(
+      messages: ChatMessage[],
+      options: ChatOptions,
+    ): AsyncIterable<string> {
+      assertActive();
+      for await (const chunk of meshGateway.chatStream(messages, options)) {
+        assertActive();
+        yield chunk;
+      }
+    },
+  };
+  const files: IFiles = {
+    async readFile(targetPath: string): Promise<string> {
+      assertActive();
+      return filesProvider.readFile(targetPath);
+    },
+    async writeFile(targetPath: string, content: string): Promise<void> {
+      assertActive();
+      return filesProvider.writeFile(targetPath, content);
+    },
+    async listFiles(dirPath: string): Promise<string[]> {
+      assertActive();
+      return filesProvider.listFiles(dirPath);
+    },
+    async searchFiles(pattern: string, dirPath: string): Promise<string[]> {
+      assertActive();
+      return filesProvider.searchFiles(pattern, dirPath);
+    },
+  };
 
   container.register("IStore", store);
   container.register("IBus", bus);
@@ -66,18 +197,26 @@ export function createRuntime(config: RuntimeConfig): Runtime {
 
   const emit = config.onEvent ?? (() => {});
   const { taskId } = config;
+  let activePlan: TaskPlan | null = null;
 
   // Bridge internal bus topics to the typed, frontend-facing event stream.
   const patterns = [
     `task.${taskId}.plan_updated`,
     `task.${taskId}.agent_message`,
     `task.${taskId}.started`,
+    `task.${taskId}.agent.*.lifecycle`,
     `task.${taskId}.agent.*.thought`,
     `task.${taskId}.agent.*.tool_requested`,
   ];
   for (const pattern of patterns) {
     bus.subscribe(pattern, (topic, msg) => {
       const event = mapBusEvent(taskId, topic, msg);
+      if (event?.type === "agent-status") {
+        const subtask = activePlan?.subtasks.find(
+          (candidate) => candidate.id === event.agent.subtaskId,
+        );
+        writeAgentLifecycleDocument(config, event.agent, subtask);
+      }
       if (event) emit(event);
     });
   }
@@ -85,15 +224,31 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   return {
     store,
     bus,
-    async run(goal: string): Promise<TaskRunResult> {
+    async plan(goal: string): Promise<TaskPlan> {
+      assertActive();
       emit({ type: "task-started", taskId });
       const supervisor = new Supervisor();
-      const result = await supervisor.runTask(goal, taskId);
+      const plan = await supervisor.createPlan(goal, taskId);
+      assertActive();
+      return plan;
+    },
+    async runPlan(plan: TaskPlan): Promise<TaskRunResult> {
+      assertActive();
+      activePlan = plan;
+      const supervisor = new Supervisor();
+      const result = await supervisor.runPlan(plan, taskId);
+      assertActive();
       emit({ type: "complete", result });
       return result;
+    },
+    async run(goal: string): Promise<TaskRunResult> {
+      const plan = await this.plan(goal);
+      return this.runPlan(plan);
     },
     dispose(): void {
       store.closeAll();
     },
   };
 }
+import fs from "node:fs";
+import path from "node:path";

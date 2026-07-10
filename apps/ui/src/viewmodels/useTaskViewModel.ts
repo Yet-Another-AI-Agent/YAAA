@@ -1,17 +1,21 @@
 import { useState, useEffect, useRef } from "react";
-import { TaskModel, type UISubtask, type UIArtifact, type UITask } from "../models/TaskModel";
+import { TaskModel, type UIAgent, type UISubtask, type UIArtifact, type UITask } from "../models/TaskModel";
 import { useLogState } from "./useLogState";
 import { useApprovalState } from "./useApprovalState";
+import { formatAgentLifecycleNotice } from "../utils/agentWorkspace";
 
 export function useTaskViewModel() {
   const [goal, setGoal] = useState("");
   const [taskId, setTaskId] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
+  const [awaitingConfirmation, setAwaitingConfirmation] = useState(false);
+  const [agents, setAgents] = useState<UIAgent[]>([]);
   const [subtasks, setSubtasks] = useState<UISubtask[]>([]);
   const [artifacts, setArtifacts] = useState<UIArtifact[]>([]);
   const [summary, setSummary] = useState<string | null>(null);
   const [success, setSuccess] = useState<boolean | null>(null);
   const [tasks, setTasks] = useState<UITask[]>([]);
+  const [channelTopic, setChannelTopic] = useState<string | null>(null);
 
   // Controls the shared API-key modal. "funds" is set automatically when a run
   // stops for lack of balance; "manual" is opened from the Settings button.
@@ -26,6 +30,7 @@ export function useTaskViewModel() {
   const { pendingApproval, setPendingApproval, resolveApproval } = useApprovalState(taskId, addLog);
 
   const unsubscribeRef = useRef<(() => void) | null>(null);
+  const agentsRef = useRef<UIAgent[]>([]);
 
   const loadTasks = async () => {
     try {
@@ -47,17 +52,21 @@ export function useTaskViewModel() {
 
   const startTask = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (!goal.trim() || running) return;
+    if (!goal.trim() || running || awaitingConfirmation) return;
 
     // Reset previous states
     setTaskId(null);
     setSubtasks([]);
+    setAgents([]);
+    agentsRef.current = [];
     clearLogs();
     setPendingApproval(null);
     setArtifacts([]);
     setSummary(null);
     setSuccess(null);
+    setChannelTopic(null);
     setRunning(true);
+    setAwaitingConfirmation(false);
 
     addLog("system", `Submitting task to supervisor: "${goal}"`);
 
@@ -77,7 +86,22 @@ export function useTaskViewModel() {
         (eventData) => {
           const { topic, data } = eventData;
           
-          if (topic.includes("plan_updated")) {
+          if (topic.endsWith("agent_status")) {
+            const index = agentsRef.current.findIndex((agent) => agent.id === data.id);
+            const previous = index < 0 ? undefined : agentsRef.current[index];
+            const nextAgents = index < 0
+              ? [...agentsRef.current, data]
+              : agentsRef.current.map((agent) => agent.id === data.id ? data : agent);
+            agentsRef.current = nextAgents;
+            setAgents(nextAgents);
+
+            const lifecycleNotice = formatAgentLifecycleNotice(previous, data);
+            if (lifecycleNotice) {
+              addLog("system", `[agent-lifecycle] ${lifecycleNotice}`);
+            }
+          }
+
+          else if (topic.includes("plan_updated")) {
             if (data && data.subtasks) {
               setSubtasks(data.subtasks);
               const producedArtifacts: UIArtifact[] = [];
@@ -88,6 +112,9 @@ export function useTaskViewModel() {
               });
               setArtifacts(producedArtifacts);
             }
+            setRunning(false);
+            setAwaitingConfirmation(true);
+            addLog("orchestrator", "Plan ready for your review. Confirm the mission to begin agent work.");
           }
 
           else if (topic.endsWith(".thought")) {
@@ -98,6 +125,13 @@ export function useTaskViewModel() {
           else if (topic.endsWith(".tool_requested")) {
             const agentName = topic.split(".").find((p) => p.includes("agent-")) || "agent";
             addLog("agent", `🛠️ ${agentName}: ${data.content}`, "activity");
+          }
+
+          else if (topic.includes("topic_updated")) {
+            if (data && data.topic) {
+              setChannelTopic(data.topic);
+              loadTasks(); // Reload so the sidebar channel list picks up the new name
+            }
           }
 
           else if (topic.includes("task-started")) {
@@ -122,6 +156,7 @@ export function useTaskViewModel() {
           setSuccess(resultData.success);
           setSummary(resultData.summary);
           setRunning(false);
+          setAwaitingConfirmation(false);
           // Surface the final answer as an assistant chat message. On failure
           // the recovery banner carries the error instead, so skip it here.
           if (resultData.success && resultData.summary) {
@@ -143,6 +178,51 @@ export function useTaskViewModel() {
     } catch (err: any) {
       addLog("system", `Error: ${err.message}`);
       setRunning(false);
+      setAwaitingConfirmation(false);
+    }
+  };
+
+  /**
+   * Permanently purge a mission channel. If it's the one currently open,
+   * detach from its event stream and reset local state — deleting it does
+   * not stop in-flight agent work (no abort primitive exists yet), it only
+   * stops the UI from listening to and persisting further updates from it.
+   */
+  const deleteTask = async (idToDelete: string) => {
+    await TaskModel.deleteTask(idToDelete);
+    if (idToDelete === taskId) {
+      if (unsubscribeRef.current) {
+        unsubscribeRef.current();
+        unsubscribeRef.current = null;
+      }
+      setTaskId(null);
+      setRunning(false);
+      setAwaitingConfirmation(false);
+      setAgents([]);
+      agentsRef.current = [];
+      setSubtasks([]);
+      setArtifacts([]);
+      setSummary(null);
+      setSuccess(null);
+      setChannelTopic(null);
+      setPendingApproval(null);
+      clearLogs();
+    }
+    await loadTasks();
+  };
+
+  const confirmPlan = async () => {
+    if (!taskId || running || !awaitingConfirmation) return;
+    setAwaitingConfirmation(false);
+    setRunning(true);
+    addLog("system", "Mission confirmed. Orchestrator is starting the approved plan.");
+    try {
+      await TaskModel.confirmTask(taskId);
+      loadTasks();
+    } catch (err: any) {
+      addLog("system", `Unable to start approved mission: ${err.message}`);
+      setRunning(false);
+      setAwaitingConfirmation(true);
     }
   };
 
@@ -152,14 +232,19 @@ export function useTaskViewModel() {
     taskId,
     setTaskId,
     running,
+    awaitingConfirmation,
+    agents,
     subtasks,
     logs,
     pendingApproval,
     artifacts,
     summary,
     success,
+    channelTopic,
     startTask,
+    confirmPlan,
     resolveApproval,
+    deleteTask,
     tasks,
     loadTasks,
     apiKeyPrompt,

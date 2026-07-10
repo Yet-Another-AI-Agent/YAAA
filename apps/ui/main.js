@@ -17,6 +17,14 @@ const workspace = new Workspace();
 // resolves it via the "resolve-approval" IPC channel.
 const pendingApprovals = new Map();
 
+// Task ids the user deleted while their run was still in flight. There is no
+// abort primitive threaded through the agent loop yet, so a delete cannot
+// stop in-flight model calls — it only detaches the UI: further events for
+// the task are dropped and any approval it's waiting on is auto-rejected so
+// the backend doesn't block forever on a renderer that gave up on it.
+const killedTasks = new Set();
+const confirmingTasks = new Set();
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1300,
@@ -52,6 +60,7 @@ function sendToRenderer(channel, payload) {
  * renderer already consumes (previously produced by parsing CLI stdout).
  */
 function forwardRuntimeEvent(taskId, event) {
+  if (killedTasks.has(taskId)) return;
   switch (event.type) {
     case "task-started":
       sendToRenderer("task-event", {
@@ -77,10 +86,22 @@ function forwardRuntimeEvent(taskId, event) {
         data: { content: event.content },
       });
       break;
+    case "agent-status":
+      sendToRenderer("task-event", {
+        topic: `task.${taskId}.agent_status`,
+        data: event.agent,
+      });
+      break;
     case "status":
       sendToRenderer("task-event", {
         topic: `task.${taskId}.started`,
         data: { note: event.note },
+      });
+      break;
+    case "topic-updated":
+      sendToRenderer("task-event", {
+        topic: `task.${taskId}.topic_updated`,
+        data: { topic: event.topic },
       });
       break;
     // "result" is surfaced through the final "complete" payload; "complete"
@@ -93,6 +114,10 @@ function forwardRuntimeEvent(taskId, event) {
 function makeApprovalHandler(taskId) {
   return (agentId, call) =>
     new Promise((resolve) => {
+      if (killedTasks.has(taskId)) {
+        resolve(false);
+        return;
+      }
       const approvalId = `${taskId}:${call.id ?? "call"}:${Date.now()}`;
       pendingApprovals.set(approvalId, resolve);
       sendToRenderer("approval-required", {
@@ -108,15 +133,44 @@ ipcMain.handle("start-task", async (_event, goal) => {
   // Scaffold synchronously so we can hand the id back before the run streams.
   const task = workspace.createTask(goal);
 
-  // Defer the run one tick so the renderer can attach its event listeners
-  // (which it does immediately after awaiting this handler) before events fly.
+  // Defer planning one tick so the renderer can attach its event listeners
+  // before the draft plan is streamed. Execution is started by confirm-task.
   setTimeout(() => {
     workspace
-      .runTask(goal, task, {
+      .prepareTask(goal, task, {
         onEvent: (event) => forwardRuntimeEvent(task.taskId, event),
         onApproval: makeApprovalHandler(task.taskId),
       })
+      .catch((err) => {
+        if (killedTasks.has(task.taskId)) return;
+        sendToRenderer("task-complete", {
+          success: false,
+          summary: err?.message ?? String(err),
+          reason: isInsufficientFundsError(err)
+            ? "insufficient_funds"
+            : undefined,
+        });
+      });
+  }, 0);
+
+  return task.taskId;
+});
+
+ipcMain.handle("confirm-task", async (_event, taskId) => {
+  if (killedTasks.has(taskId) || confirmingTasks.has(taskId)) {
+    return { status: "error", error: "Task is already running or was deleted" };
+  }
+  confirmingTasks.add(taskId);
+  // The immediate acknowledgement lets the renderer transition to running
+  // while the full result continues over the existing event channels.
+  setTimeout(() => {
+    workspace
+      .confirmTask(taskId, {
+        onEvent: (event) => forwardRuntimeEvent(taskId, event),
+        onApproval: makeApprovalHandler(taskId),
+      })
       .then((result) => {
+        if (killedTasks.has(taskId)) return;
         const reason =
           !result.success && isInsufficientFundsError(result.summary)
             ? "insufficient_funds"
@@ -124,15 +178,19 @@ ipcMain.handle("start-task", async (_event, goal) => {
         sendToRenderer("task-complete", { ...result, reason });
       })
       .catch((err) => {
+        if (killedTasks.has(taskId)) return;
         sendToRenderer("task-complete", {
           success: false,
           summary: err?.message ?? String(err),
-          reason: isInsufficientFundsError(err) ? "insufficient_funds" : undefined,
+          reason: isInsufficientFundsError(err)
+            ? "insufficient_funds"
+            : undefined,
         });
-      });
+      })
+      .finally(() => confirmingTasks.delete(taskId));
   }, 0);
 
-  return task.taskId;
+  return { status: "started" };
 });
 
 ipcMain.handle("resolve-approval", async (_event, { callId, approved }) => {
@@ -145,14 +203,55 @@ ipcMain.handle("resolve-approval", async (_event, { callId, approved }) => {
   return { status: "success" };
 });
 
+ipcMain.handle("delete-task", async (_event, taskId) => {
+  // Mark killed first so any in-flight run's late events/approvals no-op.
+  killedTasks.add(taskId);
+  for (const [approvalId, resolve] of pendingApprovals) {
+    if (approvalId.startsWith(`${taskId}:`)) {
+      resolve(false);
+      pendingApprovals.delete(approvalId);
+    }
+  }
+  workspace.deleteTask(taskId);
+  return { status: "deleted" };
+});
+
 ipcMain.handle("list-tasks", async () => workspace.listTasks());
 
 ipcMain.handle("get-task-history", async (_event, taskId) =>
   workspace.getTaskHistory(taskId),
 );
 
+ipcMain.handle("get-task-agents", async (_event, taskId) =>
+  workspace.getTaskAgents(taskId),
+);
+
+ipcMain.handle(
+  "create-public-conversation",
+  async (_event, { taskId, title }) =>
+    workspace.createPublicConversation(taskId, title),
+);
+
+ipcMain.handle("get-task-conversations", async (_event, taskId) =>
+  workspace.getTaskConversations(taskId),
+);
+
+ipcMain.handle(
+  "get-conversation-messages",
+  async (_event, { taskId, conversationId }) =>
+    workspace.getConversationMessages(taskId, conversationId),
+);
+
+ipcMain.handle("post-conversation-message", async (_event, message) =>
+  workspace.postConversationMessage(message),
+);
+
 ipcMain.handle("read-task-orchestrator", async (_event, taskId) =>
   workspace.readOrchestrator(taskId),
+);
+
+ipcMain.handle("read-artifact", async (_event, { taskId, artifactPath }) =>
+  workspace.readArtifact(taskId, artifactPath),
 );
 
 ipcMain.handle("get-yaaa-dir", async () => workspace.getYaaaDir());

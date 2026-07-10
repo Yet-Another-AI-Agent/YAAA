@@ -2,7 +2,7 @@ import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
-import type { AgentMessage, TaskPlan, LedgerEntry } from "@yaaa/shared";
+import type { AgentMessage, AgentRun, TaskPlan, LedgerEntry } from "@yaaa/shared";
 
 // ---------------------------------------------------------------------------
 // Mock better-sqlite3 with a pure in-memory implementation so tests run on
@@ -17,12 +17,17 @@ vi.mock("better-sqlite3", async () => {
     plans: any[];
     ledger: any[];
     audit_logs: any[];
+    agents: any[];
+    conversations: any[];
+    conversation_messages: any[];
     autoId: number;
   }>();
 
   function getDb(dbPath: string) {
     if (!dbs.has(dbPath)) {
-      dbs.set(dbPath, { messages: [], plans: [], ledger: [], audit_logs: [], autoId: 1 });
+      dbs.set(dbPath, {
+        messages: [], plans: [], ledger: [], audit_logs: [], agents: [], conversations: [], conversation_messages: [], autoId: 1,
+      });
     }
     return dbs.get(dbPath)!;
   }
@@ -50,6 +55,19 @@ vi.mock("better-sqlite3", async () => {
         } else if (/INSERT INTO audit_logs/.test(sql)) {
           const [action, details, approvedBy] = args;
           db.audit_logs.push({ id: db.autoId++, action, details, approvedBy: approvedBy ?? null, timestamp: new Date().toISOString() });
+        } else if (/INSERT INTO agents/.test(sql)) {
+          const [id, data] = args;
+          const index = db.agents.findIndex((row) => row.id === id);
+          const row = { id, data, updated_at: new Date().toISOString() };
+          if (index >= 0) db.agents[index] = row; else db.agents.push(row);
+        } else if (/INSERT INTO conversations/.test(sql)) {
+          const [id, task_id, kind, data] = args;
+          const index = db.conversations.findIndex((row) => row.id === id);
+          const row = { id, task_id, kind, data, updated_at: new Date().toISOString() };
+          if (index >= 0) db.conversations[index] = row; else db.conversations.push(row);
+        } else if (/INSERT INTO conversation_messages/.test(sql)) {
+          const [id, task_id, conversation_id, data] = args;
+          db.conversation_messages.push({ id, task_id, conversation_id, data, created_at: new Date().toISOString() });
         }
       };
 
@@ -58,14 +76,22 @@ vi.mock("better-sqlite3", async () => {
           return db.plans.find((r) => r.taskId === args[0]);
         }
         if (/FROM messages/.test(sql)) return db.messages[0];
+        if (/FROM conversations WHERE id/.test(sql)) {
+          return db.conversations.find((row) => row.id === args[0] && row.task_id === args[1]);
+        }
         return undefined;
       };
 
-      const all = () => {
+      const all = (...args: any[]) => {
         if (/FROM messages/.test(sql)) return db.messages;
         if (/FROM plans/.test(sql)) return db.plans;
         if (/FROM ledger/.test(sql)) return db.ledger;
         if (/FROM audit_logs/.test(sql)) return db.audit_logs;
+        if (/FROM agents/.test(sql)) return db.agents;
+        if (/FROM conversations/.test(sql)) return db.conversations.filter((row) => row.task_id === args[0]);
+        if (/FROM conversation_messages/.test(sql)) {
+          return db.conversation_messages.filter((row) => row.task_id === args[0] && row.conversation_id === args[1]);
+        }
         return [];
       };
 
@@ -184,5 +210,81 @@ describe("SqliteStore", () => {
     expect(logs[0].action).toBe(log.action);
     expect(logs[0].details).toBe(log.details);
     expect(logs[0].approvedBy).toBe(log.approvedBy);
+  });
+
+  it("persists the latest lifecycle state for each named agent", async () => {
+    const agent: AgentRun = {
+      id: "files-agent-1",
+      handle: "@sage-1",
+      displayName: "Sage",
+      taskId,
+      subtaskId: "subtask-1",
+      role: "FilesAgent",
+      modelRole: "worker",
+      status: "working",
+    };
+    await store.saveAgent(taskId, agent);
+    await store.saveAgent(taskId, { ...agent, status: "completed", summary: "Done" });
+
+    await expect(store.getAgents(taskId)).resolves.toEqual([
+      { ...agent, status: "completed", summary: "Done" },
+    ]);
+  });
+
+  it("persists conversations independently from legacy runtime messages", async () => {
+    const conversation = {
+      id: "public-1",
+      taskId,
+      kind: "public" as const,
+      title: "Mission chat",
+      participantIds: ["orchestrator"],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const message = {
+      id: "chat-message-1",
+      taskId,
+      conversationId: conversation.id,
+      authorId: "user-1",
+      authorKind: "user" as const,
+      content: "Hello @orchestrator",
+      mentions: [{ handle: "@orchestrator", recipientId: "orchestrator", recipientKind: "orchestrator" as const }],
+      createdAt: "2026-01-01T00:00:01.000Z",
+    };
+
+    await store.saveConversation(taskId, conversation);
+    await store.saveConversationMessage(taskId, message);
+
+    await expect(store.getConversation(taskId, conversation.id)).resolves.toEqual(conversation);
+    await expect(store.getConversations(taskId)).resolves.toContainEqual(conversation);
+    await expect(store.getConversationMessages(taskId, conversation.id)).resolves.toEqual([message]);
+  });
+
+  it("rejects conversation records assigned to another task", async () => {
+    const otherTaskConversation = {
+      id: "public-other",
+      taskId: "other-task",
+      kind: "public" as const,
+      title: "Wrong task",
+      participantIds: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    };
+    await expect(store.saveConversation(taskId, otherTaskConversation)).rejects.toThrow(
+      "Conversation taskId does not match",
+    );
+
+    await expect(
+      store.saveConversationMessage(taskId, {
+        id: "message-other",
+        taskId: "other-task",
+        conversationId: otherTaskConversation.id,
+        authorId: "user-1",
+        authorKind: "user",
+        content: "Wrong task",
+        mentions: [],
+        createdAt: "2026-01-01T00:00:01.000Z",
+      }),
+    ).rejects.toThrow("Conversation message taskId does not match");
   });
 });

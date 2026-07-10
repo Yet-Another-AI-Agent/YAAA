@@ -433,15 +433,132 @@ body {
   gap: 0.75rem;
 }
 
+.artifact-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.artifact-group-title {
+  align-items: center;
+  color: var(--text-muted);
+  display: flex;
+  font-size: 0.68rem;
+  font-weight: 700;
+  justify-content: space-between;
+  letter-spacing: 0.08em;
+  padding: 0 0.2rem;
+  text-transform: uppercase;
+}
+
+.artifact-group-count {
+  background: hsl(222, 18%, 19%);
+  border-radius: 999px;
+  min-width: 1.35rem;
+  padding: 0.1rem 0.35rem;
+  text-align: center;
+}
+
 .artifact-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 10px;
   padding: 0.75rem 1rem;
   border-radius: 8px;
   background: hsl(222, 20%, 15%);
   border: 1px solid var(--border-color);
   font-size: 0.95rem;
+}
+
+.artifact-tree-branch {
+  align-self: stretch;
+  border-bottom: 1px solid var(--border-color);
+  border-left: 1px solid var(--border-color);
+  flex: 0 0 0.55rem;
+  height: 0.9rem;
+}
+
+.artifact-item-copy {
+  flex: 1;
+  min-width: 0;
+}
+
+.artifact-path {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  margin-bottom: 0.15rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.artifact-name-row,
+.artifact-actions {
+  align-items: center;
+  display: flex;
+  gap: 0.45rem;
+}
+
+.artifact-name {
+  font-size: 0.85rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.artifact-desc {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.artifact-type-badge {
+  background: hsl(222, 18%, 20%);
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  color: var(--text-muted);
+  flex: 0 0 auto;
+  font-size: 0.57rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 0.08rem 0.32rem;
+  text-transform: uppercase;
+}
+
+.artifact-type-badge.image,
+.artifact-type-badge.video,
+.artifact-type-badge.audio {
+  border-color: hsl(190, 65%, 42%, 0.6);
+  color: hsl(190, 75%, 70%);
+}
+
+.artifact-type-badge.hands-on,
+.artifact-type-badge.hands-off {
+  border-color: hsl(44, 70%, 42%, 0.65);
+  color: hsl(44, 82%, 70%);
+}
+
+.artifact-actions .artifact-link {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 0.78rem;
+  padding: 0;
+}
+
+.artifact-actions .artifact-link.disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.artifact-item > div:last-child,
+.artifact-item .artifact-link {
+  flex-shrink: 0;
 }
 
 .artifact-link {
@@ -1779,6 +1896,75 @@ body {
   opacity: 0.8;
 }
 
+.slack-channel-item-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.slack-channel-item-row .slack-channel-item {
+  flex: 1;
+  min-width: 0;
+}
+
+.slack-channel-delete-btn {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.slack-channel-delete-btn:hover {
+  background: rgba(255, 80, 80, 0.15);
+  color: #ff6b6b;
+}
+
+.slack-channel-delete-confirm {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.slack-channel-delete-confirm-btn,
+.slack-channel-delete-cancel-btn {
+  flex-shrink: 0;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: none;
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.slack-channel-delete-confirm-btn {
+  background: #ff6b6b;
+  color: #1a0d0d;
+}
+
+.slack-channel-delete-confirm-btn:hover {
+  background: #ff8787;
+}
+
+.slack-channel-delete-cancel-btn {
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border-color);
+}
+
+.slack-channel-delete-cancel-btn:hover {
+  color: var(--text-primary);
+}
+
 .slack-hash {
   color: var(--text-muted);
   font-weight: 700;
@@ -1944,6 +2130,70 @@ body {
   background: hsl(242, 60%, 14%, 0.4);
   border-color: hsl(242, 60%, 25%, 0.5);
   color: var(--text-primary);
+}
+
+/* Public workspace events are deliberately quieter than messages, while still
+   preserving a readable audit trail of people/agents joining and leaving. */
+.slack-system-notice {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin: 0.4rem 0;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.slack-system-notice-line {
+  width: 1.25rem;
+  height: 1px;
+  background: var(--border-color);
+  flex: 0 0 auto;
+}
+
+.slack-system-notice-time {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+/* Raw backend status noise (task ids, lifecycle plumbing) — collapsed by
+   default so it never competes with real conversation content. */
+.slack-system-log-block {
+  margin: 0 0 1rem 0;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: hsl(222, 22%, 9%);
+}
+
+.slack-system-log-block summary {
+  cursor: pointer;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  user-select: none;
+}
+
+.slack-system-log-row {
+  display: flex;
+  gap: 0.6rem;
+  margin-top: 0.5rem;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.slack-system-log-time {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.slack-system-log-text {
+  overflow-wrap: break-word;
 }
 
 /* Chat Input Area */
@@ -2114,7 +2364,7 @@ body {
 }
 
 /* ═══════════════════════════════════════════════
-   AGENT SPACE PLACEHOLDER PANE
+   AGENT SPACE
 ═══════════════════════════════════════════════ */
 .agent-space-pane {
   flex: 1;
@@ -2216,6 +2466,15 @@ body {
   padding: 1px 6px;
 }
 
+.agent-space-activity-heading {
+  color: var(--text-muted);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  margin-top: 0.35rem;
+  text-transform: uppercase;
+}
+
 .agent-space-note {
   font-size: 0.82rem;
   color: var(--text-muted);
@@ -2249,6 +2508,60 @@ body {
   color: var(--text-muted);
   font-size: 0.9rem;
   font-style: italic;
+}
+
+.mission-team-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.mission-team-member {
+  align-items: center;
+  display: flex;
+  gap: 0.6rem;
+  min-width: 0;
+}
+
+.mission-team-status {
+  background: var(--text-muted);
+  border-radius: 999px;
+  flex: 0 0 auto;
+  height: 0.55rem;
+  width: 0.55rem;
+}
+
+.mission-team-status.planned { background: var(--color-warning); }
+.mission-team-status.working { background: var(--color-success); box-shadow: 0 0 8px var(--color-success-glow); }
+.mission-team-status.blocked { background: var(--color-warning); }
+.mission-team-status.completed,
+.mission-team-status.exited { background: var(--text-muted); }
+.mission-team-status.failed { background: var(--color-danger); }
+
+.mission-team-identity {
+  display: flex;
+  flex: 1;
+  justify-content: space-between;
+  min-width: 0;
+  gap: 0.5rem;
+}
+
+.mission-team-handle {
+  color: var(--text-primary);
+  font-size: 0.84rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mission-team-role {
+  color: var(--text-muted);
+  flex: 0 1 auto;
+  font-size: 0.72rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Working folder */
@@ -2465,6 +2778,118 @@ body {
   font-size: 0.85rem;
   margin-top: 0.25rem;
 
+}
+
+/* --- Artifact preview (in-app Markdown/plaintext viewer) --- */
+.artifact-preview-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem;
+  background: rgba(5, 8, 14, 0.72);
+  backdrop-filter: blur(6px);
+}
+
+.artifact-preview-panel {
+  width: 100%;
+  max-width: 720px;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-app);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+}
+
+.artifact-preview-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.9rem 1.1rem;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.artifact-preview-title {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.artifact-preview-close {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 1rem;
+  padding: 4px 8px;
+  border-radius: 6px;
+}
+
+.artifact-preview-close:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.artifact-preview-body {
+  overflow-y: auto;
+  padding: 1.25rem 1.5rem;
+}
+
+.markdown-preview {
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+
+.markdown-preview h1,
+.markdown-preview h2,
+.markdown-preview h3,
+.markdown-preview h4 {
+  color: var(--text-primary);
+  margin: 1.2em 0 0.5em;
+}
+
+.markdown-preview h1:first-child,
+.markdown-preview h2:first-child,
+.markdown-preview h3:first-child,
+.markdown-preview h4:first-child {
+  margin-top: 0;
+}
+
+.markdown-preview p {
+  margin: 0.6em 0;
+}
+
+.markdown-preview ul {
+  margin: 0.6em 0;
+  padding-left: 1.4em;
+}
+
+.markdown-preview code {
+  font-family: var(--font-mono);
+  background: rgba(255, 255, 255, 0.08);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 0.85em;
+}
+
+.markdown-preview pre {
+  background: hsl(222, 22%, 9%);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  overflow-x: auto;
+}
+
+.markdown-preview pre code {
+  background: none;
+  padding: 0;
 }
 
 /* --- API key modal overlay (onboarding + out-of-funds prompt) --- */

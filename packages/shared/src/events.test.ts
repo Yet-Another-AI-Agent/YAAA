@@ -33,4 +33,11 @@ describe("matchTopic wildcard matcher", () => {
     expect(matchTopic("task.#.started", "task.123.456.started")).toBe(true);
     expect(matchTopic("task.#.started", "task.started")).toBe(true);
   });
+
+  it("should handle terminal and unsuccessful multi-level wildcards", () => {
+    expect(matchTopic("task.#", "task.123.started")).toBe(true);
+    expect(matchTopic("task.#.completed", "task.123.started")).toBe(false);
+    expect(matchTopic("task.started", "task.started.extra")).toBe(false);
+    expect(matchTopic("task.started.extra", "task.started")).toBe(false);
+  });
 });

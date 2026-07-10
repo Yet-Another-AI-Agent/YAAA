@@ -7,7 +7,7 @@ import { FilesFs, MeshGateway } from "@yaaa/providers";
 import { Supervisor } from "@yaaa/orchestrator";
 import { OuterLoop } from "@yaaa/agents";
 import type { IStore } from "@yaaa/interfaces";
-import type { AgentMessage, TaskPlan, LedgerEntry } from "@yaaa/shared";
+import type { AgentMessage, AgentRun, TaskPlan, LedgerEntry } from "@yaaa/shared";
 
 // ---------------------------------------------------------------------------
 // In-memory IStore mock — avoids better-sqlite3 native binary dependency so
@@ -18,6 +18,7 @@ function createInMemoryStore(): IStore & { closeAll: () => void } {
   const messages = new Map<string, AgentMessage[]>();
   const ledger = new Map<string, LedgerEntry[]>();
   const auditLogs = new Map<string, any[]>();
+  const agents = new Map<string, AgentRun[]>();
 
   return {
     async initTaskDb(taskId) { /* no-op */ },
@@ -41,7 +42,14 @@ function createInMemoryStore(): IStore & { closeAll: () => void } {
       auditLogs.set(taskId, list);
     },
     async getAuditLogs(taskId) { return auditLogs.get(taskId) ?? []; },
-    closeAll() { plans.clear(); messages.clear(); ledger.clear(); auditLogs.clear(); },
+    async saveAgent(taskId, agent) {
+      const current = agents.get(taskId) ?? [];
+      const index = current.findIndex((item) => item.id === agent.id);
+      if (index >= 0) current[index] = agent; else current.push(agent);
+      agents.set(taskId, current);
+    },
+    async getAgents(taskId) { return agents.get(taskId) ?? []; },
+    closeAll() { plans.clear(); messages.clear(); ledger.clear(); auditLogs.clear(); agents.clear(); },
   };
 }
 
@@ -126,5 +134,25 @@ describe("E2E Spine Integration Scenario", () => {
     } finally {
       vi.restoreAllMocks();
     }
+  });
+
+  it("requires an explicit plan phase before agents execute and records their lifecycle", async () => {
+    const supervisor = new Supervisor();
+    const taskId = "reviewed-e2e-task";
+    const plan = await supervisor.createPlan(
+      "Create a file named reviewed.txt containing the word approved",
+      taskId,
+    );
+
+    expect(plan.subtasks.length).toBeGreaterThan(0);
+    expect(await store.getAgents(taskId)).toEqual([]);
+
+    const result = await supervisor.runPlan(plan, taskId);
+    expect(result.success).toBe(true);
+    await expect(store.getAgents(taskId)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ handle: "@sage-1", status: "completed" }),
+      ]),
+    );
   });
 });

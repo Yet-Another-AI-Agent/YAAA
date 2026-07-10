@@ -19,6 +19,43 @@ export interface UITask {
   prompt: string;
   status: string;
   created_at: string;
+  topic?: string | null;
+}
+
+export interface UIAgent {
+  id: string;
+  handle: string;
+  displayName: string;
+  taskId: string;
+  subtaskId: string;
+  role: string;
+  modelRole: string;
+  status: "planned" | "working" | "blocked" | "completed" | "failed" | "exited";
+  startedAt?: string;
+  finishedAt?: string;
+  summary?: string;
+}
+
+export interface UIConversation {
+  id: string;
+  taskId: string;
+  kind: "public" | "agent_thread";
+  title: string;
+  participantIds: string[];
+  agentId?: string;
+  createdAt: string;
+  updatedAt: string;
+  archivedAt?: string;
+}
+
+export interface UIConversationMessage {
+  id: string;
+  taskId: string;
+  conversationId: string;
+  authorId: string;
+  authorKind: "user" | "orchestrator" | "agent" | "system";
+  content: string;
+  createdAt: string;
 }
 
 export class TaskModel {
@@ -34,6 +71,10 @@ export class TaskModel {
     return this.getElectronAPI().startTask(goal);
   }
 
+  static async confirmTask(taskId: string): Promise<{ status: string }> {
+    return this.getElectronAPI().confirmTask(taskId);
+  }
+
   static async resolveApproval(
     callId: string,
     approved: boolean,
@@ -45,8 +86,16 @@ export class TaskModel {
     return this.getElectronAPI().listTasks();
   }
 
+  static async deleteTask(taskId: string): Promise<{ status: string }> {
+    return this.getElectronAPI().deleteTask(taskId);
+  }
+
   static async readTaskOrchestrator(taskId: string): Promise<string | null> {
     return this.getElectronAPI().readTaskOrchestrator(taskId);
+  }
+
+  static async readArtifact(taskId: string, artifactPath: string): Promise<string | null> {
+    return this.getElectronAPI().readArtifact(taskId, artifactPath);
   }
   /**
    * Retrieves the complete execution log and chat history messages for a specific task.
@@ -55,6 +104,29 @@ export class TaskModel {
    */
   static async getTaskHistory(taskId: string): Promise<any[]> {
     return this.getElectronAPI().getTaskHistory(taskId);
+  }
+
+  static async getTaskAgents(taskId: string): Promise<UIAgent[]> {
+    return this.getElectronAPI().getTaskAgents(taskId);
+  }
+
+  static async createPublicConversation(taskId: string, title?: string): Promise<UIConversation> {
+    return this.getElectronAPI().createPublicConversation(taskId, title);
+  }
+
+  static async getTaskConversations(taskId: string): Promise<UIConversation[]> {
+    return this.getElectronAPI().getTaskConversations(taskId);
+  }
+
+  static async getConversationMessages(
+    taskId: string,
+    conversationId: string,
+  ): Promise<UIConversationMessage[]> {
+    return this.getElectronAPI().getConversationMessages(taskId, conversationId);
+  }
+
+  static async postConversationMessage(message: Omit<UIConversationMessage, "id" | "createdAt">) {
+    return this.getElectronAPI().postConversationMessage(message);
   }
 
   /**

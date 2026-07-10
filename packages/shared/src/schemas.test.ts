@@ -5,6 +5,8 @@ import {
   TaskPlanSchema,
   ToolCallSchema,
   AgentMessageSchema,
+  ConversationMessageSchema,
+  ConversationSchema,
 } from "./schemas.js";
 
 describe("Shared schemas validation", () => {
@@ -83,5 +85,29 @@ describe("Shared schemas validation", () => {
       from: "agent-1",
     };
     expect(AgentMessageSchema.safeParse(invalidMsg).success).toBe(false);
+  });
+
+  it("validates public conversations and durable conversation messages", () => {
+    const conversation = {
+      id: "chat-1",
+      taskId: "mission-1",
+      kind: "public",
+      title: "Mission chat",
+      participantIds: ["orchestrator"],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    };
+    expect(ConversationSchema.safeParse(conversation).success).toBe(true);
+    expect(ConversationSchema.safeParse({ ...conversation, kind: "agent_thread" }).success).toBe(false);
+    expect(ConversationMessageSchema.safeParse({
+      id: "message-1",
+      taskId: "mission-1",
+      conversationId: "chat-1",
+      authorId: "user-1",
+      authorKind: "user",
+      content: "Please help @sage-1",
+      mentions: [{ handle: "@sage-1", recipientId: "agent-1", recipientKind: "agent" }],
+      createdAt: "2026-01-01T00:00:01.000Z",
+    }).success).toBe(true);
   });
 });

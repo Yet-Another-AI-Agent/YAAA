@@ -33,6 +33,8 @@ describe("Supervisor", () => {
       getLedgerEntries: vi.fn().mockResolvedValue([]),
       saveAuditLog: vi.fn(),
       getAuditLogs: vi.fn().mockResolvedValue([]),
+      saveAgent: vi.fn(),
+      getAgents: vi.fn().mockResolvedValue([]),
     };
 
     container.register("IMeshGateway", mockGateway);
@@ -91,6 +93,22 @@ describe("Supervisor", () => {
     expect(result.success).toBe(true);
     expect(result.summary).toBe("Task fully verified");
     expect(mockStore.initTaskDb).toHaveBeenCalled();
+  });
+
+  it("creates and persists a draft plan before any agent execution", async () => {
+    const plan = {
+      goal: "Review before execution",
+      subtasks: [],
+    };
+    (mockGateway.chat as any).mockResolvedValue(`\`\`\`json\n${JSON.stringify(plan)}\n\`\`\``);
+    const runSpy = vi.spyOn(OuterLoop.prototype, "run");
+
+    await expect(supervisor.createPlan("Review before execution", "task-draft")).resolves.toEqual(plan);
+
+    expect(mockStore.savePlan).toHaveBeenCalledWith("task-draft", plan);
+    expect(mockBus.publish).toHaveBeenCalledWith("task.task-draft.plan_updated", plan);
+    expect(runSpy).not.toHaveBeenCalled();
+    runSpy.mockRestore();
   });
 
   it("should handle failures during task execution and return success: false", async () => {

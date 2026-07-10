@@ -5,6 +5,14 @@ import { TaskModel } from "../models/TaskModel";
 import { ApiKeyModal } from "../components/ApiKeyModal";
 import { MissionInput } from "../components/MissionInput";
 import { ThinkingPanel } from "../components/ThinkingPanel";
+import {
+  getAgentActivity,
+  getVisibleLogContent,
+  isActiveAgent,
+  isAgentLifecycleLog,
+} from "../utils/agentWorkspace";
+import { renderMarkdown } from "../utils/simpleMarkdown";
+import { buildArtifactExplorer } from "../utils/artifactExplorer";
 import * as shared from "@yaaa/shared";
 const { ORCHESTRATOR_MD_HEADERS } = shared;
 
@@ -182,6 +190,19 @@ function getAvatarColor(sender: string): string {
   return "#707070";
 }
 
+const CAPABILITY_LABELS: Record<string, string> = {
+  docs: "Docs",
+  browser: "Web Browser",
+  shell: "Shell / Terminal",
+  files: "File System",
+  integration: "External Integration",
+  verify: "Verification",
+};
+
+function formatCapabilityLabel(capability: string): string {
+  return CAPABILITY_LABELS[capability] || capability;
+}
+
 function formatChannelName(prompt: string, taskId?: string): string {
   if (!prompt) return "channel";
   let slug = prompt
@@ -206,6 +227,11 @@ function getArtifactHref(yaaaDir: string, activeTaskId: string | null, artPath: 
   return `file://${yaaaDir}/tasks/${activeTaskId}/working/${encodedPath}`;
 }
 
+/** Only Markdown/plaintext artifacts get an in-app preview for now — PPT/PDF/Excel rendering is a separate, larger feature. */
+function isPreviewableArtifact(artPath: string): boolean {
+  return /\.(md|markdown|txt)$/i.test(artPath);
+}
+
 export function DashboardView({ viewModel }: DashboardViewProps) {
   const {
     goal,
@@ -213,14 +239,19 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     taskId,
     setTaskId,
     running,
+    awaitingConfirmation,
+    agents = [],
     subtasks,
     logs,
     pendingApproval,
     artifacts,
     summary,
     success,
+    channelTopic,
     startTask,
+    confirmPlan,
     resolveApproval,
+    deleteTask,
     tasks,
     apiKeyPrompt,
     setApiKeyPrompt,
@@ -234,10 +265,18 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
 
   // Past task selected states
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  // Channel id currently showing its inline "confirm delete?" affordance.
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [orchestratorMd, setOrchestratorMd] = useState<string | null>(null);
   const [historyMessages, setHistoryMessages] = useState<any[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const activeHistoryRequestRef = useRef<string | null>(null);
+
+  // Split-screen artifact preview (Markdown/plaintext only for now).
+  const [artifactPreview, setArtifactPreview] = useState<{ path: string; content: string } | null>(null);
+  const [artifactPreviewLoading, setArtifactPreviewLoading] = useState(false);
+  const [artifactPreviewError, setArtifactPreviewError] = useState<string | null>(null);
+  const activeArtifactRequestRef = useRef(0);
 
   // YAAA data directory state
   const [yaaaDir, setYaaaDir] = useState<string>("");
@@ -274,6 +313,15 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
       setSidebarOpen(false); // Collapsed on start
     }
   }, [running, taskId]);
+
+  // Invalidate preview reads when the visible mission changes. Without this,
+  // a slower response from the previous mission can overwrite the new view.
+  useEffect(() => {
+    activeArtifactRequestRef.current += 1;
+    setArtifactPreview(null);
+    setArtifactPreviewError(null);
+    setArtifactPreviewLoading(false);
+  }, [selectedTaskId, taskId]);
 
   // Fetch orchestrator.md when a task is selected
   useEffect(() => {
@@ -342,6 +390,58 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     }
   };
 
+  const handleDeleteTaskRequest = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setConfirmDeleteId(id);
+  };
+
+  const handleCancelDeleteTask = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setConfirmDeleteId(null);
+  };
+
+  const handleConfirmDeleteTask = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setConfirmDeleteId(null);
+    if (id === selectedTaskId) {
+      setSelectedTaskId(null);
+      setShowTaskView(false);
+    }
+    deleteTask(id);
+  };
+
+  const handlePreviewArtifact = async (artPath: string) => {
+    const activeTaskId = selectedTaskId || taskId;
+    if (!activeTaskId) return;
+    const requestId = activeArtifactRequestRef.current + 1;
+    activeArtifactRequestRef.current = requestId;
+    setArtifactPreviewError(null);
+    setArtifactPreviewLoading(true);
+    setArtifactPreview({ path: artPath, content: "" });
+    try {
+      const content = await TaskModel.readArtifact(activeTaskId, artPath);
+      if (activeArtifactRequestRef.current !== requestId) return;
+      if (content === null) {
+        setArtifactPreviewError("Could not read this file.");
+      } else {
+        setArtifactPreview({ path: artPath, content });
+      }
+    } catch (err: any) {
+      if (activeArtifactRequestRef.current !== requestId) return;
+      setArtifactPreviewError(err?.message || "Could not read this file.");
+    } finally {
+      if (activeArtifactRequestRef.current === requestId) {
+        setArtifactPreviewLoading(false);
+      }
+    }
+  };
+
+  const handleClosePreview = () => {
+    activeArtifactRequestRef.current += 1;
+    setArtifactPreview(null);
+    setArtifactPreviewError(null);
+  };
+
   const handleNewMission = () => {
     setSelectedTaskId(null);
     setShowTaskView(false);
@@ -366,12 +466,17 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
 
   // Pre-process display messages, subtasks, and artifacts
   const selectedTask = selectedTaskId ? tasks.find(t => t.id === selectedTaskId) : null;
-  const currentChannelName = selectedTask 
-    ? formatChannelName(selectedTask.prompt, selectedTask.id)
-    : (taskId ? formatChannelName(goal, taskId) : "general");
+  // channelTopic (live event) is the fastest path; the tasks list (refreshed
+  // independently via loadTasks) is the fallback if that event arrives after
+  // the mission's event subscription has already been torn down.
+  const liveTask = taskId ? tasks.find(t => t.id === taskId) : null;
+  const currentChannelName = selectedTask
+    ? (selectedTask.topic || formatChannelName(selectedTask.prompt, selectedTask.id))
+    : (taskId ? (channelTopic || liveTask?.topic || formatChannelName(goal, taskId)) : "general");
 
   const memoizedData = useMemo(() => {
     let displayMessages: any[] = [];
+    let systemLogEntries: any[] = [];
     const parsedOrchestrator = parseOrchestratorMd(orchestratorMd);
 
     if (selectedTaskId) {
@@ -434,11 +539,20 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
         kind: "thought"
       });
 
-      // Add live logs
+      // Add live logs. Plain system status logs (task IDs, "submitting to
+      // supervisor", etc.) are backend noise, not conversation — collect them
+      // separately for a single collapsed block instead of individual chat
+      // bubbles. Lifecycle notices keep their existing toast rendering, and
+      // orchestrator/agent logs remain real bubbles.
       logs.forEach((log) => {
+        if (log.source === "system" && !isAgentLifecycleLog(log)) {
+          systemLogEntries.push(log);
+          return;
+        }
+
         let sender = log.source === "system" ? "System" : (log.source === "orchestrator" ? "Supervisor" : "Agent");
         if (log.kind === "response") sender = "Orchestrator";
-        let content = log.content;
+        let content = getVisibleLogContent(log.content);
         const agentMatch = log.content.match(/^\[([^\]]+)\] (.*)/);
         if (agentMatch) {
           sender = agentMatch[1];
@@ -449,7 +563,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
           sender,
           time: log.time,
           content,
-          kind: log.kind,
+          kind: isAgentLifecycleLog(log) ? "lifecycle" : log.kind,
           artifacts: [],
         });
       });
@@ -468,10 +582,11 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
 
     const currentStatus = selectedTaskId 
       ? (selectedTask?.status || parsedOrchestrator.status) 
-      : (running ? "running" : (success ? "success" : (success === false ? "failed" : "pending")));
+      : (awaitingConfirmation ? "awaiting_confirmation" : (running ? "running" : (success ? "success" : (success === false ? "failed" : "pending"))));
 
     return {
       displayMessages,
+      systemLogEntries,
       displaySubtasks,
       displayArtifacts,
       currentStatus
@@ -487,10 +602,16 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     subtasks,
     artifacts,
     running,
+    awaitingConfirmation,
     success
   ]);
 
-  const { displayMessages, displaySubtasks, displayArtifacts, currentStatus } = memoizedData;
+  const { displayMessages, systemLogEntries, displaySubtasks, displayArtifacts, currentStatus } = memoizedData;
+  const artifactGroups = useMemo(() => buildArtifactExplorer(displayArtifacts), [displayArtifacts]);
+  const activeAgentCount = agents.filter(isActiveAgent).length;
+  // Real capabilities this plan actually uses, replacing what used to be a
+  // hardcoded fake Slack/GitHub/Web-Search "connected" list.
+  const activeCapabilities = Array.from(new Set(displaySubtasks.map((st) => st.capability).filter(Boolean)));
 
   // Collapse runs of consecutive "thinking" messages into a single dropdown
   // panel; everything else renders as an individual chat bubble.
@@ -541,20 +662,56 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
               (tasks || []).map((t) => {
                 const isActive = (showTaskView && t.id === taskId) || (selectedTaskId === t.id);
                 const isWaiting = t.id === taskId && running && pendingApproval;
-                const status = isWaiting ? "waiting" : (t.id === taskId && running ? "running" : t.status);
-                const channelName = formatChannelName(t.prompt, t.id);
+                const status = isWaiting ? "waiting" : (t.id === taskId && awaitingConfirmation ? "awaiting_confirmation" : (t.id === taskId && running ? "running" : t.status));
+                const channelName = t.topic || formatChannelName(t.prompt, t.id);
                 return (
-                  <button
-                    key={t.id}
-                    className={`slack-channel-item ${isActive ? "active" : ""}`}
-                    onClick={() => handleSelectTask(t.id)}
-                    title={t.prompt}
-                  >
-                    <span className="slack-hash">#</span>
-                    <span className="slack-channel-name">{channelName}</span>
-                    <span style={{ display: "none" }}>{t.prompt}</span>
-                    <span className={`slack-status-dot ${status}`} />
-                  </button>
+                  <div key={t.id} className={`slack-channel-item-row ${isActive ? "active" : ""}`}>
+                    <button
+                      className={`slack-channel-item ${isActive ? "active" : ""}`}
+                      onClick={() => handleSelectTask(t.id)}
+                      title={t.prompt}
+                    >
+                      <span className="slack-hash">#</span>
+                      <span className="slack-channel-name">{channelName}</span>
+                      <span style={{ display: "none" }}>{t.prompt}</span>
+                      <span className={`slack-status-dot ${status}`} />
+                    </button>
+                    {confirmDeleteId === t.id ? (
+                      <div className="slack-channel-delete-confirm">
+                        <button
+                          className="slack-channel-delete-confirm-btn"
+                          onClick={(e) => handleConfirmDeleteTask(t.id, e)}
+                          title="Confirm delete"
+                          aria-label="Confirm delete"
+                        >
+                          Delete
+                        </button>
+                        <button
+                          className="slack-channel-delete-cancel-btn"
+                          onClick={handleCancelDeleteTask}
+                          title="Cancel"
+                          aria-label="Cancel delete"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        className="slack-channel-delete-btn"
+                        onClick={(e) => handleDeleteTaskRequest(t.id, e)}
+                        title="Delete chat"
+                        aria-label="Delete chat"
+                      >
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <polyline points="3 6 5 6 21 6" />
+                          <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                          <path d="M10 11v6" />
+                          <path d="M14 11v6" />
+                          <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+                        </svg>
+                      </button>
+                    )}
+                  </div>
                 );
               })
             )}
@@ -617,7 +774,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                 value={goal}
                 onChange={setGoal}
                 onSubmit={() => startTask()}
-                running={running}
+                running={running || awaitingConfirmation}
                 placeholder="What's the mission today?"
               />
               <div className="mission-chips">
@@ -673,6 +830,19 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   </div>
                 )}
 
+                {/* System status noise, collapsed and minimized by default */}
+                {!loadingHistory && systemLogEntries.length > 0 && (
+                  <details className="slack-system-log-block">
+                    <summary>System log ({systemLogEntries.length})</summary>
+                    {systemLogEntries.map((log) => (
+                      <div className="slack-system-log-row" key={log.id}>
+                        <span className="slack-system-log-time">{log.time}</span>
+                        <span className="slack-system-log-text">{log.content}</span>
+                      </div>
+                    ))}
+                  </details>
+                )}
+
                 {/* Main conversation message bubbles */}
                 {!loadingHistory && displayMessages.length === 0 && (
                   <div className="panel-empty">
@@ -692,7 +862,13 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                     );
                   }
                   const msg = group.msg;
-                  return (
+                  return msg.kind === "lifecycle" ? (
+                    <div className="slack-system-notice" role="status" key={msg.id}>
+                      <span className="slack-system-notice-line" aria-hidden="true" />
+                      <span>{msg.content}</span>
+                      <span className="slack-system-notice-time">{msg.time}</span>
+                    </div>
+                  ) : (
                   <div className="slack-message" key={msg.id}>
                     <div
                       className="slack-message-avatar"
@@ -717,6 +893,15 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                                   <span className="artifact-filename">{art.path.split("/").pop()}</span>
                                   <span className="artifact-description">{art.description}</span>
                                 </div>
+                                {isPreviewableArtifact(art.path) && (
+                                  <button
+                                    type="button"
+                                    className="slack-artifact-download"
+                                    onClick={() => handlePreviewArtifact(art.path)}
+                                  >
+                                    Preview
+                                  </button>
+                                )}
                                 {(!yaaaDir || !(selectedTaskId || taskId)) ? (
                                   <span className="slack-artifact-download disabled" style={{ opacity: 0.5, cursor: 'not-allowed' }}>
                                     Open
@@ -740,7 +925,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   </div>
                   );
                 })}
-                
+
                 {/* Approval Banner inside chat list */}
                 {showTaskView && pendingApproval && (
                   <div className="approval-banner" style={{ marginTop: '1.25rem' }}>
@@ -757,6 +942,18 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                     <div className="approval-actions">
                       <button className="btn-reject" onClick={() => resolveApproval(false)}>Reject</button>
                       <button className="btn-approve" onClick={() => resolveApproval(true)}>Approve & Execute</button>
+                    </div>
+                  </div>
+                )}
+
+                {showTaskView && awaitingConfirmation && !selectedTaskId && (
+                  <div className="approval-banner" style={{ marginTop: '1.25rem' }}>
+                    <div className="approval-title">Plan ready for review</div>
+                    <div className="approval-body">
+                      The orchestrator has proposed the work shown in Todo and Progress. No agent actions have started yet.
+                    </div>
+                    <div className="approval-actions">
+                      <button className="btn-approve" onClick={confirmPlan}>Confirm plan &amp; start agents</button>
                     </div>
                   </div>
                 )}
@@ -792,6 +989,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                 <div className="slack-chat-input-box">
                   <span>
                     {selectedTaskId && "🔒 Archived channel — send a message to start a new mission."}
+                    {!selectedTaskId && awaitingConfirmation && "🗺️ Plan ready. Review Todo and Progress, then confirm to start agents."}
                     {!selectedTaskId && running && "⚡ Mission in progress... Agent is running and printing thoughts."}
                     {!selectedTaskId && !running && success === true && "✅ Mission completed."}
                     {!selectedTaskId && !running && success === false && "❌ Mission failed."}
@@ -802,51 +1000,61 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   value={goal}
                   onChange={setGoal}
                   onSubmit={() => startTask()}
-                  running={running}
+                  running={running || awaitingConfirmation}
                   placeholder="Message this channel…"
                 />
               </div>
             </div>
             ) : (
-            /* Agent Space placeholder pane */
+            /* Agent Space: structured lifecycle state plus collapsible execution log. */
             <div className="agent-space-pane">
               <div className="agent-space-header">
                 <div className="agent-space-header-title">
                   <span className="agent-space-header-icon" aria-hidden="true">🧠</span>
                   <span>Agent Space</span>
                 </div>
-                <span className="agent-space-preview-tag">Preview</span>
+                <span className="agent-space-preview-tag">{activeAgentCount} active agent{activeAgentCount === 1 ? "" : "s"}</span>
               </div>
               <div className="agent-space-body">
-                <div className="agent-space-heading">What the agent thinks and does</div>
-
-                <div className="agent-space-block agent-space-thinking">
-                  <div className="agent-space-block-label">Thinking</div>
-                  <div className="agent-space-block-text">
-                    Analyzing the request and breaking it into subtasks…
+                <div className="agent-space-heading">Named agents, execution state, and activity</div>
+                {agents.length === 0 ? (
+                  <div className="agent-space-note">
+                    Confirm the plan to create the specialist agents assigned to this mission.
                   </div>
-                </div>
-
-                <div className="agent-space-block">
-                  <div className="agent-space-block-label">Actions</div>
-                  <div className="agent-space-action-row">
-                    <span className="agent-space-action-icon" aria-hidden="true">🔧</span>
-                    <span className="agent-space-action-text">Ran: <code>read_file(package.json)</code></span>
-                  </div>
-                  <div className="agent-space-action-row">
-                    <span className="agent-space-action-icon" aria-hidden="true">🌐</span>
-                    <span className="agent-space-action-text">Searched web: <code>'vite ESM config'</code></span>
-                  </div>
-                  <div className="agent-space-action-row">
-                    <span className="agent-space-action-icon" aria-hidden="true">📝</span>
-                    <span className="agent-space-action-text">Wrote: <code>notes.md</code></span>
-                  </div>
-                </div>
-
-                <div className="agent-space-note">
-                  This is a preview of the Agent Space. Live reasoning and tool activity will
-                  appear here in a future release.
-                </div>
+                ) : agents.map((agent) => {
+                  const agentActivity = getAgentActivity(agent, logs);
+                  return (
+                  <details className="agent-space-block" key={agent.id}>
+                    <summary className="agent-space-block-label">
+                      <span>{agent.handle} · {agent.role}</span>
+                      <span className={`detail-status-pill ${agent.status}`}>{agent.status}</span>
+                    </summary>
+                    <div className="agent-space-block-text">Model role: {agent.modelRole}</div>
+                    <div className="agent-space-block-text">Assigned to: {agent.subtaskId}</div>
+                    {agent.summary && <div className="agent-space-block-text">{agent.summary}</div>}
+                    <div className="agent-space-activity-heading">Activity ({agentActivity.length})</div>
+                    {agentActivity.length === 0 ? (
+                      <div className="agent-space-block-text">No execution activity reported yet.</div>
+                    ) : agentActivity.map((log) => (
+                      <div className="agent-space-action-row" key={log.id}>
+                        <span className="agent-space-action-icon" aria-hidden="true">💭</span>
+                        <span className="agent-space-action-text">{log.content}</span>
+                      </div>
+                    ))}
+                  </details>
+                  );
+                })}
+                <details className="agent-space-block" data-testid="execution-activity">
+                  <summary className="agent-space-block-label">Execution activity</summary>
+                  {logs.length === 0 ? (
+                    <div className="agent-space-block-text">No agent activity yet.</div>
+                  ) : logs.map((log, index) => (
+                    <div className="agent-space-action-row" key={`${log.time}-${index}`}>
+                      <span className="agent-space-action-icon" aria-hidden="true">{log.source === "agent" ? "💭" : "🔧"}</span>
+                      <span className="agent-space-action-text">{log.content}</span>
+                    </div>
+                  ))}
+                </details>
               </div>
             </div>
             )}
@@ -857,6 +1065,25 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                 Mission Details
               </div>
               <div className="slack-details-content">
+                <div className="slack-details-section" aria-label="Mission team">
+                  <div className="slack-section-title">Mission team</div>
+                  {agents.length === 0 ? (
+                    <div className="slack-section-empty">Agents will join after the plan is confirmed.</div>
+                  ) : (
+                    <div className="mission-team-list">
+                      {agents.map((agent) => (
+                        <div className="mission-team-member" key={agent.id}>
+                          <span className={`mission-team-status ${agent.status}`} aria-label={agent.status} />
+                          <div className="mission-team-identity">
+                            <span className="mission-team-handle">{agent.handle}</span>
+                            <span className="mission-team-role">{agent.role}</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
                 {/* ── 1. Artifacts (REAL) ── */}
                 <div className="slack-details-section">
                   <div className="slack-section-title">Artifacts</div>
@@ -865,33 +1092,61 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                       No artifacts generated yet.
                     </div>
                   ) : (
-                    <div className="artifact-list">
-                      {displayArtifacts.map((art, idx) => (
-                        <div key={idx} className="artifact-item">
-                          <div style={{ minWidth: 0, flex: 1, paddingRight: '8px' }}>
-                            <div className="artifact-name" style={{ fontSize: '0.85rem', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                              {art.path.split("/").pop()}
-                            </div>
-                            <div className="artifact-desc" style={{ fontSize: '0.75rem', color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                              {art.description}
-                            </div>
+                    <div className="artifact-list" role="tree" aria-label="Mission artifacts">
+                      {artifactGroups.map((group) => (
+                        <section className="artifact-group" key={group.id} role="group" aria-label={group.label}>
+                          <div className="artifact-group-title">
+                            <span>{group.label}</span>
+                            <span className="artifact-group-count">{group.entries.length}</span>
                           </div>
-                          {(!yaaaDir || !(selectedTaskId || taskId)) ? (
-                            <span className="artifact-link disabled" style={{ opacity: 0.5, cursor: 'not-allowed', fontSize: '0.85rem' }}>
-                              Open
-                            </span>
-                          ) : (
-                            <a
-                              className="artifact-link"
-                              href={getArtifactHref(yaaaDir, selectedTaskId || taskId, art.path)}
-                              target="_blank"
-                              rel="noreferrer"
-                              style={{ fontSize: '0.85rem' }}
+                          {group.entries.map((art) => (
+                            <div
+                              key={art.normalizedPath}
+                              className="artifact-item"
+                              role="treeitem"
+                              aria-label={`${group.label}: ${art.name}`}
+                              data-artifact-kind={art.groupId}
+                              aria-level={Math.max(1, art.depth + 1)}
                             >
-                              Open
-                            </a>
-                          )}
-                        </div>
+                              <div className="artifact-tree-branch" aria-hidden="true" />
+                              <div className="artifact-item-copy">
+                                {art.directorySegments.length > 0 && (
+                                  <div className="artifact-path">{art.directorySegments.join(" / ")}</div>
+                                )}
+                                <div className="artifact-name-row">
+                                  <span className="artifact-name">{art.name}</span>
+                                  <span className={`artifact-type-badge ${art.mediaKind || art.handoffKind || art.groupId}`}>
+                                    {art.typeLabel}
+                                  </span>
+                                </div>
+                                <div className="artifact-desc">{art.description}</div>
+                              </div>
+                              <div className="artifact-actions">
+                                {isPreviewableArtifact(art.path) && (
+                                  <button
+                                    type="button"
+                                    className="artifact-link"
+                                    onClick={() => handlePreviewArtifact(art.path)}
+                                  >
+                                    Preview
+                                  </button>
+                                )}
+                                {(!yaaaDir || !(selectedTaskId || taskId)) ? (
+                                  <span className="artifact-link disabled">Open</span>
+                                ) : (
+                                  <a
+                                    className="artifact-link"
+                                    href={getArtifactHref(yaaaDir, selectedTaskId || taskId, art.path)}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                  >
+                                    Open
+                                  </a>
+                                )}
+                              </div>
+                            </div>
+                          ))}
+                        </section>
                       ))}
                     </div>
                   )}
@@ -927,7 +1182,11 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   </span>
                   {displaySubtasks.length === 0 ? (
                     <div className="slack-section-empty">
-                      {selectedTaskId ? "No subtasks recorded." : (running ? "Generating plan..." : "Awaiting plan...")}
+                      {selectedTaskId
+                        ? "No subtasks recorded."
+                        : (running
+                          ? "Generating plan..."
+                          : (awaitingConfirmation ? "This plan has no subtasks to review." : "Awaiting plan..."))}
                     </div>
                   ) : (
                     <div className="subtask-list">
@@ -963,23 +1222,21 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   </div>
                 </div>
 
-                {/* ── 5. Active Integrations (HARDCODED placeholder) ── */}
+                {/* ── 5. Active Integrations: the plan's real capabilities, not a fake fixed list ── */}
                 <div className="slack-details-section">
                   <div className="slack-section-title">Active Integrations</div>
-                  <div className="integration-list">
-                    <div className="integration-row">
-                      <span className="integration-name">Slack</span>
-                      <span className="integration-status connected">connected</span>
+                  {activeCapabilities.length === 0 ? (
+                    <div className="slack-section-empty">No capabilities assigned yet.</div>
+                  ) : (
+                    <div className="integration-list">
+                      {activeCapabilities.map((capability) => (
+                        <div className="integration-row" key={capability}>
+                          <span className="integration-name">{formatCapabilityLabel(capability)}</span>
+                          <span className="integration-status connected">in plan</span>
+                        </div>
+                      ))}
                     </div>
-                    <div className="integration-row">
-                      <span className="integration-name">GitHub</span>
-                      <span className="integration-status connected">connected</span>
-                    </div>
-                    <div className="integration-row">
-                      <span className="integration-name">Web Search</span>
-                      <span className="integration-status enabled">enabled</span>
-                    </div>
-                  </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -1016,6 +1273,37 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
           onSaved={() => setApiKeyPrompt(null)}
           onClose={() => setApiKeyPrompt(null)}
         />
+      )}
+
+      {artifactPreview && (
+        <div className="artifact-preview-overlay" onClick={handleClosePreview}>
+          <div className="artifact-preview-panel" onClick={(e) => e.stopPropagation()}>
+            <div className="artifact-preview-header">
+              <span className="artifact-preview-title">{artifactPreview.path.split("/").pop()}</span>
+              <button
+                type="button"
+                className="artifact-preview-close"
+                onClick={handleClosePreview}
+                aria-label="Close preview"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="artifact-preview-body">
+              {artifactPreviewLoading ? (
+                <div className="panel-empty">
+                  <div className="thinking-dots">
+                    <span /><span /><span />
+                  </div>
+                </div>
+              ) : artifactPreviewError ? (
+                <div className="panel-empty">{artifactPreviewError}</div>
+              ) : (
+                <div className="markdown-preview">{renderMarkdown(artifactPreview.content)}</div>
+              )}
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
