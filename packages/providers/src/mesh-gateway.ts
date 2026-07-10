@@ -198,6 +198,21 @@ export class MeshGateway implements IMeshGateway {
 \`\`\``;
     }
 
+    if (role === "utility") {
+      const systemMsg = messages.find((m) => m.role === "system")?.content || "";
+      if (systemMsg.includes("channel topic")) {
+        const userMsg = messages.find((m) => m.role === "user")?.content || "mission";
+        return userMsg
+          .toLowerCase()
+          .replace(/[^a-z0-9\s-]/g, "")
+          .trim()
+          .split(/\s+/)
+          .filter(Boolean)
+          .slice(0, 4)
+          .join("-");
+      }
+    }
+
     if (role === "verifier") {
       const isFinalJudge = messages.some(
         (m) => m.role === "system" && m.content.includes("final synthesis and verification judge")

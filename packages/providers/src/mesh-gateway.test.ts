@@ -91,6 +91,41 @@ describe("MeshGateway", () => {
     expect(onReasoning).not.toHaveBeenCalled();
   });
 
+  it("should cover each deterministic mock role response", async () => {
+    const gateway = new MeshGateway({ apiKey: "" });
+
+    const firstWorkerReply = await gateway.chat(
+      [{ role: "user", content: "start work" }],
+      { modelRole: "worker" },
+    );
+    expect(firstWorkerReply).toContain('"call"');
+
+    const completedWorkerReply = await gateway.chat(
+      [{ role: "user", content: "Tool Execution Result: success" }],
+      { modelRole: "worker" },
+    );
+    expect(completedWorkerReply).toContain('"result"');
+
+    const topic = await gateway.chat(
+      [
+        { role: "system", content: "Generate a channel topic" },
+        { role: "user", content: "Ship the Release!" },
+      ],
+      { modelRole: "utility" },
+    );
+    expect(topic).toBe("ship-the-release");
+
+    const finalVerification = await gateway.chat(
+      [{ role: "system", content: "Act as the final synthesis and verification judge" }],
+      { modelRole: "verifier" },
+    );
+    expect(finalVerification).toContain('"passed": true');
+
+    await expect(
+      gateway.chat([{ role: "user", content: "fallback" }], { modelRole: "utility" }),
+    ).resolves.toBe("{}");
+  });
+
   it("should make a real OpenAI call if API key is provided", async () => {
     const gateway = new MeshGateway({ apiKey: "some-key" });
     
@@ -105,6 +140,15 @@ describe("MeshGateway", () => {
 
     expect(mockCreate).toHaveBeenCalled();
     expect(response).toBe("real-gateway-reply");
+  });
+
+  it("should return an empty string when a real response has no content", async () => {
+    const gateway = new MeshGateway({ apiKey: "some-key" });
+    mockCreate.mockResolvedValue({ choices: [] });
+
+    await expect(
+      gateway.chat([{ role: "user", content: "hello" }], { modelRole: "planner", jsonMode: true }),
+    ).resolves.toBe("");
   });
 
   it("should support real stream responses if API key is provided", async () => {
@@ -133,6 +177,26 @@ describe("MeshGateway", () => {
     expect(chunks).toEqual(["part1", "part2"]);
   });
 
+  it("should skip empty real stream chunks", async () => {
+    const gateway = new MeshGateway({ apiKey: "some-key" });
+    mockCreateStream.mockResolvedValue({
+      async *[Symbol.asyncIterator]() {
+        yield { choices: [] };
+        yield { choices: [{ delta: { content: "" } }] };
+        yield { choices: [{ delta: { content: "visible" } }] };
+      },
+    });
+
+    const chunks: string[] = [];
+    for await (const chunk of gateway.chatStream(
+      [{ role: "user", content: "hello" }],
+      { modelRole: "planner" },
+    )) {
+      chunks.push(chunk);
+    }
+    expect(chunks).toEqual(["visible"]);
+  });
+
   it("should throw error if OpenAI call fails", async () => {
     const gateway = new MeshGateway({ apiKey: "some-key" });
     mockCreate.mockRejectedValue(new Error("API Error"));
@@ -140,6 +204,18 @@ describe("MeshGateway", () => {
     await expect(
       gateway.chat([{ role: "user", content: "hello" }], { modelRole: "planner" })
     ).rejects.toThrow("API Error");
+  });
+
+  it("should normalize insufficient-funds errors from real calls", async () => {
+    const gateway = new MeshGateway({ apiKey: "some-key" });
+    mockCreate.mockRejectedValue({ status: 402 });
+
+    await expect(
+      gateway.chat([{ role: "user", content: "hello" }], { modelRole: "planner" }),
+    ).rejects.toMatchObject({
+      code: "insufficient_funds",
+      message: expect.stringContaining("insufficient funds"),
+    });
   });
 
   it("should propagate error during stream initialization", async () => {

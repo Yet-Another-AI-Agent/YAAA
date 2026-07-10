@@ -10,7 +10,7 @@
     "lint": "oxlint",
     "preview": "vite preview",
     "electron:start": "electron .",
-    "dev:electron": "concurrently \"tsc -b -w\" \"npm run dev\" \"sleep 2 && electron .\""
+    "dev:electron": "concurrently --kill-others-on-fail \"tsc -b -w\" \"npm run dev\" \"sleep 2 && electron .\""
   },
   "dependencies": {
     "@yaaa/agents": "*",
@@ -24,6 +24,7 @@
     "react-dom": "^19.2.7"
   },
   "devDependencies": {
+    "@electron/rebuild": "^3.7.2",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@types/node": "^24.13.2",
@@ -32,7 +33,7 @@
     "@vitejs/plugin-react": "^5.1.1",
     "concurrently": "^8.2.2",
     "electron": "^30.0.0",
-    "jsdom": "^29.1.1",
+    "jsdom": "^26.1.0",
     "oxlint": "^1.71.0",
     "typescript": "~6.0.2",
     "vite": "^5.4.11"

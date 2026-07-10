@@ -1,4 +1,4 @@
-import type { TaskPlan, ArtifactRef } from "@yaaa/shared";
+import type { TaskPlan, ArtifactRef, AgentRun } from "@yaaa/shared";
 
 /**
  * The structured event contract emitted by the core runtime.
@@ -12,9 +12,11 @@ export type RuntimeEvent =
   | { type: "plan-updated"; plan: TaskPlan }
   | { type: "thought"; from: string; content: string }
   | { type: "tool-requested"; from: string; content: string }
+  | { type: "agent-status"; agent: AgentRun }
   | { type: "status"; from: string; note: string }
   | { type: "result"; from: string; summary: string; artifacts: ArtifactRef[] }
-  | { type: "complete"; result: TaskRunResult };
+  | { type: "complete"; result: TaskRunResult }
+  | { type: "topic-updated"; taskId: string; topic: string };
 
 export interface TaskRunResult {
   success: boolean;
@@ -73,6 +75,10 @@ export function mapBusEvent(
     const from =
       topic.split(".").find((p) => p.includes("agent-")) ?? msg?.from ?? "agent";
     return { type: "tool-requested", from, content: msg?.content ?? "" };
+  }
+
+  if (topic.startsWith(`${base}.agent.`) && topic.endsWith(".lifecycle")) {
+    return { type: "agent-status", agent: msg as AgentRun };
   }
 
   return null;

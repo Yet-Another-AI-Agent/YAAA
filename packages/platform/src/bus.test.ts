@@ -23,6 +23,8 @@ describe("MessageBus", () => {
       getLedgerEntries: vi.fn(),
       saveAuditLog: vi.fn(),
       getAuditLogs: vi.fn(),
+      saveAgent: vi.fn(),
+      getAgents: vi.fn(),
     };
 
     container.register("IStore", mockStore);
@@ -88,5 +90,22 @@ describe("MessageBus", () => {
 
     // This should complete without throwing
     await expect(bus.publish("task.99.status", agentMsg)).resolves.not.toThrow();
+  });
+
+  it("isolates subscriber failures and continues notifying later subscribers", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const laterSubscriber = vi.fn();
+    bus.subscribe("task.123.started", async () => {
+      throw new Error("subscriber failed");
+    });
+    bus.subscribe("task.123.started", laterSubscriber);
+
+    await expect(bus.publish("task.123.started", { msg: "hello" })).resolves.toBeUndefined();
+    expect(laterSubscriber).toHaveBeenCalledOnce();
+    expect(error).toHaveBeenCalledWith(
+      "Error in subscriber for topic task.123.started:",
+      expect.any(Error),
+    );
+    error.mockRestore();
   });
 });

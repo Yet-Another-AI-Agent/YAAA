@@ -36,3 +36,53 @@ Fall back to Grep/Glob/Read **only** when the graph doesn't cover what you need.
 2. Use `detect_changes` for code review.
 3. Use `get_affected_flows` to understand impact.
 4. Use `query_graph` pattern="tests_for" to check coverage.
+
+## Running the Electron UI (`npm start`)
+
+**Always use `npm start`** (not `npm run dev:electron` or `electron .` directly)
+to boot the app. It runs `scripts/start-ui.sh`, which:
+
+1. `nvm use`s the Node version pinned in `.nvmrc` (20.18.0), if nvm is present.
+2. `npm install`.
+3. Rebuilds `better-sqlite3` for **Electron's** ABI via `electron-rebuild`
+   (`npm run rebuild:electron`), then
+4. runs `npm run dev:ui`.
+
+### Why: the recurring "NODE_MODULE_VERSION mismatch" crash
+
+`better-sqlite3` is a native module. `npm rebuild`/`npm install` compile it
+against whatever `node` binary is currently active — but Electron bundles
+its **own** Node with a different ABI (`NODE_MODULE_VERSION`) than your
+system Node. Whichever one it was last built for, the *other* runtime fails
+with:
+
+```
+The module '.../better_sqlite3.node' was compiled against a different
+Node.js version using NODE_MODULE_VERSION 115. This version of Node.js
+requires NODE_MODULE_VERSION 123.
+```
+
+This isn't a one-time fix — the two runtimes need two different builds of
+the same native module:
+
+- **Electron / `npm start` / `npm run dev:ui`** needs the module built via
+  `npm run rebuild:electron` (wraps `electron-rebuild`). `npm start` does
+  this automatically every time.
+- **vitest / `npm test` / `tsc -b`** run under the system Node and need the
+  module built via plain `npm rebuild better-sqlite3` instead. If tests
+  start throwing the same ABI error after you've run the Electron app,
+  that's why — rebuild it back with `npm rebuild better-sqlite3`.
+
+### Typechecking apps/ui
+
+The root `tsc -b` (and `npm run build`) only typechecks `packages/*` — the
+root `tsconfig.json`'s project references don't include `apps/ui`. Changes
+to `apps/ui` (e.g. `DashboardView.tsx`, `useTaskViewModel.ts`) must be
+separately typechecked with:
+
+```
+cd apps/ui && npx tsc -b
+```
+
+or rely on the `tsc -b -w` watcher that `npm run dev:electron` already runs
+in the background. A clean root `tsc -b` does **not** mean the UI compiles.

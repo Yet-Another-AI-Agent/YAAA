@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, act } from "@testing-library/react";
+import { render, screen, act, fireEvent } from "@testing-library/react";
 import { DashboardView } from "./DashboardView";
 
 vi.mock("../assets/logo.jpg", () => ({ default: "logo.jpg" }));
@@ -11,14 +11,19 @@ const makeViewModel = (overrides = {}) => ({
   taskId: null,
   setTaskId: vi.fn(),
   running: false,
+  awaitingConfirmation: false,
+  agents: [],
   subtasks: [],
   logs: [],
   pendingApproval: null,
   artifacts: [],
   summary: null,
   success: null,
+  channelTopic: null,
   startTask: vi.fn(),
+  confirmPlan: vi.fn(),
   resolveApproval: vi.fn(),
+  deleteTask: vi.fn().mockResolvedValue(undefined),
   tasks: [],
   loadTasks: vi.fn().mockResolvedValue(undefined),
   apiKeyPrompt: null,
@@ -32,6 +37,9 @@ describe("DashboardView", () => {
     (window as any).electronAPI = {
       getYaaaDir: vi.fn().mockResolvedValue("/mock/yaaa"),
       getTaskHistory: vi.fn().mockResolvedValue([]),
+      getOnboardingProfile: vi.fn().mockResolvedValue({ name: "", profession: "", description: "" }),
+      readTaskOrchestrator: vi.fn().mockResolvedValue(null),
+      readArtifact: vi.fn().mockResolvedValue("# Report\n\nAll done."),
     };
   });
 
@@ -114,5 +122,215 @@ describe("DashboardView", () => {
     render(<DashboardView viewModel={makeViewModel({ running: true, taskId: "task-1" })} />);
     const sidebar = screen.getByText("Missions").closest(".dash-sidebar");
     expect(sidebar?.classList.contains("collapsed")).toBe(true);
+  });
+
+  it("deletes a channel from the sidebar after an inline confirm, without opening it", () => {
+    const tasks = [
+      { id: "task-1", prompt: "Test task 1", status: "success", created_at: "2026-07-08T12:00:00Z" }
+    ];
+    const deleteTask = vi.fn().mockResolvedValue(undefined);
+
+    render(<DashboardView viewModel={makeViewModel({ tasks, deleteTask })} />);
+
+    fireEvent.click(screen.getByTitle("Delete chat"));
+    expect(deleteTask).not.toHaveBeenCalled(); // first click only arms the confirm
+
+    fireEvent.click(screen.getByTitle("Confirm delete"));
+    expect(deleteTask).toHaveBeenCalledWith("task-1");
+    // Deleting shouldn't also select/open the channel it was attached to.
+    expect(screen.queryByText(/Yet Another AI Agent/)).toBeTruthy();
+  });
+
+  it("does not delete a channel when the inline confirm is cancelled", () => {
+    const tasks = [
+      { id: "task-1", prompt: "Test task 1", status: "success", created_at: "2026-07-08T12:00:00Z" }
+    ];
+    const deleteTask = vi.fn();
+
+    render(<DashboardView viewModel={makeViewModel({ tasks, deleteTask })} />);
+    fireEvent.click(screen.getByTitle("Delete chat"));
+    fireEvent.click(screen.getByTitle("Cancel"));
+
+    expect(deleteTask).not.toHaveBeenCalled();
+    expect(screen.queryByTitle("Confirm delete")).toBeNull();
+    expect(screen.getByTitle("Delete chat")).toBeTruthy();
+  });
+
+  it("shows Active Integrations derived from the plan's real capabilities, not a fake fixed list", () => {
+    render(<DashboardView viewModel={makeViewModel({
+      taskId: "task-1",
+      subtasks: [
+        { id: "task-1", title: "Write a file", capability: "files", dependsOn: [], riskLevel: "low", successCriteria: "", state: "pending" },
+        { id: "task-2", title: "Verify it", capability: "verify", dependsOn: [], riskLevel: "low", successCriteria: "", state: "pending" },
+      ],
+    })} />);
+
+    expect(screen.getByText("File System")).toBeTruthy();
+    expect(screen.getByText("Verification")).toBeTruthy();
+    expect(screen.queryByText("Slack")).toBeNull();
+    expect(screen.queryByText("GitHub")).toBeNull();
+  });
+
+  it("opens an in-app preview of a Markdown artifact and renders it, without dangerouslySetInnerHTML", async () => {
+    render(<DashboardView viewModel={makeViewModel({
+      taskId: "task-1",
+      artifacts: [{ path: "summary.md", mimeType: "text/markdown", description: "Final report" }],
+    })} />);
+
+    await act(async () => {
+      fireEvent.click(screen.getAllByText("Preview")[0]);
+    });
+
+    expect((window as any).electronAPI.readArtifact).toHaveBeenCalledWith("task-1", "summary.md");
+    expect(screen.getByRole("heading", { name: "Report" })).toBeTruthy();
+    expect(screen.getByText("All done.")).toBeTruthy();
+
+    fireEvent.click(screen.getByLabelText("Close preview"));
+    expect(screen.queryByRole("heading", { name: "Report" })).toBeNull();
+  });
+
+  it("ignores a stale artifact response after a newer preview is requested", async () => {
+    let resolveFirst!: (content: string) => void;
+    let resolveSecond!: (content: string) => void;
+    const first = new Promise<string>((resolve) => { resolveFirst = resolve; });
+    const second = new Promise<string>((resolve) => { resolveSecond = resolve; });
+    (window as any).electronAPI.readArtifact
+      .mockReturnValueOnce(first)
+      .mockReturnValueOnce(second);
+
+    render(<DashboardView viewModel={makeViewModel({
+      taskId: "task-1",
+      artifacts: [
+        { path: "old.md", mimeType: "text/markdown", description: "Old" },
+        { path: "new.md", mimeType: "text/markdown", description: "New" },
+      ],
+    })} />);
+
+    const previewButtons = screen.getAllByText("Preview");
+    fireEvent.click(previewButtons[0]);
+    fireEvent.click(previewButtons[1]);
+
+    await act(async () => resolveSecond("# Current preview"));
+    expect(screen.getByRole("heading", { name: "Current preview" })).toBeTruthy();
+
+    await act(async () => resolveFirst("# Stale preview"));
+    expect(screen.queryByRole("heading", { name: "Stale preview" })).toBeNull();
+    expect(screen.getByRole("heading", { name: "Current preview" })).toBeTruthy();
+  });
+
+  it("does not offer a preview button for non-Markdown artifacts", () => {
+    render(<DashboardView viewModel={makeViewModel({
+      taskId: "task-1",
+      artifacts: [{ path: "deck.pptx", mimeType: "application/vnd.ms-powerpoint", description: "Slides" }],
+    })} />);
+
+    expect(screen.queryByText("Preview")).toBeNull();
+  });
+
+  it("groups artifact tree metadata for plans, handoffs, media, and generated files", () => {
+    render(<DashboardView viewModel={makeViewModel({
+      taskId: "task-1",
+      artifacts: [
+        { path: "plans/IMPLEMENTATION_PLAN.md", mimeType: "text/markdown", description: "Execution blueprint" },
+        { path: "agents/builder/HANDS_ON.md", mimeType: "text/markdown", description: "Agent boundaries" },
+        { path: "agents/builder/HANDS_OFF.md", mimeType: "text/markdown", description: "Completed changes" },
+        { path: "media/demo.mp4", mimeType: "video/mp4", description: "Generated walkthrough" },
+        { path: "exports/results.csv", mimeType: "text/csv", description: "Generated data" },
+      ],
+    })} />);
+
+    expect(screen.getByRole("tree", { name: "Mission artifacts" })).toBeTruthy();
+    expect(screen.getByRole("group", { name: "Plans" })).toBeTruthy();
+    expect(screen.getByRole("group", { name: "Agent handoffs" })).toBeTruthy();
+    expect(screen.getByRole("group", { name: "Generated media" })).toBeTruthy();
+    expect(screen.getByRole("group", { name: "Documents & files" })).toBeTruthy();
+    expect(
+      screen.getByRole("treeitem", { name: "Plans: IMPLEMENTATION_PLAN.md" }).getAttribute(
+        "data-artifact-kind",
+      ),
+    ).toBe("plans");
+    expect(screen.getByText("HANDS ON")).toBeTruthy();
+    expect(screen.getByText("HANDS OFF")).toBeTruthy();
+    expect(screen.getByText("Video")).toBeTruthy();
+    expect(screen.getAllByText("agents / builder")).toHaveLength(2);
+  });
+
+  it("shows an honest empty state for Active Integrations when the plan has no subtasks yet", () => {
+    render(<DashboardView viewModel={makeViewModel({ taskId: "task-1", subtasks: [] })} />);
+    expect(screen.getByText("No capabilities assigned yet.")).toBeTruthy();
+  });
+
+  it("collapses raw system status logs instead of rendering them as chat bubbles", () => {
+    render(<DashboardView viewModel={makeViewModel({
+      taskId: "task-1",
+      logs: [
+        { id: "sys-1", time: "10:00", source: "system", content: 'Submitting task to supervisor: "hi"' },
+        { id: "sys-2", time: "10:00", source: "system", content: "Task initialized. ID: abc-123. Listening to event stream..." },
+      ],
+    })} />);
+
+    expect(screen.getByText("System log (2)")).toBeTruthy();
+    expect(screen.getByText(/Submitting task to supervisor/)).toBeTruthy();
+    // Collapsed by default: no `open` attribute on the <details> block.
+    const block = screen.getByText("System log (2)").closest("details") as HTMLDetailsElement;
+    expect(block.open).toBe(false);
+  });
+
+  it("shows the LLM-generated channel topic instead of the raw task id once available", () => {
+    render(<DashboardView viewModel={makeViewModel({
+      taskId: "task-1",
+      goal: "Analyze the codebase",
+      channelTopic: "codebase-analysis",
+    })} />);
+
+    expect(screen.getByText("codebase-analysis")).toBeTruthy();
+  });
+
+  it("does not contradict the plan-ready banner when a confirmed plan has no subtasks", () => {
+    render(<DashboardView viewModel={makeViewModel({
+      taskId: "task-1",
+      awaitingConfirmation: true,
+      subtasks: [],
+    })} />);
+
+    expect(screen.getByText("This plan has no subtasks to review.")).toBeTruthy();
+  });
+
+  it("shows public join and exit notices in the channel", () => {
+    render(<DashboardView viewModel={makeViewModel({
+      taskId: "task-1",
+      logs: [
+        { id: "join", time: "10:00", source: "system", content: "[agent-lifecycle] 🟢 @sage-1 joined the mission as Researcher." },
+        { id: "exit", time: "10:02", source: "system", content: "[agent-lifecycle] 👋 @sage-1 is done and exited the mission." },
+      ],
+    })} />);
+
+    expect(screen.getAllByRole("status")[0].textContent).toContain("joined the mission");
+    expect(screen.getByText(/done and exited the mission/)).toBeTruthy();
+  });
+
+  it("renders the live mission roster and starts execution details collapsed", () => {
+    render(<DashboardView viewModel={makeViewModel({
+      taskId: "task-1",
+      agents: [{
+        id: "agent-research",
+        handle: "@sage-1",
+        displayName: "Sage",
+        taskId: "task-1",
+        subtaskId: "research",
+        role: "Researcher",
+        modelRole: "fast",
+        status: "working",
+      }],
+      logs: [{ id: "thought", time: "10:00", source: "agent", content: "[@sage-1] inspected the repository" }],
+    })} />);
+
+    expect(screen.getAllByText("@sage-1")).toHaveLength(2);
+    expect(screen.getByLabelText("working")).toBeTruthy();
+
+    fireEvent.click(screen.getByTitle("Agent Space"));
+    const execution = screen.getByTestId("execution-activity") as HTMLDetailsElement;
+    expect(execution.open).toBe(false);
+    expect(screen.getByText(/@sage-1 · Researcher/)).toBeTruthy();
   });
 });

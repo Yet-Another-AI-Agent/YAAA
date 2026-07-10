@@ -4,7 +4,26 @@ import path from "node:path";
 import crypto from "node:crypto";
 import Database from "better-sqlite3";
 import { SqliteStore, MeshGateway } from "@yaaa/providers";
-import { ORCHESTRATOR_MD_HEADERS, type AgentMessage } from "@yaaa/shared";
+import {
+  ORCHESTRATOR_MD_HEADERS,
+  type AgentMessage,
+  type AgentRun,
+  type Conversation,
+  type ConversationAuthorKind,
+  type ConversationMessage,
+  type MentionRoute,
+  type TaskPlan,
+} from "@yaaa/shared";
+import { ConversationCoordinator } from "./conversations.js";
+import {
+  cloneMcpIntegrationDefinition,
+  type McpIntegrationDefinition,
+  type McpIntegrationScope,
+  type McpIntegrationState,
+  type McpIntegrationStateUpdate,
+  type RegisteredMcpIntegration,
+  validateMcpIntegrationDefinition,
+} from "./mcp-integrations.js";
 import { createRuntime } from "./runtime.js";
 import type { RuntimeEvent, TaskRunResult } from "./events.js";
 
@@ -23,6 +42,7 @@ export interface TaskRow {
   status: string;
   path: string;
   created_at: string;
+  topic: string | null;
 }
 
 export interface CreatedTask {
@@ -42,6 +62,13 @@ export interface ResumeProfile {
   description: string;
 }
 
+interface McpIntegrationRow {
+  definition: string;
+  state: string;
+  created_at: string;
+  updated_at: string;
+}
+
 /**
  * Workspace owns all global, app-wide state (config.json + main.db) and the
  * per-task folder lifecycle. It is the single place these stores are touched —
@@ -55,6 +82,9 @@ export interface ResumeProfile {
 export class Workspace {
   private readonly yaaaDir: string;
   private readonly configPath: string;
+  private topicColumnEnsured = false;
+  private readonly deletedTasks = new Set<string>();
+  private readonly activeTaskRuns = new Set<string>();
 
   constructor(yaaaDir?: string) {
     this.yaaaDir =
@@ -91,7 +121,11 @@ export class Workspace {
     });
   }
 
-  getOnboardingStatus(): { hasKey: boolean; hasProfile: boolean; skipped: boolean } {
+  getOnboardingStatus(): {
+    hasKey: boolean;
+    hasProfile: boolean;
+    skipped: boolean;
+  } {
     const c = this.loadConfig();
     return {
       hasKey: !!c.accessToken,
@@ -100,7 +134,11 @@ export class Workspace {
     };
   }
 
-  getOnboardingProfile(): { name: string; profession: string; description: string } {
+  getOnboardingProfile(): {
+    name: string;
+    profession: string;
+    description: string;
+  } {
     const c = this.loadConfig();
     return {
       name: c.userName ?? "",
@@ -125,7 +163,8 @@ export class Workspace {
     const c = this.loadConfig();
     if (profile.name !== undefined) c.userName = profile.name;
     if (profile.profession !== undefined) c.userProfession = profile.profession;
-    if (profile.description !== undefined) c.userDescription = profile.description;
+    if (profile.description !== undefined)
+      c.userDescription = profile.description;
     if (profile.skip) c.skipOnboarding = true;
     this.saveConfig(c);
     return { success: true };
@@ -143,7 +182,29 @@ export class Workspace {
         path TEXT NOT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
+      CREATE TABLE IF NOT EXISTS mcp_integrations (
+        id TEXT NOT NULL,
+        scope TEXT NOT NULL CHECK (scope IN ('global', 'task')),
+        task_id TEXT NOT NULL DEFAULT '',
+        definition TEXT NOT NULL,
+        state TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (scope, task_id, id)
+      );
     `);
+    // Every task-related call opens a fresh connection, so guard the
+    // migration with an instance flag — otherwise this throws-and-catches a
+    // "duplicate column" error on every single query for the process's
+    // lifetime once the column already exists.
+    if (!this.topicColumnEnsured) {
+      try {
+        db.exec("ALTER TABLE tasks ADD COLUMN topic TEXT");
+      } catch {
+        // Column already exists from a previous run.
+      }
+      this.topicColumnEnsured = true;
+    }
     return db;
   }
 
@@ -152,7 +213,7 @@ export class Workspace {
     try {
       return db
         .prepare(
-          "SELECT id, prompt, status, path, created_at FROM tasks ORDER BY created_at DESC",
+          "SELECT id, prompt, status, path, created_at, topic FROM tasks ORDER BY created_at DESC",
         )
         .all() as TaskRow[];
     } finally {
@@ -163,14 +224,272 @@ export class Workspace {
   private updateTaskStatus(taskId: string, status: string): void {
     const db = this.openMainDb();
     try {
-      db.prepare("UPDATE tasks SET status = ? WHERE id = ?").run(status, taskId);
+      db.prepare("UPDATE tasks SET status = ? WHERE id = ?").run(
+        status,
+        taskId,
+      );
     } finally {
       db.close();
     }
   }
 
+  /** Atomically move a reviewed task into running state, even across processes. */
+  private claimTaskForRun(taskId: string): TaskRow {
+    const db = this.openMainDb();
+    try {
+      const task = db
+        .prepare(
+          "SELECT id, prompt, status, path, created_at, topic FROM tasks WHERE id = ?",
+        )
+        .get(taskId) as TaskRow | undefined;
+      if (!task) throw new Error("Task not found.");
+      const claimed = db
+        .prepare(
+          "UPDATE tasks SET status = 'running' WHERE id = ? AND status = 'awaiting_confirmation'",
+        )
+        .run(taskId);
+      if (claimed.changes !== 1) {
+        throw new Error("Task is not awaiting plan confirmation.");
+      }
+      return task;
+    } finally {
+      db.close();
+    }
+  }
+
+  private updateTaskTopic(taskId: string, topic: string): void {
+    const db = this.openMainDb();
+    try {
+      db.prepare("UPDATE tasks SET topic = ? WHERE id = ?").run(topic, taskId);
+    } finally {
+      db.close();
+    }
+  }
+
+  private getTask(taskId: string): TaskRow | null {
+    if (!/^[a-zA-Z0-9-]+$/.test(taskId)) return null;
+    const db = this.openMainDb();
+    try {
+      return (
+        (db
+          .prepare(
+            "SELECT id, prompt, status, path, created_at, topic FROM tasks WHERE id = ?",
+          )
+          .get(taskId) as TaskRow | undefined) ?? null
+      );
+    } finally {
+      db.close();
+    }
+  }
+
+  private requireTask(taskId: string): TaskRow {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    return task;
+  }
+
+  private integrationScopeKey(scope: McpIntegrationScope): {
+    kind: "global" | "task";
+    taskId: string;
+  } {
+    if (scope.kind === "global") return { kind: "global", taskId: "" };
+    this.requireTask(scope.taskId);
+    return { kind: "task", taskId: scope.taskId };
+  }
+
+  private parseMcpIntegration(
+    row: McpIntegrationRow,
+    scope: McpIntegrationScope,
+  ): RegisteredMcpIntegration {
+    const definition: unknown = JSON.parse(row.definition);
+    const state: unknown = JSON.parse(row.state);
+    validateMcpIntegrationDefinition(definition);
+    if (
+      typeof state !== "object" ||
+      state === null ||
+      !("trust" in state) ||
+      !("enabled" in state) ||
+      (state.trust !== "trusted" && state.trust !== "untrusted") ||
+      typeof state.enabled !== "boolean"
+    ) {
+      throw new Error("Stored MCP integration state is invalid.");
+    }
+    return {
+      definition: cloneMcpIntegrationDefinition(definition),
+      scope: scope.kind === "global" ? { kind: "global" } : { ...scope },
+      state: { trust: state.trust, enabled: state.enabled },
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  /** Register metadata in a disabled, untrusted state. No server is installed or started. */
+  registerMcpIntegration(
+    scope: McpIntegrationScope,
+    definition: McpIntegrationDefinition,
+  ): RegisteredMcpIntegration {
+    validateMcpIntegrationDefinition(definition);
+    const key = this.integrationScopeKey(scope);
+    const safeDefinition = cloneMcpIntegrationDefinition(definition);
+    const safeState: McpIntegrationState = {
+      trust: "untrusted",
+      enabled: false,
+    };
+    const now = new Date().toISOString();
+    const db = this.openMainDb();
+    try {
+      db.prepare(
+        `INSERT INTO mcp_integrations
+          (id, scope, task_id, definition, state, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(scope, task_id, id) DO UPDATE SET
+           definition = excluded.definition,
+           state = excluded.state,
+           updated_at = excluded.updated_at`,
+      ).run(
+        safeDefinition.id,
+        key.kind,
+        key.taskId,
+        JSON.stringify(safeDefinition),
+        JSON.stringify(safeState),
+        now,
+        now,
+      );
+      return this.getMcpIntegration(scope, safeDefinition.id)!;
+    } finally {
+      db.close();
+    }
+  }
+
+  listMcpIntegrations(scope: McpIntegrationScope): RegisteredMcpIntegration[] {
+    const key = this.integrationScopeKey(scope);
+    const db = this.openMainDb();
+    try {
+      const rows = db
+        .prepare(
+          `SELECT definition, state, created_at, updated_at
+           FROM mcp_integrations
+           WHERE scope = ? AND task_id = ?
+           ORDER BY id`,
+        )
+        .all(key.kind, key.taskId) as McpIntegrationRow[];
+      return rows.map((row) => this.parseMcpIntegration(row, scope));
+    } finally {
+      db.close();
+    }
+  }
+
+  getMcpIntegration(
+    scope: McpIntegrationScope,
+    integrationId: string,
+  ): RegisteredMcpIntegration | null {
+    const key = this.integrationScopeKey(scope);
+    const db = this.openMainDb();
+    try {
+      const row = db
+        .prepare(
+          `SELECT definition, state, created_at, updated_at
+           FROM mcp_integrations
+           WHERE scope = ? AND task_id = ? AND id = ?`,
+        )
+        .get(key.kind, key.taskId, integrationId) as
+        | McpIntegrationRow
+        | undefined;
+      return row ? this.parseMcpIntegration(row, scope) : null;
+    } finally {
+      db.close();
+    }
+  }
+
+  updateMcpIntegrationState(
+    scope: McpIntegrationScope,
+    integrationId: string,
+    update: McpIntegrationStateUpdate,
+  ): RegisteredMcpIntegration {
+    const existing = this.getMcpIntegration(scope, integrationId);
+    if (!existing) throw new Error("MCP integration not found.");
+    const state: McpIntegrationState = {
+      trust: update.trust ?? existing.state.trust,
+      enabled: update.enabled ?? existing.state.enabled,
+    };
+    if (state.enabled && state.trust !== "trusted") {
+      throw new Error(
+        "An MCP integration must be trusted before it can be enabled.",
+      );
+    }
+    const key = this.integrationScopeKey(scope);
+    const db = this.openMainDb();
+    try {
+      db.prepare(
+        `UPDATE mcp_integrations SET state = ?, updated_at = ?
+         WHERE scope = ? AND task_id = ? AND id = ?`,
+      ).run(
+        JSON.stringify(state),
+        new Date().toISOString(),
+        key.kind,
+        key.taskId,
+        integrationId,
+      );
+    } finally {
+      db.close();
+    }
+    return this.getMcpIntegration(scope, integrationId)!;
+  }
+
+  removeMcpIntegration(
+    scope: McpIntegrationScope,
+    integrationId: string,
+  ): boolean {
+    const key = this.integrationScopeKey(scope);
+    const db = this.openMainDb();
+    try {
+      return (
+        db
+          .prepare(
+            "DELETE FROM mcp_integrations WHERE scope = ? AND task_id = ? AND id = ?",
+          )
+          .run(key.kind, key.taskId, integrationId).changes === 1
+      );
+    } finally {
+      db.close();
+    }
+  }
+
+  /**
+   * Permanently purge a mission: remove its row from main.db and delete its
+   * on-disk task directory (per-task SQLite databases, orchestrator.md,
+   * working files). Safe to call on a task that is still running — the
+   * caller is responsible for detaching its event stream first since this
+   * does not abort in-flight agent work, only its persisted state.
+   */
+  deleteTask(taskId: string): void {
+    const task = this.requireTask(taskId);
+    this.deletedTasks.add(taskId);
+    const db = this.openMainDb();
+    try {
+      db.prepare(
+        "DELETE FROM mcp_integrations WHERE scope = 'task' AND task_id = ?",
+      ).run(taskId);
+      db.prepare("DELETE FROM tasks WHERE id = ?").run(taskId);
+    } finally {
+      db.close();
+    }
+    fs.rmSync(task.path, { recursive: true, force: true });
+  }
+
+  private async withConversationCoordinator<T>(
+    operation: (conversations: ConversationCoordinator) => Promise<T>,
+  ): Promise<T> {
+    const store = new SqliteStore(this.tasksDir);
+    try {
+      return await operation(new ConversationCoordinator(store));
+    } finally {
+      store.closeAll();
+    }
+  }
+
   async getTaskHistory(taskId: string): Promise<AgentMessage[]> {
-    if (!/^[a-zA-Z0-9-]+$/.test(taskId)) return [];
+    this.requireTask(taskId);
     const store = new SqliteStore(this.tasksDir);
     try {
       return await store.getMessages(taskId);
@@ -179,12 +498,100 @@ export class Workspace {
     }
   }
 
+  async getTaskAgents(taskId: string): Promise<AgentRun[]> {
+    this.requireTask(taskId);
+    const store = new SqliteStore(this.tasksDir);
+    try {
+      return await store.getAgents(taskId);
+    } finally {
+      store.closeAll();
+    }
+  }
+
+  async createPublicConversation(
+    taskId: string,
+    title?: string,
+  ): Promise<Conversation> {
+    this.requireTask(taskId);
+    return this.withConversationCoordinator((conversations) =>
+      conversations.createPublicConversation({ taskId, title }),
+    );
+  }
+
+  async getOrCreateAgentThread(
+    taskId: string,
+    agentId: string,
+  ): Promise<Conversation> {
+    this.requireTask(taskId);
+    const agents = await this.getTaskAgents(taskId);
+    const agent = agents.find((candidate) => candidate.id === agentId);
+    if (!agent) throw new Error("Agent not found for this mission.");
+    return this.withConversationCoordinator((conversations) =>
+      conversations.getOrCreateAgentThread(taskId, agent),
+    );
+  }
+
+  async getTaskConversations(taskId: string): Promise<Conversation[]> {
+    this.requireTask(taskId);
+    return this.withConversationCoordinator((conversations) =>
+      conversations.listConversations(taskId),
+    );
+  }
+
+  async getConversationMessages(
+    taskId: string,
+    conversationId: string,
+  ): Promise<ConversationMessage[]> {
+    this.requireTask(taskId);
+    return this.withConversationCoordinator((conversations) =>
+      conversations.listMessages(taskId, conversationId),
+    );
+  }
+
+  async postConversationMessage(input: {
+    taskId: string;
+    conversationId: string;
+    authorId: string;
+    authorKind: ConversationAuthorKind;
+    content: string;
+  }): Promise<{ message: ConversationMessage; routes: MentionRoute[] }> {
+    this.requireTask(input.taskId);
+    return this.withConversationCoordinator((conversations) =>
+      conversations.postMessage(input),
+    );
+  }
+
   readOrchestrator(taskId: string): string | null {
     if (!/^[a-zA-Z0-9-]+$/.test(taskId)) return null;
-    const mdPath = path.resolve(path.join(this.tasksDir, taskId, "orchestrator.md"));
+    const mdPath = path.resolve(
+      path.join(this.tasksDir, taskId, "orchestrator.md"),
+    );
     if (!mdPath.startsWith(path.resolve(this.tasksDir))) return null;
     try {
       return fs.existsSync(mdPath) ? fs.readFileSync(mdPath, "utf-8") : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Read a generated artifact's text content for in-app preview (Markdown/plaintext only). */
+  readArtifact(taskId: string, artifactPath: string): string | null {
+    if (!this.getTask(taskId)) return null;
+    try {
+      const workingDir = fs.realpathSync(
+        path.join(this.tasksDir, taskId, "working"),
+      );
+      const filePath = fs.realpathSync(path.resolve(workingDir, artifactPath));
+      const relativePath = path.relative(workingDir, filePath);
+      if (
+        relativePath === "" ||
+        relativePath.startsWith(`..${path.sep}`) ||
+        path.isAbsolute(relativePath)
+      ) {
+        return null;
+      }
+      if (!fs.statSync(filePath).isFile()) return null;
+      return fs.readFileSync(filePath, "utf-8");
     } catch {
       return null;
     }
@@ -218,18 +625,154 @@ export class Workspace {
       JSON.stringify(config.preferredModels ?? {}, null, 2),
       "utf-8",
     );
-    fs.writeFileSync(path.join(taskDir, "agents"), JSON.stringify([], null, 2), "utf-8");
+    fs.writeFileSync(
+      path.join(taskDir, "agents"),
+      JSON.stringify([], null, 2),
+      "utf-8",
+    );
 
     const db = this.openMainDb();
     try {
       db.prepare(
         "INSERT INTO tasks (id, prompt, status, path) VALUES (?, ?, ?, ?)",
-      ).run(taskId, goal, "running", taskDir);
+      ).run(taskId, goal, "planning", taskDir);
     } finally {
       db.close();
     }
 
     return { taskId, taskDir, workingDir };
+  }
+
+  /**
+   * Ask the utility model for a short, human-readable channel topic and
+   * persist it once ready. Runs in the background alongside planning — a slow
+   * or failed call must never delay or block the plan the user is waiting on.
+   */
+  private requestTopicGeneration(
+    goal: string,
+    taskId: string,
+    config: AppConfig,
+    onEvent?: (event: RuntimeEvent) => void,
+  ): void {
+    const gateway = new MeshGateway({
+      apiKey: config.accessToken ?? process.env.MESH_API_KEY ?? undefined,
+      modelMapping: config.preferredModels as any,
+    });
+    gateway
+      .chat(
+        [
+          {
+            role: "system",
+            content:
+              "Generate a short channel topic slug (2-4 words, lowercase, hyphen-separated, no punctuation) that summarizes this request. Respond with ONLY the slug, nothing else.",
+          },
+          { role: "user", content: goal },
+        ],
+        { modelRole: "utility", temperature: 0.3 },
+      )
+      .then((raw) => {
+        if (this.deletedTasks.has(taskId)) return;
+        const topic = this.sanitizeTopic(raw);
+        if (!topic) return;
+        this.updateTaskTopic(taskId, topic);
+        onEvent?.({ type: "topic-updated", taskId, topic });
+      })
+      .catch(() => {
+        // Best-effort: the raw-slug channel name remains as a fallback.
+      });
+  }
+
+  private sanitizeTopic(raw: string): string {
+    return raw
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, "")
+      .trim()
+      .replace(/\s+/g, "-")
+      .split("-")
+      .filter(Boolean)
+      .slice(0, 4)
+      .join("-")
+      .substring(0, 40);
+  }
+
+  /** Generate the plan and leave this task waiting for a user decision. */
+  async prepareTask(
+    goal: string,
+    task: CreatedTask,
+    hooks: RunTaskHooks = {},
+  ): Promise<TaskPlan> {
+    const config = this.loadConfig();
+    const runtime = createRuntime({
+      taskId: task.taskId,
+      tasksBaseDir: this.tasksDir,
+      workingDir: task.workingDir,
+      apiKey: config.accessToken ?? process.env.MESH_API_KEY ?? undefined,
+      modelMapping: config.preferredModels ?? undefined,
+      onEvent: (event) => {
+        if (!this.deletedTasks.has(task.taskId)) hooks.onEvent?.(event);
+      },
+      onApproval: hooks.onApproval
+        ? (agentId, call) =>
+            this.deletedTasks.has(task.taskId)
+              ? Promise.resolve(false)
+              : hooks.onApproval!(agentId, call)
+        : undefined,
+      isCancelled: () => this.deletedTasks.has(task.taskId),
+    });
+
+    this.requestTopicGeneration(goal, task.taskId, config, hooks.onEvent);
+
+    try {
+      const plan = await runtime.plan(goal);
+      if (this.deletedTasks.has(task.taskId))
+        throw new Error("Task was deleted.");
+      this.updateTaskStatus(task.taskId, "awaiting_confirmation");
+      this.writeOrchestratorMd(
+        task.taskDir,
+        task.taskId,
+        goal,
+        "awaiting_confirmation",
+        plan,
+        [],
+      );
+      return plan;
+    } catch (err) {
+      if (!this.deletedTasks.has(task.taskId)) {
+        this.updateTaskStatus(task.taskId, "failed");
+      }
+      throw err;
+    } finally {
+      runtime.dispose();
+      if (this.deletedTasks.has(task.taskId)) {
+        fs.rmSync(task.taskDir, { recursive: true, force: true });
+      }
+    }
+  }
+
+  /** Start a prepared plan only after an explicit user confirmation. */
+  async confirmTask(
+    taskId: string,
+    hooks: RunTaskHooks = {},
+  ): Promise<TaskRunResult> {
+    const row = this.claimTaskForRun(taskId);
+
+    const store = new SqliteStore(this.tasksDir);
+    let plan: TaskPlan | null;
+    try {
+      plan = await store.getPlan(taskId);
+    } finally {
+      store.closeAll();
+    }
+    if (!plan) {
+      this.updateTaskStatus(taskId, "failed");
+      throw new Error("Task plan is missing; create a new mission instead.");
+    }
+    return this.runTask(
+      row.prompt,
+      { taskId, taskDir: row.path, workingDir: path.join(row.path, "working") },
+      hooks,
+      plan,
+    );
   }
 
   /**
@@ -240,8 +783,13 @@ export class Workspace {
     goal: string,
     task: CreatedTask,
     hooks: RunTaskHooks = {},
+    preparedPlan?: TaskPlan,
   ): Promise<TaskRunResult> {
     const { taskId, taskDir, workingDir } = task;
+    if (this.deletedTasks.has(taskId)) throw new Error("Task was deleted.");
+    if (this.activeTaskRuns.has(taskId))
+      throw new Error("Task is already running.");
+    this.activeTaskRuns.add(taskId);
     const config = this.loadConfig();
 
     const runtime = createRuntime({
@@ -250,14 +798,26 @@ export class Workspace {
       workingDir,
       apiKey: config.accessToken ?? process.env.MESH_API_KEY ?? undefined,
       modelMapping: config.preferredModels ?? undefined,
-      onEvent: hooks.onEvent,
-      onApproval: hooks.onApproval,
+      onEvent: (event) => {
+        if (!this.deletedTasks.has(taskId)) hooks.onEvent?.(event);
+      },
+      onApproval: hooks.onApproval
+        ? (agentId, call) =>
+            this.deletedTasks.has(taskId)
+              ? Promise.resolve(false)
+              : hooks.onApproval!(agentId, call)
+        : undefined,
+      isCancelled: () => this.deletedTasks.has(taskId),
     });
 
     try {
-      const result = await runtime.run(goal);
+      const result = preparedPlan
+        ? await runtime.runPlan(preparedPlan)
+        : await runtime.run(goal);
+      if (this.deletedTasks.has(taskId)) throw new Error("Task was deleted.");
       this.updateTaskStatus(taskId, result.success ? "success" : "failed");
       const ledger = await runtime.store.getLedgerEntries(taskId);
+      if (this.deletedTasks.has(taskId)) throw new Error("Task was deleted.");
       this.writeOrchestratorMd(
         taskDir,
         taskId,
@@ -267,6 +827,7 @@ export class Workspace {
         ledger,
       );
       const messages = await runtime.store.getMessages(taskId);
+      if (this.deletedTasks.has(taskId)) throw new Error("Task was deleted.");
       const agents = Array.from(
         new Set(
           messages
@@ -281,17 +842,29 @@ export class Workspace {
       );
       return result;
     } catch (err) {
+      if (this.deletedTasks.has(taskId)) throw err;
       this.updateTaskStatus(taskId, "failed");
       try {
         const finalPlan = await runtime.store.getPlan(taskId);
         const ledger = await runtime.store.getLedgerEntries(taskId);
-        this.writeOrchestratorMd(taskDir, taskId, goal, "failed", finalPlan, ledger);
+        this.writeOrchestratorMd(
+          taskDir,
+          taskId,
+          goal,
+          "failed",
+          finalPlan,
+          ledger,
+        );
       } catch {
         /* best-effort */
       }
       throw err;
     } finally {
       runtime.dispose();
+      this.activeTaskRuns.delete(taskId);
+      if (this.deletedTasks.has(taskId)) {
+        fs.rmSync(taskDir, { recursive: true, force: true });
+      }
     }
   }
 

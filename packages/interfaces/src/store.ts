@@ -1,4 +1,11 @@
-import type { AgentMessage, TaskPlan, LedgerEntry } from "@yaaa/shared";
+import type {
+  AgentMessage,
+  AgentRun,
+  Conversation,
+  ConversationMessage,
+  LedgerEntry,
+  TaskPlan,
+} from "@yaaa/shared";
 
 export interface IStore {
   initTaskDb(taskId: string): Promise<void>;
@@ -14,4 +21,18 @@ export interface IStore {
   
   saveAuditLog(taskId: string, log: { action: string; details: string; approvedBy?: string }): Promise<void>;
   getAuditLogs(taskId: string): Promise<any[]>;
+
+  saveAgent(taskId: string, agent: AgentRun): Promise<void>;
+  getAgents(taskId: string): Promise<AgentRun[]>;
+
+}
+
+/** Optional persistence capability used by the multi-agent conversation layer. */
+export interface IConversationStore extends IStore {
+  saveConversation(taskId: string, conversation: Conversation): Promise<void>;
+  getConversation(taskId: string, conversationId: string): Promise<Conversation | null>;
+  getConversations(taskId: string): Promise<Conversation[]>;
+
+  saveConversationMessage(taskId: string, message: ConversationMessage): Promise<void>;
+  getConversationMessages(taskId: string, conversationId: string): Promise<ConversationMessage[]>;
 }

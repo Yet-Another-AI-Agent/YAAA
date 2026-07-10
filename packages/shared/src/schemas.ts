@@ -6,6 +6,42 @@ export const ArtifactRefSchema = z.object({
   description: z.string(),
 });
 
+export const ConversationSchema = z.object({
+  id: z.string().min(1),
+  taskId: z.string().min(1),
+  kind: z.enum(["public", "agent_thread"]),
+  title: z.string().min(1),
+  participantIds: z.array(z.string().min(1)),
+  agentId: z.string().min(1).optional(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+  archivedAt: z.string().datetime().optional(),
+}).superRefine((conversation, context) => {
+  if (conversation.kind === "agent_thread" && !conversation.agentId) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "Agent threads require an agentId." });
+  }
+  if (conversation.kind === "public" && conversation.agentId) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "Public conversations cannot target one agent." });
+  }
+});
+
+export const MentionSchema = z.object({
+  handle: z.string().regex(/^@[a-z0-9][a-z0-9_-]*$/i),
+  recipientId: z.string().min(1),
+  recipientKind: z.enum(["orchestrator", "agent"]),
+});
+
+export const ConversationMessageSchema = z.object({
+  id: z.string().min(1),
+  taskId: z.string().min(1),
+  conversationId: z.string().min(1),
+  authorId: z.string().min(1),
+  authorKind: z.enum(["user", "orchestrator", "agent", "system"]),
+  content: z.string().min(1),
+  mentions: z.array(MentionSchema),
+  createdAt: z.string().datetime(),
+});
+
 export const SubtaskSchema = z.object({
   id: z.string(),
   title: z.string(),

@@ -27,6 +27,8 @@ describe("Synthesizer", () => {
       getLedgerEntries: vi.fn().mockResolvedValue([]),
       saveAuditLog: vi.fn(),
       getAuditLogs: vi.fn(),
+      saveAgent: vi.fn(),
+      getAgents: vi.fn(),
     };
 
     container.register("IMeshGateway", mockGateway);

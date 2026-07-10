@@ -4,6 +4,67 @@ export interface ArtifactRef {
   description: string;
 }
 
+export type AgentRunStatus = "planned" | "working" | "blocked" | "completed" | "failed" | "exited";
+
+/** A durable, user-addressable agent assignment within a mission. */
+export interface AgentRun {
+  id: string;
+  handle: string;
+  displayName: string;
+  taskId: string;
+  subtaskId: string;
+  role: string;
+  modelRole: string;
+  status: AgentRunStatus;
+  startedAt?: string;
+  finishedAt?: string;
+  summary?: string;
+}
+
+/** A durable discussion space inside a mission. */
+export interface Conversation {
+  id: string;
+  taskId: string;
+  /** `public` is visible to the whole mission; agent threads are scoped to an agent. */
+  kind: "public" | "agent_thread";
+  title: string;
+  participantIds: string[];
+  agentId?: string;
+  createdAt: string;
+  updatedAt: string;
+  archivedAt?: string;
+}
+
+export type ConversationAuthorKind = "user" | "orchestrator" | "agent" | "system";
+
+export interface Mention {
+  /** The exact, canonical handle that appeared in the message, for example `@sage-1`. */
+  handle: string;
+  recipientId: string;
+  recipientKind: "orchestrator" | "agent";
+}
+
+/** A durable message shown in a public conversation or a private agent thread. */
+export interface ConversationMessage {
+  id: string;
+  taskId: string;
+  conversationId: string;
+  authorId: string;
+  authorKind: ConversationAuthorKind;
+  content: string;
+  mentions: Mention[];
+  createdAt: string;
+}
+
+/** The routing result produced when a message contains one or more @mentions. */
+export interface MentionRoute {
+  conversationId: string;
+  messageId: string;
+  recipientId: string;
+  recipientKind: "orchestrator" | "agent";
+  handle: string;
+}
+
 export interface TaskPlan {
   goal: string;
   subtasks: Subtask[];

@@ -53,6 +53,23 @@ describe("mapBusEvent", () => {
     });
   });
 
+  it("maps durable agent lifecycle records", () => {
+    const agent = {
+      id: "files-agent-1",
+      handle: "@sage-1",
+      displayName: "Sage",
+      taskId: TASK,
+      subtaskId: "write",
+      role: "FilesAgent",
+      modelRole: "worker",
+      status: "working" as const,
+    };
+    expect(mapBusEvent(TASK, `task.${TASK}.agent.files-agent-1.lifecycle`, agent)).toEqual({
+      type: "agent-status",
+      agent,
+    });
+  });
+
   it("maps started/completed to status events", () => {
     expect(mapBusEvent(TASK, `task.${TASK}.started`, { from: "sys", note: "go" })).toEqual({
       type: "status",
@@ -67,5 +84,45 @@ describe("mapBusEvent", () => {
   it("returns null for unrelated topics", () => {
     expect(mapBusEvent(TASK, `task.${TASK}.unknown`, {})).toBeNull();
     expect(mapBusEvent(TASK, `task.other.plan_updated`, {})).toBeNull();
+  });
+
+  it("uses safe defaults for sparse frontend-facing payloads", () => {
+    expect(
+      mapBusEvent(TASK, `task.${TASK}.agent_message`, {
+        kind: "result",
+        from: "agent-1",
+        summary: "done",
+      }),
+    ).toEqual({ type: "result", from: "agent-1", summary: "done", artifacts: [] });
+
+    expect(mapBusEvent(TASK, `task.${TASK}.started`, null)).toEqual({
+      type: "status",
+      from: "system",
+      note: "",
+    });
+    expect(mapBusEvent(TASK, `task.${TASK}.completed`, null)).toEqual({
+      type: "status",
+      from: "orchestrator",
+      note: "",
+    });
+
+    expect(mapBusEvent(TASK, `task.${TASK}.agent.worker.thought`, { from: "fallback" })).toEqual({
+      type: "thought",
+      from: "fallback",
+      content: "",
+    });
+    expect(mapBusEvent(TASK, `task.${TASK}.agent.worker.thought`, {})).toEqual({
+      type: "thought",
+      from: "agent",
+      content: "",
+    });
+    expect(
+      mapBusEvent(TASK, `task.${TASK}.agent.worker.tool_requested`, { from: "fallback" }),
+    ).toEqual({ type: "tool-requested", from: "fallback", content: "" });
+    expect(mapBusEvent(TASK, `task.${TASK}.agent.worker.tool_requested`, {})).toEqual({
+      type: "tool-requested",
+      from: "agent",
+      content: "",
+    });
   });
 });

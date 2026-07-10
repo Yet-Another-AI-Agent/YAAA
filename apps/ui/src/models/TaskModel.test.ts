@@ -35,6 +35,16 @@ describe("TaskModel", () => {
     });
   });
 
+  describe("confirmTask()", () => {
+    it("asks Electron to start the reviewed mission", async () => {
+      const confirmTask = vi.fn().mockResolvedValue({ status: "started" });
+      (window as any).electronAPI = { confirmTask };
+
+      await expect(TaskModel.confirmTask("task-123")).resolves.toEqual({ status: "started" });
+      expect(confirmTask).toHaveBeenCalledWith("task-123");
+    });
+  });
+
   describe("resolveApproval()", () => {
     it("calls electronAPI.resolveApproval with callId and approved=true", async () => {
       const resolveApproval = vi.fn().mockResolvedValue({ ok: true });
@@ -73,6 +83,30 @@ describe("TaskModel", () => {
     });
   });
 
+  describe("deleteTask()", () => {
+    it("calls electronAPI.deleteTask with the task id", async () => {
+      const deleteTaskMock = vi.fn().mockResolvedValue({ status: "deleted" });
+      (window as any).electronAPI = { deleteTask: deleteTaskMock };
+
+      const result = await TaskModel.deleteTask("task-1");
+
+      expect(deleteTaskMock).toHaveBeenCalledWith("task-1");
+      expect(result).toEqual({ status: "deleted" });
+    });
+  });
+
+  describe("readArtifact()", () => {
+    it("calls electronAPI.readArtifact with the task id and artifact path", async () => {
+      const readArtifactMock = vi.fn().mockResolvedValue("# Hello");
+      (window as any).electronAPI = { readArtifact: readArtifactMock };
+
+      const result = await TaskModel.readArtifact("task-1", "summary.md");
+
+      expect(readArtifactMock).toHaveBeenCalledWith("task-1", "summary.md");
+      expect(result).toBe("# Hello");
+    });
+  });
+
   describe("readTaskOrchestrator()", () => {
     it("calls electronAPI.readTaskOrchestrator with the taskId", async () => {
       const readTaskOrchestratorMock = vi.fn().mockResolvedValue("# Plan\n");
@@ -97,6 +131,48 @@ describe("TaskModel", () => {
       expect(getTaskHistoryMock).toHaveBeenCalledOnce();
       expect(getTaskHistoryMock).toHaveBeenCalledWith("task-xyz");
       expect(result).toEqual(fakeMessages);
+    });
+  });
+
+  describe("getTaskAgents()", () => {
+    it("retrieves durable named-agent lifecycle records", async () => {
+      const agents = [{ id: "agent-1", handle: "@sage-1", status: "working" }];
+      const getTaskAgents = vi.fn().mockResolvedValue(agents);
+      (window as any).electronAPI = { getTaskAgents };
+
+      await expect(TaskModel.getTaskAgents("task-xyz")).resolves.toEqual(agents);
+      expect(getTaskAgents).toHaveBeenCalledWith("task-xyz");
+    });
+  });
+
+  describe("conversation methods", () => {
+    it("uses the IPC conversation surface", async () => {
+      const createPublicConversation = vi.fn().mockResolvedValue({ id: "public" });
+      const getTaskConversations = vi.fn().mockResolvedValue([]);
+      const getConversationMessages = vi.fn().mockResolvedValue([]);
+      const postConversationMessage = vi.fn().mockResolvedValue({ message: {}, routes: [] });
+      (window as any).electronAPI = {
+        createPublicConversation,
+        getTaskConversations,
+        getConversationMessages,
+        postConversationMessage,
+      };
+
+      await TaskModel.createPublicConversation("task-1", "Mission chat");
+      await TaskModel.getTaskConversations("task-1");
+      await TaskModel.getConversationMessages("task-1", "public");
+      await TaskModel.postConversationMessage({
+        taskId: "task-1",
+        conversationId: "public",
+        authorId: "user",
+        authorKind: "user",
+        content: "@orchestrator hello",
+      });
+
+      expect(createPublicConversation).toHaveBeenCalledWith("task-1", "Mission chat");
+      expect(getTaskConversations).toHaveBeenCalledWith("task-1");
+      expect(getConversationMessages).toHaveBeenCalledWith("task-1", "public");
+      expect(postConversationMessage).toHaveBeenCalledOnce();
     });
   });
 

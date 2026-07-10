@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import type { IBus, IStore } from "@yaaa/interfaces";
 import { container } from "@yaaa/platform";
 import { OuterLoop } from "@yaaa/agents";
+import type { TaskPlan } from "@yaaa/shared";
 import { Planner } from "./planner.js";
 import { Synthesizer } from "./synthesizer.js";
 
@@ -20,15 +21,14 @@ export class Supervisor {
     this.store = container.resolve<IStore>("IStore");
   }
 
-  async runTask(goal: string, taskId?: string): Promise<{ success: boolean; summary: string; plan: any }> {
+  /** Generate a durable plan without permitting agent execution. */
+  async createPlan(goal: string, taskId?: string): Promise<TaskPlan> {
     const activeTaskId = taskId || crypto.randomUUID();
     await this.store.initTaskDb(activeTaskId);
 
-    // 1. Generate plan
     console.log(`[Orchestrator] Generating plan for goal: "${goal}"`);
     const plan = await this.planner.plan(goal, activeTaskId);
-    
-    // Log plan generated
+    await this.store.savePlan(activeTaskId, plan);
     await this.bus.publish( `task.${activeTaskId}.plan_updated`, plan);
 
     console.log("\n[Orchestrator] Task Plan Generated:");
@@ -37,7 +37,14 @@ export class Supervisor {
     }
     console.log("");
 
-    // 2. Run execution
+    return plan;
+  }
+
+  /** Execute a plan only after the caller has approved it. */
+  async runPlan(plan: TaskPlan, taskId?: string): Promise<{ success: boolean; summary: string; plan: TaskPlan }> {
+    const activeTaskId = taskId || crypto.randomUUID();
+    await this.store.initTaskDb(activeTaskId);
+
     try {
       await this.outerLoop.run(activeTaskId, plan);
       
@@ -75,5 +82,11 @@ export class Supervisor {
         plan,
       };
     }
+  }
+
+  /** Backwards-compatible one-shot lifecycle for non-interactive clients. */
+  async runTask(goal: string, taskId?: string): Promise<{ success: boolean; summary: string; plan: TaskPlan }> {
+    const plan = await this.createPlan(goal, taskId);
+    return this.runPlan(plan, taskId);
   }
 }
