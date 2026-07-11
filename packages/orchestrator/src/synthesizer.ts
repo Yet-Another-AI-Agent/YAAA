@@ -48,7 +48,7 @@ ${artifactsSummary}
 Evaluate and return the verification JSON.
 `;
 
-    const response = await this.gateway.chat(
+    const responseRes = await this.gateway.chat(
       [
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt }
@@ -58,6 +58,7 @@ Evaluate and return the verification JSON.
         temperature: 0.1,
       }
     );
+    const response = responseRes.content;
 
     try {
       const jsonMatch = response.match(/```json\s*([\s\S]*?)\s*```/) || response.match(/\{[\s\S]*\}/);

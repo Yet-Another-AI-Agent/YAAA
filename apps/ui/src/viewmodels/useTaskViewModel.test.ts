@@ -17,16 +17,12 @@ vi.mock("../models/TaskModel", () => ({
   },
 }));
 
-describe("useTaskViewModel — conversational NLP gate", () => {
+describe("useTaskViewModel — unified chat onboarding", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it("answers small talk in #general without starting a task", async () => {
-    vi.mocked(TaskModel.routeUserMessage).mockResolvedValueOnce({
-      kind: "conversation",
-      reply: "Hello! What are we building or working on today?",
-    });
+  it("creates a task channel immediately even for small talk/greetings", async () => {
     const { result } = renderHook(() => useTaskViewModel());
 
     act(() => {
@@ -36,22 +32,13 @@ describe("useTaskViewModel — conversational NLP gate", () => {
       await result.current.startTask();
     });
 
-    expect(TaskModel.routeUserMessage).toHaveBeenCalledWith("hi");
-    expect(TaskModel.startTask).not.toHaveBeenCalled();
-    expect(result.current.taskId).toBeNull();
-    expect(result.current.running).toBe(false);
-    expect(result.current.chatMessages).toEqual([
-      expect.objectContaining({ sender: "User", content: "hi" }),
-      expect.objectContaining({
-        sender: "YAAA",
-        content: "Hello! What are we building or working on today?",
-      }),
-    ]);
-    // Input clears so the user can keep chatting.
+    expect(TaskModel.startTask).toHaveBeenCalledWith("hi");
+    expect(result.current.taskId).toBe("task-123");
+    expect(result.current.running).toBe(true);
     expect(result.current.goal).toBe("");
   });
 
-  it("starts a task when the router classifies the message as work", async () => {
+  it("starts a task and clears composer on send", async () => {
     const { result } = renderHook(() => useTaskViewModel());
 
     act(() => {
@@ -63,50 +50,8 @@ describe("useTaskViewModel — conversational NLP gate", () => {
 
     expect(TaskModel.startTask).toHaveBeenCalledWith("Build a landing page");
     expect(result.current.taskId).toBe("task-123");
-    expect(result.current.chatMessages).toEqual([]);
-    // The composer clears on send (the message must not stay in the box), and
-    // the submitted prompt is retained for the task view.
     expect(result.current.goal).toBe("");
     expect(result.current.submittedPrompt).toBe("Build a landing page");
-  });
-
-  it("still starts the task when the intent router itself fails", async () => {
-    vi.mocked(TaskModel.routeUserMessage).mockRejectedValueOnce(
-      new Error("router down"),
-    );
-    const { result } = renderHook(() => useTaskViewModel());
-
-    act(() => {
-      result.current.setGoal("Fix the login bug");
-    });
-    await act(async () => {
-      await result.current.startTask();
-    });
-
-    expect(TaskModel.startTask).toHaveBeenCalledWith("Fix the login bug");
-    expect(result.current.taskId).toBe("task-123");
-  });
-
-  it("keeps prior conversation turns when the user keeps chatting", async () => {
-    vi.mocked(TaskModel.routeUserMessage)
-      .mockResolvedValueOnce({ kind: "conversation", reply: "Hello!" })
-      .mockResolvedValueOnce({
-        kind: "conversation",
-        reply: "I'm great — you?",
-      });
-    const { result } = renderHook(() => useTaskViewModel());
-
-    act(() => result.current.setGoal("hi"));
-    await act(async () => {
-      await result.current.startTask();
-    });
-    act(() => result.current.setGoal("how are you"));
-    await act(async () => {
-      await result.current.startTask();
-    });
-
-    expect(result.current.chatMessages).toHaveLength(4);
-    expect(TaskModel.startTask).not.toHaveBeenCalled();
   });
 });
 

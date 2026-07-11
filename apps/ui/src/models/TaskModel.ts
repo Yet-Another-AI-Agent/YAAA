@@ -97,6 +97,7 @@ export class TaskModel {
     return this.getElectronAPI().confirmTask(taskId);
   }
 
+
   static async resolveApproval(
     callId: string,
     approved: boolean,

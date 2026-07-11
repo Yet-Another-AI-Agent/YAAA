@@ -1,4 +1,4 @@
-import type { IMeshGateway, IBus, ChatMessage } from "@yaaa/interfaces";
+import type { IMeshGateway, IBus, ChatMessage, ToolDefinition } from "@yaaa/interfaces";
 import { container, type Container, PermissionEngine, pauseController } from "@yaaa/platform";
 import {
   type AgentMessage,
@@ -10,16 +10,10 @@ import {
   middleBand,
 } from "@yaaa/shared";
 import { AGENT_REGISTRY, type AgentTemplate } from "../registry.js";
+import { StateGraph, START, END, MemorySaver } from "@langchain/langgraph";
+import { AgentState, type AgentStateType } from "./graph-state.js";
 
-/**
- * Once the tool-result-cleared prompt is over the summary threshold we roll the
- * middle band into an LLM summary. To avoid paying for a utility-model call on
- * every subsequent turn, we only *re*-summarize once the cleared prompt has
- * grown at least this many chars beyond the size it had at the last summary.
- */
 const SUMMARY_REFRESH_CHARS = 12000;
-
-/** System prompt for the cheap "utility" model that compresses the middle band. */
 const SUMMARY_SYSTEM_PROMPT =
   "You are a summarization assistant for an autonomous agent's working memory. " +
   "Compress the provided transcript into a terse note capturing the key decisions, " +
@@ -35,6 +29,57 @@ export interface WorkerOptions {
   contextArtifacts?: string[];
   maxTurns?: number;
 }
+
+const CAPABILITY_TOOL_DEFINITIONS: Record<string, ToolDefinition[]> = {
+  files: [
+    {
+      name: "files:readFile",
+      description: "Read the complete text contents of a file in the workspace.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Absolute or relative path to the file." },
+        },
+        required: ["path"],
+      },
+    },
+    {
+      name: "files:writeFile",
+      description: "Create or overwrite a file in the workspace with specific text content.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Absolute or relative path to the file." },
+          content: { type: "string", description: "The content to write to the file." },
+        },
+        required: ["path", "content"],
+      },
+    },
+    {
+      name: "files:listFiles",
+      description: "List all files and folders in a specific directory.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "The directory path to list." },
+        },
+        required: ["path"],
+      },
+    },
+    {
+      name: "files:searchFiles",
+      description: "Search for files matching a wildcard pattern inside a directory.",
+      parameters: {
+        type: "object",
+        properties: {
+          pattern: { type: "string", description: "The search pattern (e.g. *.js)." },
+          path: { type: "string", description: "The directory to search." },
+        },
+        required: ["pattern", "path"],
+      },
+    },
+  ],
+};
 
 export class InnerLoop {
   private gateway: IMeshGateway;
@@ -58,24 +103,19 @@ export class InnerLoop {
     }
 
     const { agentId, taskId, instruction, contextArtifacts = [] } = options;
-    const turns = options.maxTurns || this.maxTurns;
+    this.maxTurns = options.maxTurns || 10;
 
-    // Grant scopes to permission engine for this execution
     this.permissions.grantScope(agentId, {
       capabilities: template.capabilities,
-      allowedPaths: [process.cwd()], // Default to workspace directory
+      allowedPaths: [process.cwd()],
       riskCeiling: template.riskCeiling,
     });
 
-    // `instruction` now carries a fully-formed mission brief (goal + subtask +
-    // completed-dependency results) built by the outer loop via buildAgentBrief.
-    // Any extra context artifacts are appended for backward compatibility with
-    // callers that still pass them.
     const userParts = [instruction];
     if (contextArtifacts.length > 0) {
       userParts.push(`Context artifacts available:\n${contextArtifacts.join("\n")}`);
     }
-    const messages: ChatMessage[] = [
+    const initialMessages: ChatMessage[] = [
       { role: "system", content: template.systemPrompt },
       { role: "user", content: userParts.join("\n\n") },
     ];
@@ -88,134 +128,283 @@ export class InnerLoop {
       note: `Spawned ${options.templateName} to execute subtask.`
     });
 
-    // Rolling summary of the older middle band. Kept across turns and only
-    // refreshed once the conversation has grown appreciably (see
-    // SUMMARY_REFRESH_CHARS) so we don't re-summarize on every turn.
-    let summary: string | null = null;
-    let lastSummaryChars = 0;
+    const checkpointer = new MemorySaver();
+    const workflow = new StateGraph(AgentState)
+      .addNode("callModel", this.callModel.bind(this))
+      .addNode("executeTools", this.executeTools.bind(this))
+      .addEdge(START, "callModel")
+      .addConditionalEdges("callModel", this.shouldContinue.bind(this))
+      .addEdge("executeTools", "callModel");
 
-    for (let turn = 1; turn <= turns; turn++) {
-      // An @mention in chat pauses this specific agent; block here (before
-      // the next model turn) until the sub-thread conversation resumes it.
-      await pauseController.waitIfPaused(agentId);
+    const app = workflow.compile({ checkpointer });
 
-      // Two-tier compaction of the prompt (the full `messages` array is kept
-      // locally). Tier 1: tool-result clearing — cheap, pure, no LLM call.
-      const cleared = compactMessages(messages);
-      // Tier 2: if the cleared prompt is still too large, collapse the middle
-      // band into a single LLM-produced summary note. Resilient: on any failure
-      // summarizeMiddleBand returns null and we fall back to `cleared`.
-      let prompt: ChatMessage[] = cleared;
-      if (needsSummary(cleared)) {
-        const clearedChars = estimateChars(cleared);
-        if (summary === null || clearedChars - lastSummaryChars > SUMMARY_REFRESH_CHARS) {
-          const fresh = await this.summarizeMiddleBand(cleared);
-          if (fresh) {
-            summary = fresh;
-            lastSummaryChars = clearedChars;
-          }
-        }
-        if (summary) prompt = applySummary(cleared, summary);
+    const finalState = await app.invoke({
+      messages: initialMessages,
+      taskId,
+      agentId,
+      templateName: options.templateName,
+      instruction,
+      currentStep: 1,
+      errors: [],
+      status: "working",
+    }, {
+      configurable: { thread_id: agentId }
+    });
+
+    if (finalState.status === "failed") {
+      throw new Error(finalState.errors[finalState.errors.length - 1] || "Agent execution failed.");
+    }
+
+    return finalState.result;
+  }
+
+  private async callModel(state: AgentStateType): Promise<Partial<AgentStateType>> {
+    await pauseController.waitIfPaused(state.agentId);
+
+    if (state.currentStep > this.maxTurns) {
+      return {
+        status: "failed",
+        errors: [...state.errors, `Agent inner-loop exceeded max turns of ${this.maxTurns} without yielding a result.`],
+      };
+    }
+
+    const template = AGENT_REGISTRY[state.templateName];
+    if (!template) {
+      throw new Error(`Agent template ${state.templateName} not found.`);
+    }
+
+    // Two-tier memory compaction
+    const cleared = compactMessages(state.messages);
+    let prompt = cleared;
+    if (needsSummary(cleared)) {
+      const summary = await this.summarizeMiddleBand(cleared);
+      if (summary) {
+        prompt = applySummary(cleared, summary);
       }
+    }
 
-      // Get next action from model. Reasoning tokens (when the model exposes
-      // them) are streamed to the UI as "thinking"; the raw JSON answer is kept
-      // out of the thinking stream and parsed for the actual tool call/result.
-      const response = await this.gateway.chat(prompt, {
-        modelRole: template.modelRole,
-        temperature: 0.1,
-        onReasoning: (reasoning) => {
-          void this.bus.publish(`task.${taskId}.agent.${agentId}.thought`, {
-            kind: "thought",
-            from: agentId,
-            content: reasoning,
-          });
-        },
-      });
+    // Map capabilities to native tool schemas
+    const tools: ToolDefinition[] = [];
+    for (const cap of template.capabilities) {
+      if (CAPABILITY_TOOL_DEFINITIONS[cap]) {
+        tools.push(...CAPABILITY_TOOL_DEFINITIONS[cap]);
+      }
+    }
 
-      messages.push({ role: "assistant", content: response });
+    const response = await this.gateway.chat(prompt, {
+      modelRole: template.modelRole,
+      temperature: 0.1,
+      tools: tools.length > 0 ? tools : undefined,
+      onReasoning: (reasoning) => {
+        void this.bus.publish(`task.${state.taskId}.agent.${state.agentId}.thought`, {
+          kind: "thought",
+          from: state.agentId,
+          content: reasoning,
+        });
+      },
+    });
 
-      // Parse JSON tool call or final result from model output
-      const jsonMatch = response.match(/```json\s*([\s\S]*?)\s*```/) || response.match(/\{[\s\S]*\}/);
+    const content = typeof response === "string" ? response : (response.content || "");
+    const nativeToolCalls = typeof response === "object" ? response.toolCalls : undefined;
+
+    const assistantMsg: ChatMessage = {
+      role: "assistant",
+      content,
+    };
+    if (nativeToolCalls) {
+      (assistantMsg as any).toolCalls = nativeToolCalls;
+    }
+
+    // Parse response for validation/completions
+    let parsedResult: any = null;
+    let parsedVerification: any = null;
+    let hasToolCalls = (nativeToolCalls && nativeToolCalls.length > 0);
+    let formatError: string | null = null;
+
+    if (!hasToolCalls) {
+      const jsonMatch = content.match(/```json\s*([\s\S]*?)\s*```/) || content.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         try {
           const parsed = JSON.parse(jsonMatch[1] || jsonMatch[0]);
-
           if (parsed.call) {
-            const toolCall = parsed.call as ToolCall;
-            // Execute tool
-            await this.bus.publish(`task.${taskId}.agent.${agentId}.tool_requested`, {
-              kind: "thought",
-              from: agentId,
-              content: `Requesting execution of ${toolCall.capability}.${toolCall.method}`
-            });
-
-            let toolResult: any;
-            try {
-              toolResult = await this.permissions.executeWithApproval(agentId, toolCall, async () => {
-                const provider = this.scope.resolve<any>(`capability:${toolCall.capability}`);
-                if (!provider || typeof provider[toolCall.method] !== "function") {
-                  throw new Error(`Provider for capability "${toolCall.capability}" does not support method "${toolCall.method}"`);
-                }
-                return provider[toolCall.method](...Object.values(toolCall.args));
-              });
-
-              messages.push({
-                role: "user",
-                content: `Tool Execution Result:\n\`\`\`json\n${JSON.stringify({ status: "success", data: toolResult }, null, 2)}\n\`\`\``
-              });
-            } catch (execErr: any) {
-              messages.push({
-                role: "user",
-                content: `Tool Execution Error:\n\`\`\`json\n${JSON.stringify({ status: "error", error: execErr.message }, null, 2)}\n\`\`\``
-              });
-            }
-            continue; // Continue to next turn to observe tool result
+            hasToolCalls = true;
+          } else if (parsed.result) {
+            parsedResult = parsed.result;
+          } else if (parsed.verification) {
+            parsedVerification = parsed.verification;
+          } else {
+            formatError = "Your JSON block did not contain a valid 'call', 'result', or 'verification' field.";
           }
-
-          if (parsed.result) {
-            // Task completed successfully
-            await this.bus.publish(`task.${taskId}.agent_message`, {
-              kind: "result",
-              from: agentId,
-              taskId,
-              artifacts: parsed.result.artifacts,
-              summary: parsed.result.summary
-            });
-            return parsed.result;
-          }
-
-          if (parsed.verification) {
-            // For VerifierAgent
-            return parsed.verification;
-          }
-        } catch (err: any) {
-          // JSON parse failed or invalid model output format
-          messages.push({
-            role: "user",
-            content: `Error parsing your response. Please ensure you output valid JSON containing either "call" or "result". Error: ${err.message}`
-          });
+        } catch (e: any) {
+          formatError = `Failed to parse your JSON response: ${e.message}`;
         }
       } else {
-        messages.push({
+        formatError = "No valid JSON block found in your response. Please wrap your action/result in a JSON block inside markdown triple backticks.";
+      }
+    }
+
+    // Prepare updates
+    const messagesUpdate = [assistantMsg];
+    let newStatus = state.status;
+    let newResult = state.result;
+    const newErrors = [...state.errors];
+
+    if (parsedResult) {
+      void this.bus.publish(`task.${state.taskId}.agent_message`, {
+        kind: "result",
+        from: state.agentId,
+        taskId: state.taskId,
+        artifacts: parsedResult.artifacts,
+        summary: parsedResult.summary
+      });
+      newResult = parsedResult;
+      newStatus = "completed";
+    } else if (parsedVerification) {
+      newResult = parsedVerification;
+      newStatus = "completed";
+    } else if (formatError && !hasToolCalls) {
+      if (state.currentStep >= this.maxTurns) {
+        newStatus = "failed";
+        newErrors.push(`Agent inner-loop exceeded max turns of ${this.maxTurns} without yielding a result.`);
+      } else {
+        messagesUpdate.push({
           role: "user",
-          content: "No valid JSON block found in your response. Please wrap your action/result in a JSON block inside markdown triple backticks."
+          content: formatError,
         });
       }
     }
 
-    throw new Error(`Agent inner-loop exceeded max turns of ${turns} without yielding a result.`);
+    return {
+      messages: messagesUpdate,
+      currentStep: state.currentStep + 1,
+      result: newResult,
+      status: newStatus,
+      errors: newErrors,
+    };
   }
 
-  /**
-   * Compress the middle band of a (tool-result-cleared) prompt into a short note
-   * via the cheap `utility` model. Never throws: on any error — or an empty
-   * middle band / empty model reply — it returns null so the caller falls back
-   * to the tool-result-cleared array and the agent loop keeps running.
-   *
-   * Deliberately does not pass `onReasoning`; this is a side utility call and
-   * must not pollute the main turn's "thinking" stream.
-   */
+  private async executeTools(state: AgentStateType): Promise<Partial<AgentStateType>> {
+    const lastMsg = state.messages[state.messages.length - 1];
+    const nativeToolCalls = (lastMsg as any).toolCalls || [];
+    let parsedToolCall: any = null;
+
+    if (nativeToolCalls.length === 0) {
+      const jsonMatch = lastMsg.content.match(/```json\s*([\s\S]*?)\s*```/) || lastMsg.content.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        try {
+          const parsed = JSON.parse(jsonMatch[1] || jsonMatch[0]);
+          if (parsed.call) {
+            parsedToolCall = parsed.call;
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    const newMessages: ChatMessage[] = [];
+
+    if (nativeToolCalls.length > 0) {
+      for (const tc of nativeToolCalls) {
+        const [capability, method] = tc.name.split(":");
+        const toolCall: ToolCall = {
+          id: tc.id || `call-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+          capability: capability || tc.name,
+          method: method || "",
+          args: tc.args,
+        };
+
+        await this.bus.publish(`task.${state.taskId}.agent.${state.agentId}.tool_requested`, {
+          kind: "thought",
+          from: state.agentId,
+          content: `Requesting execution of ${toolCall.capability}.${toolCall.method}`
+        });
+
+        try {
+          const toolResult = await this.permissions.executeWithApproval(state.agentId, toolCall, async () => {
+            const provider = this.scope.resolve<any>(`capability:${toolCall.capability}`);
+            if (!provider || typeof provider[toolCall.method] !== "function") {
+              throw new Error(`Provider for capability "${toolCall.capability}" does not support method "${toolCall.method}"`);
+            }
+            return provider[toolCall.method](...Object.values(toolCall.args));
+          });
+
+          newMessages.push({
+            role: "user",
+            content: `Tool Execution Result:\n\`\`\`json\n${JSON.stringify({ status: "success", data: toolResult }, null, 2)}\n\`\`\``
+          });
+        } catch (execErr: any) {
+          newMessages.push({
+            role: "user",
+            content: `Tool Execution Error:\n\`\`\`json\n${JSON.stringify({ status: "error", error: execErr.message }, null, 2)}\n\`\`\``
+          });
+        }
+      }
+    } else if (parsedToolCall) {
+      const toolCall: ToolCall = {
+        id: parsedToolCall.id || `call-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+        capability: parsedToolCall.capability,
+        method: parsedToolCall.method,
+        args: parsedToolCall.args,
+      };
+      await this.bus.publish(`task.${state.taskId}.agent.${state.agentId}.tool_requested`, {
+        kind: "thought",
+        from: state.agentId,
+        content: `Requesting execution of ${toolCall.capability}.${toolCall.method}`
+      });
+
+      try {
+        const toolResult = await this.permissions.executeWithApproval(state.agentId, toolCall, async () => {
+          const provider = this.scope.resolve<any>(`capability:${toolCall.capability}`);
+          if (!provider || typeof provider[toolCall.method] !== "function") {
+            throw new Error(`Provider for capability "${toolCall.capability}" does not support method "${toolCall.method}"`);
+          }
+          return provider[toolCall.method](...Object.values(toolCall.args));
+        });
+
+        newMessages.push({
+          role: "user",
+          content: `Tool Execution Result:\n\`\`\`json\n${JSON.stringify({ status: "success", data: toolResult }, null, 2)}\n\`\`\``
+        });
+      } catch (execErr: any) {
+        newMessages.push({
+          role: "user",
+          content: `Tool Execution Error:\n\`\`\`json\n${JSON.stringify({ status: "error", error: execErr.message }, null, 2)}\n\`\`\``
+        });
+      }
+    }
+
+    return {
+      messages: newMessages,
+    };
+  }
+
+  private shouldContinue(state: AgentStateType): "executeTools" | typeof END | "callModel" {
+    if (state.status === "completed" || state.status === "failed") {
+      return END;
+    }
+
+    const lastMsg = state.messages[state.messages.length - 1];
+    const nativeToolCalls = (lastMsg as any).toolCalls || [];
+    if (nativeToolCalls.length > 0) {
+      return "executeTools";
+    }
+
+    const jsonMatch = lastMsg.content?.match(/```json\s*([\s\S]*?)\s*```/) || lastMsg.content?.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      try {
+        const parsed = JSON.parse(jsonMatch[1] || jsonMatch[0]);
+        if (parsed.call) {
+          return "executeTools";
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    return "callModel";
+  }
+
   private async summarizeMiddleBand(cleared: ChatMessage[]): Promise<string | null> {
     const middle = middleBand(cleared);
     if (middle.length === 0) return null;
@@ -234,7 +423,8 @@ export class InnerLoop {
         ],
         { modelRole: "utility", temperature: 0 },
       );
-      const trimmed = summary?.trim();
+      const rawText = typeof summary === "string" ? summary : (summary?.content || "");
+      const trimmed = rawText.trim();
       return trimmed ? trimmed : null;
     } catch {
       return null;

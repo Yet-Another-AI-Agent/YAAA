@@ -141,31 +141,31 @@ ipcMain.handle("route-user-message", async (_event, message) => {
 });
 
 ipcMain.handle("start-task", async (_event, goal) => {
-  // Scaffold synchronously so we can hand the id back before the run streams.
   const task = workspace.createTask(goal);
 
-  // Defer planning one tick so the renderer can attach its event listeners
-  // before the draft plan is streamed. Execution is started by confirm-task.
-  setTimeout(() => {
-    workspace
-      .prepareTask(goal, task, {
+  setTimeout(async () => {
+    try {
+      const result = await workspace.startConversationalOnboarding(task.taskId, goal, {
         onEvent: (event) => forwardRuntimeEvent(task.taskId, event),
-        onApproval: makeApprovalHandler(task.taskId),
-      })
-      .catch((err) => {
-        if (killedTasks.has(task.taskId)) return;
-        sendToRenderer("task-complete", {
-          success: false,
-          summary: err?.message ?? String(err),
-          reason: isInsufficientFundsError(err)
-            ? "insufficient_funds"
-            : undefined,
-        });
       });
+      if (result && result.kind === "direct_execute") {
+        sendToRenderer("task-complete", {
+          success: true,
+          summary: result.reply,
+        });
+      }
+    } catch (err) {
+      if (killedTasks.has(task.taskId)) return;
+      sendToRenderer("task-complete", {
+        success: false,
+        summary: err?.message ?? String(err),
+      });
+    }
   }, 0);
 
   return task.taskId;
 });
+
 
 ipcMain.handle("confirm-task", async (_event, taskId) => {
   if (killedTasks.has(taskId) || confirmingTasks.has(taskId)) {
@@ -208,15 +208,18 @@ ipcMain.handle("continue-task", async (_event, { taskId, message }) => {
   if (killedTasks.has(taskId)) {
     return { status: "error", error: "Mission was deleted" };
   }
-  // A follow-up either gets a lightweight conversational reply (streamed as an
-  // orchestrator bubble) or re-plans on the SAME task/channel (streamed via the
-  // plan_updated event). The renderer already attached its listeners before
-  // invoking, so we can await and hand back which path was taken.
   try {
     const result = await workspace.continueMission(taskId, message, {
       onEvent: (event) => forwardRuntimeEvent(taskId, event),
       onApproval: makeApprovalHandler(taskId),
     });
+    if (result.kind === "direct_execute") {
+      sendToRenderer("task-complete", {
+        success: true,
+        summary: result.reply,
+      });
+      return { status: "conversation" };
+    }
     return { status: result.kind };
   } catch (err) {
     if (killedTasks.has(taskId)) return { status: "cancelled" };

@@ -12,7 +12,7 @@ export type UILogKind = "thinking" | "activity" | "response" | "system";
 export interface UILog {
   id: string;
   time: string;
-  source: "orchestrator" | "agent" | "system";
+  source: "orchestrator" | "agent" | "system" | "user";
   content: string;
   kind: UILogKind;
 }
@@ -41,9 +41,14 @@ export function useLogState() {
     setLogs([]);
   };
 
+  const clearThoughts = () => {
+    setLogs((prev) => prev.filter((log) => log.kind !== "thinking" && log.source !== "system"));
+  };
+
   return {
     logs,
     addLog,
     clearLogs,
+    clearThoughts,
   };
 }

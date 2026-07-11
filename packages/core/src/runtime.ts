@@ -6,6 +6,7 @@ import type {
   IMeshGateway,
   IStore,
   ModelRole,
+  ChatResult,
 } from "@yaaa/interfaces";
 import { Container, MessageBus, PermissionEngine } from "@yaaa/platform";
 import { SqliteStore, FilesFs, MeshGateway } from "@yaaa/providers";
@@ -151,7 +152,7 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   });
   const filesProvider = new FilesFs(config.workingDir);
   const gateway: IMeshGateway = {
-    async chat(messages: ChatMessage[], options: ChatOptions): Promise<string> {
+    async chat(messages: ChatMessage[], options: ChatOptions): Promise<ChatResult> {
       assertActive();
       const response = await meshGateway.chat(messages, options);
       assertActive();

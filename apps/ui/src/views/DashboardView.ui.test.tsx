@@ -293,22 +293,19 @@ describe("DashboardView", () => {
     expect(screen.getByText("No capabilities assigned yet.")).toBeTruthy();
   });
 
-  it("collapses raw system status logs instead of rendering them as chat bubbles", () => {
-    render(<DashboardView viewModel={makeViewModel({
+  it("renders raw system status logs inline as system notices", () => {
+    const { container } = render(<DashboardView viewModel={makeViewModel({
       taskId: "task-1",
       logs: [
-        { id: "sys-1", time: "10:00", source: "system", content: 'Submitting task to supervisor: "hi"' },
-        { id: "sys-2", time: "10:00", source: "system", content: "Task initialized. ID: abc-123. Listening to event stream..." },
+        { id: "sys-1", time: "10:00", source: "system", content: 'Submitting task to supervisor: "hi"', kind: "system" },
+        { id: "sys-2", time: "10:00", source: "system", content: "Task initialized. ID: abc-123. Listening to event stream...", kind: "system" },
       ],
     })} />);
 
-    expect(screen.getByText(/System Logs \(Click to expand\)/)).toBeTruthy();
     expect(screen.getByText(/Submitting task to supervisor/)).toBeTruthy();
-    // Collapsed by default: no `open` attribute on the <details> block.
-    const block = screen.getByText(/System Logs \(Click to expand\)/).closest("details") as HTMLDetailsElement;
-    expect(block.open).toBe(false);
-    // Raw logs live inside the blueprint's encapsulation wrapper.
-    expect(block.querySelector(".raw-logs")).toBeTruthy();
+    expect(screen.getByText(/Task initialized/)).toBeTruthy();
+    const notices = container.querySelectorAll(".slack-system-notice");
+    expect(notices.length).toBe(2);
   });
 
   it("shows the LLM-generated channel topic instead of the raw task id once available", () => {
