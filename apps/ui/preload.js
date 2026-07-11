@@ -6,6 +6,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
   continueTask: (taskId, message) =>
     ipcRenderer.invoke("continue-task", { taskId, message }),
   confirmTask: (taskId) => ipcRenderer.invoke("confirm-task", taskId),
+
   resolveApproval: (callId, approved) =>
     ipcRenderer.invoke("resolve-approval", { callId, approved }),
   listTasks: () => ipcRenderer.invoke("list-tasks"),

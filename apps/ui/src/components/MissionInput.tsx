@@ -31,7 +31,7 @@ export function MissionInput({
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      if (value.trim() && !running) onSubmit();
+      if (value.trim()) onSubmit();
     }
   };
 
@@ -45,7 +45,6 @@ export function MissionInput({
         onChange={handleChange}
         onKeyDown={handleKeyDown}
         rows={1}
-        disabled={running}
       />
       <div className="mission-actions">
         <button className="mission-action-btn" title="Attach file" aria-label="Attach file" type="button">
@@ -64,9 +63,9 @@ export function MissionInput({
         <button
           className="mission-send-btn"
           onClick={() => {
-            if (value.trim() && !running) onSubmit();
+            if (value.trim()) onSubmit();
           }}
-          disabled={running || !value.trim()}
+          disabled={!value.trim()}
           title="Launch agent"
           aria-label="Launch agent"
           type="button"

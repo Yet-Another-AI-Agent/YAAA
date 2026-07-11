@@ -25,6 +25,28 @@ import {
 import * as shared from "@yaaa/shared";
 const { ORCHESTRATOR_MD_HEADERS } = shared;
 
+function TypingText({ text, onComplete }: { text: string; onComplete?: () => void }) {
+  const [displayedLength, setDisplayedLength] = useState(0);
+
+  useEffect(() => {
+    setDisplayedLength(0);
+    const interval = setInterval(() => {
+      setDisplayedLength((prev) => {
+        if (prev >= text.length) {
+          clearInterval(interval);
+          onComplete?.();
+          return text.length;
+        }
+        return prev + 2;
+      });
+    }, 8);
+    return () => clearInterval(interval);
+  }, [text, onComplete]);
+
+  const slicedText = text.substring(0, displayedLength);
+  return <>{renderMarkdown(slicedText)}</>;
+}
+
 interface DashboardViewProps {
   viewModel: TaskViewModel;
 }
@@ -191,7 +213,7 @@ function parseOrchestratorMd(content: string | null): ParsedOrchestrator {
 }
 
 function getAvatarColor(sender: string): string {
-  if (sender === "User") return "#36c5f0"; // Slack blue
+  if (sender.toLowerCase() === "user") return "#36c5f0"; // Slack blue
   // YAAA / orchestrator / supervisor all share the purple persona color.
   if (isOrchestratorSender(sender) || sender === ORCHESTRATOR_DISPLAY) return "#4a154b";
   if (sender.toLowerCase().includes("planner")) return "#e01e5a"; // Slack pink
@@ -287,6 +309,15 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   const [historyMessages, setHistoryMessages] = useState<any[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const activeHistoryRequestRef = useRef<string | null>(null);
+  const [typedMessageIds, setTypedMessageIds] = useState<Set<string>>(new Set());
+
+  const handleTypeComplete = (id: string) => {
+    setTypedMessageIds((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+  };
 
   // Split-screen artifact preview (Markdown/plaintext only for now).
   const [artifactPreview, setArtifactPreview] = useState<{
@@ -422,6 +453,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
 
   const labelForSender = (raw: string): string => {
     if (isOrchestratorSender(raw)) return ORCHESTRATOR_DISPLAY;
+    if (raw.toLowerCase() === "user") return "User";
     if (raw === "User" || raw === "System" || raw === "Agent") return raw;
     const a = resolveAgent(raw);
     if (a) return agentIdentity(a.id, a.role).display;
@@ -610,32 +642,12 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
 
   const memoizedData = useMemo(() => {
     let displayMessages: any[] = [];
-    let systemLogEntries: any[] = [];
     const parsedOrchestrator = parseOrchestratorMd(orchestratorMd);
 
     if (inConversationView) {
       // #general — casual chat with @orchestrator; plain bubbles only.
       displayMessages = chatMessages.map((m) => ({ ...m, kind: "message", artifacts: [] }));
     } else if (selectedTaskId) {
-      // Prepend user's prompt as the first message
-      if (selectedTask) {
-        displayMessages.push({
-          id: "user-prompt",
-          sender: "User",
-          time: formatDate(selectedTask.created_at),
-          content: selectedTask.prompt,
-          kind: "thought"
-        });
-      } else if (orchestratorMd) {
-        displayMessages.push({
-          id: "user-prompt",
-          sender: "User",
-          time: formatDate(parsedOrchestrator.updatedAt),
-          content: parsedOrchestrator.prompt || "Start task",
-          kind: "thought"
-        });
-      }
-
       // Add historical messages
       historyMessages.forEach((msg, idx) => {
         let sender = msg.from || "Agent";
@@ -667,28 +679,14 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
         });
       });
     } else if (showTaskView) {
-      // Prepend active task goal
-      displayMessages.push({
-        id: "user-prompt",
-        sender: "User",
-        time: new Date().toLocaleTimeString(),
-        content: submittedPrompt || goal,
-        kind: "thought"
-      });
-
-      // Add live logs. Plain system status logs (task IDs, "submitting to
-      // supervisor", etc.) are backend noise, not conversation — collect them
-      // separately for a single collapsed block instead of individual chat
-      // bubbles. Lifecycle notices keep their existing toast rendering, and
-      // orchestrator/agent logs remain real bubbles.
+      // Add live logs. System status logs are rendered inline
+      // and cleared upon completion.
       logs.forEach((log) => {
-        if (log.source === "system" && !isAgentLifecycleLog(log)) {
-          systemLogEntries.push(log);
-          return;
-        }
+        let sender = "Agent";
+        if (log.source === "system") sender = "System";
+        else if (log.source === "orchestrator") sender = "Orchestrator";
+        else if (log.source === "user") sender = "User";
 
-        let sender = log.source === "system" ? "System" : (log.source === "orchestrator" ? "Supervisor" : "Agent");
-        if (log.kind === "response") sender = "Orchestrator";
         let content = getVisibleLogContent(log.content);
         const agentMatch = log.content.match(/^\[([^\]]+)\] (.*)/);
         if (agentMatch) {
@@ -719,11 +717,10 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
 
     const currentStatus = selectedTaskId 
       ? (selectedTask?.status || parsedOrchestrator.status) 
-      : (awaitingConfirmation ? "awaiting_confirmation" : (running ? "running" : (success ? "success" : (success === false ? "failed" : "pending"))));
+      : (liveTask?.status || (awaitingConfirmation ? "awaiting_confirmation" : (running ? "running" : (success ? "success" : (success === false ? "failed" : "pending")))));
 
     return {
       displayMessages,
-      systemLogEntries,
       displaySubtasks,
       displayArtifacts,
       currentStatus
@@ -746,7 +743,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     chatMessages
   ]);
 
-  const { displayMessages, systemLogEntries, displaySubtasks, displayArtifacts, currentStatus } = memoizedData;
+  const { displayMessages, displaySubtasks, displayArtifacts, currentStatus } = memoizedData;
   const artifactGroups = useMemo(() => buildArtifactExplorer(displayArtifacts), [displayArtifacts]);
   const activeAgentCount = agents.filter(isActiveAgent).length;
   // Real capabilities this plan actually uses, replacing what used to be a
@@ -1031,20 +1028,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   </div>
                 )}
 
-                {/* System status noise, collapsed and minimized by default */}
-                {!loadingHistory && systemLogEntries.length > 0 && (
-                  <details className="slack-system-log-block">
-                    <summary>System Logs (Click to expand) · {systemLogEntries.length}</summary>
-                    <div className="raw-logs">
-                      {systemLogEntries.map((log) => (
-                        <div className="slack-system-log-row" key={log.id}>
-                          <span className="slack-system-log-time">{log.time}</span>
-                          <span className="slack-system-log-text">{log.content}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </details>
-                )}
+
 
                 {/* Main conversation message bubbles */}
                 {!loadingHistory && displayMessages.length === 0 && (
@@ -1072,7 +1056,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                     return null;
                   }
                   const senderLabel = labelForSender(msg.sender);
-                  return msg.kind === "lifecycle" ? (
+                  return msg.kind === "lifecycle" || msg.kind === "system" ? (
                     <div className="slack-system-notice" role="status" key={msg.id}>
                       <span className="slack-system-notice-line" aria-hidden="true" />
                       <span>{msg.content}</span>
@@ -1092,7 +1076,13 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                         <span className="slack-message-time">{msg.time}</span>
                       </div>
                       <div className={`slack-message-bubble ${senderLabel === 'User' ? 'slack-message-sender-user' : ''} ${msg.kind === 'response' ? 'slack-message-response' : ''} ${msg.kind === 'activity' ? 'slack-message-activity' : ''}`}>
-                        <div className="slack-message-text">{msg.content}</div>
+                        <div className="slack-message-text">
+                          {(msg.id === displayMessages.filter(m => m.sender !== 'User' && m.kind === 'response').pop()?.id && !selectedTaskId && running && !typedMessageIds.has(msg.id)) ? (
+                            <TypingText text={msg.content} onComplete={() => handleTypeComplete(msg.id)} />
+                          ) : (
+                            renderMarkdown(msg.content)
+                          )}
+                        </div>
 
                         {msg.artifacts && msg.artifacts.length > 0 && (
                           <div className="slack-message-artifacts">
@@ -1202,6 +1192,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   </div>
                 )}
 
+
                 {/* Failure banner (success answers render as a chat reply). */}
                 {showTaskView && success === false && (
                   <div className="result-banner failed" style={{ marginTop: '1.25rem' }}>
@@ -1227,20 +1218,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
 
                 <div ref={consoleEndRef} />
               </div>
-
-              {/* Chat Input / Status Info */}
               <div className="slack-chat-input-container">
-                <div className="slack-chat-input-box">
-                  <span>
-                    {selectedTaskId && "🔒 Archived channel — send a message to start a new mission."}
-                    {inConversationView && "💬 Chatting with YAAA — describe a mission to assemble the team."}
-                    {!selectedTaskId && !inConversationView && awaitingConfirmation && "🗺️ Plan ready. Review Todo and Progress, then confirm to start agents."}
-                    {!selectedTaskId && !inConversationView && running && "⚡ Mission in progress... Agent is running and printing thoughts."}
-                    {!selectedTaskId && !inConversationView && !running && success === true && "✅ Mission completed. Send a follow-up to continue in this channel."}
-                    {!selectedTaskId && !inConversationView && !running && success === false && "❌ Mission failed."}
-                    {!selectedTaskId && !inConversationView && !running && success === null && "⚡ Channel initialized. Ready to execute."}
-                  </span>
-                </div>
                 <MissionInput
                   value={goal}
                   onChange={setGoal}

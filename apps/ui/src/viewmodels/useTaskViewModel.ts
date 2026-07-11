@@ -20,11 +20,8 @@ export function useTaskViewModel() {
   const [success, setSuccess] = useState<boolean | null>(null);
   const [tasks, setTasks] = useState<UITask[]>([]);
   const [channelTopic, setChannelTopic] = useState<string | null>(null);
-  // Casual conversation with @orchestrator (the "#general" channel). These
-  // exchanges never create a task, a UUID channel, or a plan.
-  const [chatMessages, setChatMessages] = useState<
-    Array<{ id: string; sender: string; content: string; time: string }>
-  >([]);
+  // Casual conversation state is no longer used since chats are unified.
+  const chatMessages: any[] = [];
 
   // Controls the shared API-key modal. "funds" is set automatically when a run
   // stops for lack of balance; "manual" is opened from the Settings button.
@@ -33,7 +30,7 @@ export function useTaskViewModel() {
   );
 
   // Delegate Logging Responsibility
-  const { logs, addLog, clearLogs } = useLogState();
+  const { logs, addLog, clearLogs, clearThoughts } = useLogState();
 
   // Delegate Approval Responsibility
   const { pendingApproval, setPendingApproval, resolveApproval } = useApprovalState(taskId, addLog);
@@ -129,7 +126,8 @@ export function useTaskViewModel() {
 
         else if (topic.includes("started") || topic.includes("completed") || topic.includes("failed")) {
           if (data && data.note) {
-            addLog("orchestrator", data.note);
+            clearThoughts();
+            addLog("orchestrator", data.note, "response");
           }
         }
       },
@@ -146,6 +144,7 @@ export function useTaskViewModel() {
         // Surface the final answer as an assistant chat message. On failure
         // the recovery banner carries the error instead, so skip it here.
         if (resultData.success && resultData.summary) {
+          clearThoughts();
           addLog("orchestrator", resultData.summary, "response");
         }
         if (resultData.reason === "insufficient_funds") {
@@ -166,24 +165,7 @@ export function useTaskViewModel() {
     if (e) e.preventDefault();
     if (!goal.trim() || running || awaitingConfirmation) return;
 
-    // Conversational NLP gate: greetings/small talk get an orchestrator chat
-    // reply and stop here — no task folder, no UUID channel, no plan.
     const submitted = goal;
-    try {
-      const route = await TaskModel.routeUserMessage(submitted);
-      if (route.kind === "conversation") {
-        const now = new Date().toLocaleTimeString();
-        setChatMessages((prev) => [
-          ...prev,
-          { id: `chat-user-${prev.length}`, sender: "User", content: submitted, time: now },
-          { id: `chat-orch-${prev.length}`, sender: "YAAA", content: route.reply, time: now },
-        ]);
-        setGoal("");
-        return;
-      }
-    } catch {
-      // Classifier unavailable — fall through and treat the message as work.
-    }
 
     // Reset previous states
     setTaskId(null);
@@ -196,13 +178,13 @@ export function useTaskViewModel() {
     setSummary(null);
     setSuccess(null);
     setChannelTopic(null);
-    setRunning(true);
     setAwaitingConfirmation(false);
 
-    // The prompt now belongs to the task view; clear the composer so it goes
-    // blank on send instead of leaving the message stuck in the box.
+    // Render immediately by setting states and adding user message to logs
     setSubmittedPrompt(submitted);
+    setRunning(true);
     setGoal("");
+    addLog("user", submitted, "response");
 
     addLog("system", `Submitting task to YAAA: "${submitted}"`);
 
@@ -226,15 +208,9 @@ export function useTaskViewModel() {
       setAwaitingConfirmation(false);
     }
   };
-
-  /**
-   * Send a follow-up message to the already-open mission. Re-plans on the SAME
-   * channel (no new chat) with prior context, and re-attaches the event stream
-   * because a completed mission tears its subscription down.
-   */
   const continueMission = async (message?: string) => {
     const text = (message ?? goal).trim();
-    if (!taskId || !text || running || awaitingConfirmation) return;
+    if (!taskId || !text) return;
 
     // A follow-up produces a fresh plan; clear the prior plan/agents but keep
     // accumulated artifacts so the mission's outputs persist across turns.
@@ -248,15 +224,15 @@ export function useTaskViewModel() {
     setSummary(null);
     setRunning(true);
     setAwaitingConfirmation(false);
+
+    // Immediately render user follow-up message in UI logs
+    addLog("user", text, "response");
     addLog("system", `Following up on this mission: "${text}"`);
 
     try {
       attachTaskEventStream();
       const result = await TaskModel.continueTask(taskId, text);
       loadTasks();
-      // A conversational follow-up gets an inline reply (already streamed as an
-      // orchestrator bubble) and returns the composer to idle. A task follow-up
-      // stays "running" until the plan_updated event flips it to plan-review.
       if (result?.status === "conversation") {
         setRunning(false);
         setAwaitingConfirmation(false);
@@ -266,6 +242,8 @@ export function useTaskViewModel() {
       setRunning(false);
     }
   };
+
+
 
   /**
    * Permanently purge a mission channel. If it's the one currently open,

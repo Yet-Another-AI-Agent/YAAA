@@ -1,5 +1,5 @@
 import OpenAI from "openai";
-import type { IMeshGateway, ChatMessage, ChatOptions, ModelRole } from "@yaaa/interfaces";
+import type { IMeshGateway, ChatMessage, ChatOptions, ModelRole, ChatResult, ToolDefinition } from "@yaaa/interfaces";
 import { isInsufficientFundsError, INSUFFICIENT_FUNDS_CODE } from "@yaaa/shared";
 
 /**
@@ -50,31 +50,74 @@ export class MeshGateway implements IMeshGateway {
     };
   }
 
-  async chat(messages: ChatMessage[], options: ChatOptions): Promise<string> {
+  async chat(messages: ChatMessage[], options: ChatOptions): Promise<ChatResult> {
     if (this.isMockMode) {
       options.onReasoning?.(this.getMockReasoning(options.modelRole));
-      return this.getMockResponse(messages, options.modelRole);
+      const content = this.getMockResponse(messages, options.modelRole);
+      
+      const jsonMatch = content.match(/```json\s*([\s\S]*?)\s*```/) || content.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        try {
+          const parsed = JSON.parse(jsonMatch[1] || jsonMatch[0]);
+          if (parsed.call) {
+            const tc = parsed.call;
+            return {
+              content,
+              toolCalls: [{
+                id: `mock-call-${Date.now()}`,
+                name: `${tc.capability}:${tc.method}`,
+                args: tc.args,
+              }]
+            };
+          }
+        } catch {
+          // ignore
+        }
+      }
+      return { content };
     }
 
     const model = this.modelMapping[options.modelRole];
     try {
+      const oaiTools = options.tools?.map((t) => ({
+        type: "function" as const,
+        function: {
+          name: t.name,
+          description: t.description,
+          parameters: t.parameters,
+        },
+      }));
+
       const response = await this.openai.chat.completions.create({
         model,
         messages,
         temperature: options.temperature ?? 0,
         response_format: options.jsonMode ? { type: "json_object" } : undefined,
+        tools: oaiTools,
       });
+
       const message = response.choices[0]?.message as
         | (typeof response.choices[0]["message"] & {
             reasoning_content?: string;
             reasoning?: string;
           })
         | undefined;
+
       const reasoning = message?.reasoning_content ?? message?.reasoning;
       if (reasoning) {
         options.onReasoning?.(reasoning);
       }
-      return message?.content || "";
+
+      const toolCalls = message?.tool_calls?.map((tc) => ({
+        id: tc.id,
+        name: tc.function.name,
+        args: JSON.parse(tc.function.arguments),
+      }));
+
+      return {
+        content: message?.content || "",
+        toolCalls,
+      };
     } catch (err) {
       console.error(`Mesh API call failed using model ${model} for role ${options.modelRole}:`, err);
       rethrowGatewayError(err);

@@ -108,11 +108,12 @@ Respond with ONLY a JSON object: {"intent": "conversation" | "task", "reply": "s
       { role: "user", content: message },
     ];
     try {
-      const raw = await this.gateway.chat(messages, {
+      const rawRes = await this.gateway.chat(messages, {
         modelRole: "utility",
         temperature: 0,
         jsonMode: true,
       });
+      const raw = rawRes.content;
       const match = raw.match(/\{[\s\S]*\}/);
       if (!match) return { intent: "task" };
       const parsed = JSON.parse(match[0]);
@@ -143,10 +144,11 @@ Reply in 1-2 warm, concise sentences${context.userName ? ` (the user's name is $
       { role: "user", content: message },
     ];
     try {
-      const raw = await this.gateway.chat(messages, {
+      const rawRes = await this.gateway.chat(messages, {
         modelRole: "utility",
         temperature: 0.7,
       });
+      const raw = rawRes.content;
       return sanitizeReply(raw) ?? FALLBACK_GREETING;
     } catch {
       return FALLBACK_GREETING;

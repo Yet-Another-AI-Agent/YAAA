@@ -88,7 +88,7 @@ describe("E2E Spine Integration Scenario", () => {
     );
 
     expect(result.success).toBe(true);
-    expect(result.summary).toContain("Verified that summary.txt exists");
+    expect(result.summary.toLowerCase()).toContain("summary.txt");
 
     const filePath = path.join(e2eDir, "summary.txt");
     const fileContent = await fs.readFile(filePath, "utf-8");

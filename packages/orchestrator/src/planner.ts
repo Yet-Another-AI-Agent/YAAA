@@ -94,11 +94,12 @@ DO NOT output any conversational text before or after the JSON. Only return a va
       { role: "user", content: `${renderPlanContext(context)}Create a task plan for this goal: "${goal}"` }
     ];
 
-    let response = await this.gateway.chat(messages, {
+    const firstRes = await this.gateway.chat(messages, {
       modelRole: "planner",
       temperature: 0.1,
       onReasoning,
     });
+    let response = firstRes.content;
 
     try {
       return this.parseAndValidate(response);
@@ -112,11 +113,12 @@ DO NOT output any conversational text before or after the JSON. Only return a va
         content: `Your previous JSON output was invalid or failed validation. Error: ${err.message}. Please fix it and output the correct JSON block.`
       });
 
-      response = await this.gateway.chat(messages, {
+      const retryRes = await this.gateway.chat(messages, {
         modelRole: "planner",
         temperature: 0.1,
         onReasoning,
       });
+      response = retryRes.content;
 
       return this.parseAndValidate(response);
     }

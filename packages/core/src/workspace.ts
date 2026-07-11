@@ -6,6 +6,7 @@ import Database from "better-sqlite3";
 import { SqliteStore, MeshGateway } from "@yaaa/providers";
 import { pauseController } from "@yaaa/platform";
 import { IntentRouter } from "@yaaa/orchestrator";
+import type { ChatMessage } from "@yaaa/interfaces";
 import {
   ORCHESTRATOR_MD_HEADERS,
   buildMissionSummary,
@@ -276,7 +277,7 @@ export class Workspace {
     }
   }
 
-  private getTask(taskId: string): TaskRow | null {
+  getTask(taskId: string): TaskRow | null {
     if (!/^[a-zA-Z0-9-]+$/.test(taskId)) return null;
     const db = this.openMainDb();
     try {
@@ -880,8 +881,9 @@ export class Workspace {
         ],
         { modelRole: "utility", temperature: 0.3 },
       )
-      .then((raw) => {
+      .then((res) => {
         if (this.deletedTasks.has(taskId)) return;
+        const raw = res.content;
         const topic = this.sanitizeTopic(raw);
         if (!topic) return;
         this.updateTaskTopic(taskId, topic);
@@ -979,7 +981,7 @@ export class Workspace {
     taskId: string,
     message: string,
     hooks: RunTaskHooks = {},
-  ): Promise<{ kind: "conversation"; reply: string } | { kind: "task"; plan: TaskPlan }> {
+  ): Promise<{ kind: "conversation" | "direct_execute"; reply: string } | { kind: "task"; plan: TaskPlan }> {
     const task = this.requireTask(taskId);
     if (this.activeTaskRuns.has(taskId)) {
       throw new Error(
@@ -988,16 +990,47 @@ export class Workspace {
     }
     await this.appendUserMessageToMission(taskId, message);
 
+    if (task.status === "conversing") {
+      const decision = await this.evaluateConversationalOnboarding(taskId, message, hooks);
+      if (decision.action === "prepare_plan") {
+        this.updateTaskStatus(taskId, "planning");
+        await this.appendOrchestratorReplyToMission(taskId, decision.reply);
+        hooks.onEvent?.({ type: "status", from: "orchestrator", note: decision.reply });
+
+        const plan = await this.prepareTask(
+          task.prompt,
+          {
+            taskId,
+            taskDir: task.path,
+            workingDir: path.join(task.path, "working"),
+          },
+          hooks,
+          {}
+        );
+        return { kind: "task", plan };
+      } else if (decision.action === "direct_execute") {
+        this.updateTaskStatus(taskId, "success");
+        await this.appendOrchestratorReplyToMission(taskId, decision.reply);
+        hooks.onEvent?.({ type: "status", from: "orchestrator", note: decision.reply });
+        return { kind: "direct_execute", reply: decision.reply };
+      } else {
+        await this.appendOrchestratorReplyToMission(taskId, decision.reply);
+        hooks.onEvent?.({ type: "status", from: "orchestrator", note: decision.reply });
+        return { kind: "conversation", reply: decision.reply };
+      }
+    }
+
     // Route the follow-up: small talk ("thanks", "what did you do?") gets a
     // lightweight in-channel reply; an actionable request re-plans on the same
     // task with prior context. Either way, no new channel is created.
     const route = await this.routeUserMessage(message);
     if (route.kind === "conversation") {
-      await this.appendOrchestratorReplyToMission(taskId, route.reply);
+      const reply = await this.generateConversationalReplyWithHistory(taskId, message, hooks);
+      await this.appendOrchestratorReplyToMission(taskId, reply);
       // Surface as an orchestrator bubble in the same channel (mapped to
       // task.<id>.started → addLog("orchestrator", note) in the renderer).
-      hooks.onEvent?.({ type: "status", from: "orchestrator", note: route.reply });
-      return { kind: "conversation", reply: route.reply };
+      hooks.onEvent?.({ type: "status", from: "orchestrator", note: reply });
+      return { kind: "conversation", reply };
     }
 
     const priorSummary = await this.buildMissionPriorSummary(taskId);
@@ -1013,6 +1046,144 @@ export class Workspace {
     );
     return { kind: "task", plan };
   }
+
+  async startConversationalOnboarding(
+    taskId: string,
+    goal: string,
+    hooks: RunTaskHooks = {},
+  ): Promise<{ kind: "conversation" | "direct_execute" | "task"; reply?: string }> {
+    this.updateTaskStatus(taskId, "conversing");
+    await this.appendUserMessageToMission(taskId, goal);
+
+    const route = await this.routeUserMessage(goal);
+    if (route.kind === "conversation") {
+      await this.appendOrchestratorReplyToMission(taskId, route.reply);
+      hooks.onEvent?.({ type: "status", from: "orchestrator", note: route.reply });
+      this.updateTaskStatus(taskId, "success");
+      return { kind: "conversation", reply: route.reply };
+    }
+
+    const decision = await this.evaluateConversationalOnboarding(taskId, goal, hooks);
+
+    if (decision.action === "prepare_plan") {
+      this.updateTaskStatus(taskId, "planning");
+      await this.appendOrchestratorReplyToMission(taskId, decision.reply);
+      hooks.onEvent?.({ type: "status", from: "orchestrator", note: decision.reply });
+
+      const task = this.getTask(taskId);
+      if (task) {
+        await this.prepareTask(
+          goal,
+          {
+            taskId,
+            taskDir: task.path,
+            workingDir: path.join(task.path, "working"),
+          },
+          hooks,
+          {}
+        );
+      }
+      return { kind: "task", reply: decision.reply };
+    } else if (decision.action === "direct_execute") {
+      this.updateTaskStatus(taskId, "success");
+      await this.appendOrchestratorReplyToMission(taskId, decision.reply);
+      hooks.onEvent?.({ type: "status", from: "orchestrator", note: decision.reply });
+      return { kind: "direct_execute", reply: decision.reply };
+    } else {
+      await this.appendOrchestratorReplyToMission(taskId, decision.reply);
+      hooks.onEvent?.({ type: "status", from: "orchestrator", note: decision.reply });
+      return { kind: "conversation", reply: decision.reply };
+    }
+  }
+
+  async evaluateConversationalOnboarding(
+    taskId: string,
+    message: string,
+    hooks: RunTaskHooks = {},
+  ): Promise<{ thought: string; reply: string; action: "chat" | "prepare_plan" | "direct_execute" }> {
+    const history = await this.getTaskHistory(taskId);
+    const chatMessages: ChatMessage[] = history
+      .filter((msg) => msg.kind === "thought" || msg.kind === "status" || msg.from === "user" || msg.kind === "result")
+      .map((msg) => {
+        let role: "user" | "assistant" | "system" = "user";
+        if (msg.from === "user") role = "user";
+        else if (msg.from === "system") role = "system";
+        else role = "assistant";
+
+        let content = "";
+        if (msg.kind === "thought") content = msg.content;
+        else if (msg.kind === "status") content = msg.note || "";
+        else if (msg.kind === "result") content = msg.summary;
+        else if (msg.kind === "info_request") content = msg.question;
+        else if (msg.kind === "info_reply") content = msg.answer;
+
+        return { role, content };
+      });
+
+    const task = this.requireTask(taskId);
+    const config = this.loadConfig();
+    const gateway = new MeshGateway({
+      apiKey: config.accessToken ?? process.env.MESH_API_KEY ?? undefined,
+      modelMapping: config.preferredModels as any,
+    });
+
+    hooks.onEvent?.({
+      type: "thought",
+      from: "orchestrator",
+      content: "Evaluating conversation next steps...",
+    });
+
+    const messages: ChatMessage[] = [
+      {
+        role: "system",
+        content: `You are the YAAA orchestrator, the friendly Team Lead of an AI professional firm.
+The user's original task goal is: "${task.prompt}".
+You are chatting with the user to clarify details before deciding how to proceed.
+Analyze the conversation history. Decide if:
+1. You need more details or clarification -> Choose action "chat" and write a reply asking the user follow-up questions about:
+   - The intent/goal.
+   - Clarifications/details.
+   - Plan necessity.
+   - Sub-agent requirements.
+2. You have a solid understanding and a multi-step plan of subtasks using specialized agents is needed -> Choose action "prepare_plan" and reply stating you are preparing the plan.
+3. You have a solid understanding and this is a simple query/task that does NOT require a multi-step plan -> Choose action "direct_execute" and write the direct reply/answer in the "reply" field.
+
+You must respond with ONLY a JSON object:
+{
+  "thought": "Your step-by-step reasoning about the request complexity, what details are missing, whether a plan is needed, and if you are ready.",
+  "reply": "Your message to the user.",
+  "action": "chat" | "prepare_plan" | "direct_execute"
+}`,
+      },
+      ...chatMessages,
+    ];
+
+    try {
+      const rawRes = await gateway.chat(messages, {
+        modelRole: "utility",
+        temperature: 0.3,
+        jsonMode: true,
+      });
+      const raw = rawRes.content;
+
+      const match = raw.match(/\{[\s\S]*\}/);
+      if (match) {
+        const parsed = JSON.parse(match[0]);
+        if (parsed && (parsed.action === "chat" || parsed.action === "prepare_plan" || parsed.action === "direct_execute")) {
+          return parsed;
+        }
+      }
+    } catch (err) {
+      console.error("Evaluation LLM call failed, falling back to prepare_plan:", err);
+    }
+
+    return {
+      thought: "Failed to parse LLM response, falling back to prepare_plan.",
+      reply: "Understood. I will now prepare a plan for this mission.",
+      action: "prepare_plan",
+    };
+  }
+
 
   /** Append a user's follow-up into the mission's public conversation channel. */
   private async appendUserMessageToMission(
@@ -1050,6 +1221,71 @@ export class Workspace {
         content,
       });
     });
+
+    const store = new SqliteStore(this.tasksDir);
+    try {
+      await store.saveMessage(taskId, {
+        kind: "thought",
+        from: authorKind,
+        content,
+      });
+    } finally {
+      store.closeAll();
+    }
+  }
+
+  private async generateConversationalReplyWithHistory(
+    taskId: string,
+    message: string,
+    hooks: RunTaskHooks = {},
+  ): Promise<string> {
+    const history = await this.getTaskHistory(taskId);
+    const chatMessages: ChatMessage[] = history
+      .filter((msg) => msg.kind === "thought" || msg.kind === "status" || msg.from === "user" || msg.kind === "result")
+      .map((msg) => {
+        let role: "user" | "assistant" | "system" = "user";
+        if (msg.from === "user") role = "user";
+        else if (msg.from === "system") role = "system";
+        else role = "assistant";
+
+        let content = "";
+        if (msg.kind === "thought") content = msg.content;
+        else if (msg.kind === "status") content = msg.note || "";
+        else if (msg.kind === "result") content = msg.summary;
+        else if (msg.kind === "info_request") content = msg.question;
+        else if (msg.kind === "info_reply") content = msg.answer;
+
+        return { role, content };
+      });
+
+    const config = this.loadConfig();
+    const gateway = new MeshGateway({
+      apiKey: config.accessToken ?? process.env.MESH_API_KEY ?? undefined,
+      modelMapping: config.preferredModels as any,
+    });
+
+    hooks.onEvent?.({
+      type: "thought",
+      from: "orchestrator",
+      content: "Formulating reply...",
+    });
+
+    const messages: ChatMessage[] = [
+      {
+        role: "system",
+        content: `You are @orchestrator, the friendly Team Lead of YAAA, an AI professional firm.
+You are chatting with the user in their channel. You have access to the conversation history.
+Please reply to the user's message in a helpful, friendly manner, maintaining the context of what was said before.`,
+      },
+      ...chatMessages,
+    ];
+
+    const replyRes = await gateway.chat(messages, {
+      modelRole: "utility",
+      temperature: 0.7,
+    });
+
+    return replyRes.content;
   }
 
   /** Condense the stored plan + agent results into a prior-mission summary. */
@@ -1215,7 +1451,7 @@ export class Workspace {
         apiKey,
         modelMapping: config.preferredModels as any,
       });
-      const resultText = await gateway.chat(
+      const resultTextRes = await gateway.chat(
         [
           {
             role: "system" as const,
@@ -1226,6 +1462,7 @@ export class Workspace {
         ],
         { modelRole: "utility", jsonMode: true, temperature: 0 },
       );
+      const resultText = resultTextRes.content;
       const parsed = JSON.parse(resultText);
       return parsed && typeof parsed === "object" ? parsed : fallback;
     } catch {
