@@ -1,17 +1,45 @@
 import type { IMeshGateway, IBus, ChatMessage } from "@yaaa/interfaces";
-import { container } from "@yaaa/platform";
+import { container, type Container } from "@yaaa/platform";
 import { TaskPlanSchema, type TaskPlan } from "@yaaa/shared";
+
+/** Optional context threaded into planning so the planner is not memoryless. */
+export interface PlanContext {
+  userProfile?: { name?: string; profession?: string; description?: string };
+  /** Condensed summary of earlier turns/work on this mission (for follow-ups). */
+  priorSummary?: string;
+}
+
+/** Render the plan-context preamble prepended to the planning request. */
+export function renderPlanContext(context?: PlanContext): string {
+  if (!context) return "";
+  const parts: string[] = [];
+  const p = context.userProfile;
+  if (p && (p.name || p.profession || p.description)) {
+    const bits = [
+      p.name ? `Name: ${p.name}` : "",
+      p.profession ? `Profession: ${p.profession}` : "",
+      p.description ? `About: ${p.description}` : "",
+    ]
+      .filter(Boolean)
+      .join("; ");
+    parts.push(`About the user — ${bits}.`);
+  }
+  if (context.priorSummary?.trim()) {
+    parts.push(`Context from earlier in this mission:\n${context.priorSummary.trim()}`);
+  }
+  return parts.length ? `${parts.join("\n\n")}\n\n` : "";
+}
 
 export class Planner {
   private gateway: IMeshGateway;
   private bus: IBus;
 
-  constructor() {
-    this.gateway = container.resolve<IMeshGateway>("IMeshGateway");
-    this.bus = container.resolve<IBus>("IBus");
+  constructor(scope: Container = container) {
+    this.gateway = scope.resolve<IMeshGateway>("IMeshGateway");
+    this.bus = scope.resolve<IBus>("IBus");
   }
 
-  async plan(goal: string, taskId?: string): Promise<TaskPlan> {
+  async plan(goal: string, taskId?: string, context?: PlanContext): Promise<TaskPlan> {
     // Surface the orchestrator's reasoning tokens as "thinking" for the UI.
     const onReasoning = taskId
       ? (reasoning: string) => {
@@ -63,7 +91,7 @@ DO NOT output any conversational text before or after the JSON. Only return a va
 
     const messages: ChatMessage[] = [
       { role: "system", content: systemPrompt },
-      { role: "user", content: `Create a task plan for this goal: "${goal}"` }
+      { role: "user", content: `${renderPlanContext(context)}Create a task plan for this goal: "${goal}"` }
     ];
 
     let response = await this.gateway.chat(messages, {

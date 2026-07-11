@@ -15,6 +15,13 @@ import {
 } from "../utils/agentWorkspace";
 import { renderMarkdown } from "../utils/simpleMarkdown";
 import { buildArtifactExplorer } from "../utils/artifactExplorer";
+import {
+  ORCHESTRATOR_DISPLAY,
+  agentIdentity,
+  displaySender,
+  humanizeChannelName,
+  isOrchestratorSender,
+} from "../utils/displayNames";
 import * as shared from "@yaaa/shared";
 const { ORCHESTRATOR_MD_HEADERS } = shared;
 
@@ -185,10 +192,11 @@ function parseOrchestratorMd(content: string | null): ParsedOrchestrator {
 
 function getAvatarColor(sender: string): string {
   if (sender === "User") return "#36c5f0"; // Slack blue
+  // YAAA / orchestrator / supervisor all share the purple persona color.
+  if (isOrchestratorSender(sender) || sender === ORCHESTRATOR_DISPLAY) return "#4a154b";
   if (sender.toLowerCase().includes("planner")) return "#e01e5a"; // Slack pink
   if (sender.toLowerCase().includes("worker")) return "#2eb67d"; // Slack green
   if (sender.toLowerCase().includes("verifier")) return "#ecb22e"; // Slack yellow
-  if (sender.toLowerCase().includes("supervisor") || sender.toLowerCase().includes("orchestrator")) return "#4a154b"; // Slack purple
   return "#707070";
 }
 
@@ -211,30 +219,34 @@ function formatCapabilityLabel(capability: string): string {
  * pure prompt slug — never suffixed with the task id.
  */
 function formatChannelName(prompt: string): string {
-  const slug = prompt
+  const words = prompt
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
-    .trim()
-    .replace(/\s+/g, "-")
-    .substring(0, 30);
-  return slug || "new-mission";
+    .split(/[\s-]+/)
+    .filter(Boolean)
+    .slice(0, 6)
+    .join(" ")
+    .substring(0, 40)
+    .trim();
+  return words || "new mission";
 }
 
-function getArtifactHref(yaaaDir: string, activeTaskId: string | null, artPath: string): string {
-  if (!yaaaDir || !activeTaskId || !artPath) return "#";
-  const encodedPath = artPath.split("/").map(p => encodeURIComponent(p)).join("/");
-  return `file://${yaaaDir}/tasks/${activeTaskId}/working/${encodedPath}`;
-}
-
-/** Markdown/plaintext, images, and graphTD diagrams preview in-app — PPT/PDF/Excel rendering is a separate, larger feature. */
+/**
+ * Files the in-app viewer can render: markdown/plaintext, images, graphTD
+ * diagrams, and common source/config text files. Binary office docs
+ * (PPT/PDF/Excel) still need a dedicated renderer and are excluded.
+ */
 function isPreviewableArtifact(artPath: string): boolean {
-  return /\.(md|markdown|txt|mmd|mermaid|png|jpe?g|gif|webp|svg)$/i.test(artPath);
+  return /\.(md|markdown|txt|mmd|mermaid|png|jpe?g|gif|webp|svg|py|js|jsx|ts|tsx|json|ya?ml|toml|html?|css|scss|sh|bash|c|cc|cpp|h|hpp|java|go|rs|rb|php|sql|xml|csv|env|ini|cfg|log)$/i.test(
+    artPath,
+  );
 }
 
 export function DashboardView({ viewModel }: DashboardViewProps) {
   const {
     goal,
     setGoal,
+    submittedPrompt,
     taskId,
     setTaskId,
     running,
@@ -249,7 +261,9 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     channelTopic,
     chatMessages = [],
     startTask,
+    continueMission,
     confirmPlan,
+    rejectPlan,
     resolveApproval,
     deleteTask,
     tasks,
@@ -286,8 +300,17 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   const [annotating, setAnnotating] = useState(false);
   const activeArtifactRequestRef = useRef(0);
 
-  // YAAA data directory state
-  const [yaaaDir, setYaaaDir] = useState<string>("");
+  // Plan review modal: view the proposed orchestrator.md, comment on it, then
+  // Accept (addressing comments) or Reject (with a required reason).
+  const [planReviewOpen, setPlanReviewOpen] = useState(false);
+  const [planReviewMd, setPlanReviewMd] = useState<string | null>(null);
+  const [planReviewLoading, setPlanReviewLoading] = useState(false);
+  const [planComment, setPlanComment] = useState("");
+  const [rejecting, setRejecting] = useState(false);
+  const [rejectReason, setRejectReason] = useState("");
+
+  // Sub-agent thread currently expanded into the full-screen thread view.
+  const [openThreadAgentId, setOpenThreadAgentId] = useState<string | null>(null);
 
   // User's name from onboarding profile
   const [userName, setUserName] = useState("");
@@ -303,13 +326,6 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
       .then((list) => setMcpIntegrations(list || []))
       .catch(() => setMcpIntegrations([]));
   }, [selectedTaskId, taskId]);
-
-  // Fetch yaaaDir on mount
-  useEffect(() => {
-    TaskModel.getYaaaDir()
-      .then(setYaaaDir)
-      .catch((err) => console.error("Failed to fetch YAAA dir:", err));
-  }, []);
 
   // Fetch user's name from onboarding profile on mount
   useEffect(() => {
@@ -368,14 +384,64 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     };
   }, [selectedTaskId]);
 
+  // Load the proposed plan (orchestrator.md) for the live task whenever the
+  // review modal is opened.
+  useEffect(() => {
+    let active = true;
+    if (planReviewOpen && taskId) {
+      setPlanReviewLoading(true);
+      setPlanReviewMd(null);
+      TaskModel.readTaskOrchestrator(taskId)
+        .then((content) => {
+          if (active) setPlanReviewMd(content);
+        })
+        .catch((err) => {
+          console.error("Failed to load plan:", err);
+          if (active) setPlanReviewMd(null);
+        })
+        .finally(() => {
+          if (active) setPlanReviewLoading(false);
+        });
+    }
+    return () => {
+      active = false;
+    };
+  }, [planReviewOpen, taskId]);
+
+  // Resolve any raw sender key (agent id OR roster handle) back to its agent,
+  // so a chat bubble keyed by "@sage-1" and a team card keyed by "agent-research"
+  // render as the same person. Names are always seeded on the canonical id.
+  const resolveAgent = useMemo(() => {
+    const byKey: Record<string, (typeof agents)[number]> = {};
+    for (const a of agents) {
+      if (a?.id) byKey[a.id] = a;
+      if (a?.handle) byKey[a.handle] = a;
+    }
+    return (raw: string) => byKey[raw];
+  }, [agents]);
+
+  const labelForSender = (raw: string): string => {
+    if (isOrchestratorSender(raw)) return ORCHESTRATOR_DISPLAY;
+    if (raw === "User" || raw === "System" || raw === "Agent") return raw;
+    const a = resolveAgent(raw);
+    if (a) return agentIdentity(a.id, a.role).display;
+    return displaySender(raw);
+  };
+
   const handleChipClick = (chip: string) => {
     setGoal(chip);
   };
 
-  const handleReset = () => {
-    setSelectedTaskId(null);
-    setShowTaskView(false);
-    setTaskId(null);
+  /**
+   * Route the channel composer: a live, open mission continues in-channel (no
+   * new chat); the home view and archived channels start a fresh mission.
+   */
+  const handleChannelSend = () => {
+    if (taskId && !selectedTaskId) {
+      continueMission(goal);
+    } else {
+      startTask();
+    }
   };
 
   const handleSelectTask = (id: string) => {
@@ -481,6 +547,37 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     setTaskId(null);
   };
 
+  const handleOpenPlanReview = () => {
+    setPlanComment("");
+    setRejectReason("");
+    setRejecting(false);
+    setPlanReviewOpen(true);
+  };
+
+  const handleClosePlanReview = () => {
+    setPlanReviewOpen(false);
+    setRejecting(false);
+  };
+
+  const handleAcceptPlan = () => {
+    const comment = planComment;
+    setPlanReviewOpen(false);
+    setRejecting(false);
+    setPlanComment("");
+    setRejectReason("");
+    confirmPlan(comment);
+  };
+
+  const handleSubmitReject = () => {
+    if (!rejectReason.trim()) return;
+    const reason = rejectReason;
+    setPlanReviewOpen(false);
+    setRejecting(false);
+    setRejectReason("");
+    setPlanComment("");
+    rejectPlan(reason);
+  };
+
   const formatDate = (dateStr: string): string => {
     if (!dateStr) return "";
     try {
@@ -506,8 +603,10 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   // the mission's event subscription has already been torn down.
   const liveTask = taskId ? tasks.find(t => t.id === taskId) : null;
   const currentChannelName = selectedTask
-    ? (selectedTask.topic || formatChannelName(selectedTask.prompt))
-    : (taskId ? (channelTopic || liveTask?.topic || formatChannelName(goal)) : "general");
+    ? humanizeChannelName(selectedTask.topic || formatChannelName(selectedTask.prompt))
+    : (taskId
+        ? humanizeChannelName(channelTopic || liveTask?.topic || formatChannelName(submittedPrompt || goal))
+        : "general");
 
   const memoizedData = useMemo(() => {
     let displayMessages: any[] = [];
@@ -573,7 +672,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
         id: "user-prompt",
         sender: "User",
         time: new Date().toLocaleTimeString(),
-        content: goal,
+        content: submittedPrompt || goal,
         kind: "thought"
       });
 
@@ -636,6 +735,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     historyMessages,
     showTaskView,
     goal,
+    submittedPrompt,
     logs,
     subtasks,
     artifacts,
@@ -652,6 +752,27 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   // Real capabilities this plan actually uses, replacing what used to be a
   // hardcoded fake Slack/GitHub/Web-Search "connected" list.
   const activeCapabilities = Array.from(new Set(displaySubtasks.map((st) => st.capability).filter(Boolean)));
+
+  // Each spawned agent runs in its own sub-thread. In the main channel we show
+  // a compact card (YAAA's handoff + a "Show thread" affordance); the full
+  // agent conversation and proof of work live behind the thread overlay.
+  const missionThreads = useMemo(() => {
+    return agents.map((agent) => {
+      const subtask = displaySubtasks.find((s: any) => s.id === agent.subtaskId);
+      const activity = getAgentActivity(agent, logs);
+      const handoffParts: string[] = [];
+      if (subtask?.title) handoffParts.push(subtask.title);
+      if ((subtask as any)?.successCriteria) {
+        handoffParts.push(`Success criteria: ${(subtask as any).successCriteria}`);
+      }
+      const handoff = handoffParts.join("\n\n") || agent.summary || "Assignment briefing pending.";
+      return { agent, subtask, activity, handoff };
+    });
+  }, [agents, displaySubtasks, logs]);
+
+  const openThread = openThreadAgentId
+    ? missionThreads.find((t) => t.agent.id === openThreadAgentId) || null
+    : null;
 
   // Collapse runs of consecutive "thinking" messages into a single dropdown
   // panel; everything else renders as an individual chat bubble.
@@ -703,7 +824,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                 const isActive = (showTaskView && t.id === taskId) || (selectedTaskId === t.id);
                 const isWaiting = t.id === taskId && running && pendingApproval;
                 const status = isWaiting ? "waiting" : (t.id === taskId && awaitingConfirmation ? "awaiting_confirmation" : (t.id === taskId && running ? "running" : t.status));
-                const channelName = t.topic || formatChannelName(t.prompt);
+                const channelName = humanizeChannelName(t.topic || formatChannelName(t.prompt));
                 return (
                   <div key={t.id} className={`slack-channel-item-row ${isActive ? "active" : ""}`}>
                     <button
@@ -771,11 +892,6 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                 <line x1="3" y1="18" x2="21" y2="18"/>
               </svg>
             </button>
-            {(showTaskView || selectedTaskId) && (
-              <button className="dash-back-btn" onClick={handleReset}>
-                ← New Mission
-              </button>
-            )}
           </div>
 
           <div className="dash-topbar-right">
@@ -949,6 +1065,13 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                     );
                   }
                   const msg = group.msg;
+                  // Agent-spawn lifecycle notices are represented by the thread
+                  // cards below, so suppress them from the inline stream once a
+                  // thread exists for that work.
+                  if (msg.kind === "lifecycle" && missionThreads.length > 0 && !selectedTaskId) {
+                    return null;
+                  }
+                  const senderLabel = labelForSender(msg.sender);
                   return msg.kind === "lifecycle" ? (
                     <div className="slack-system-notice" role="status" key={msg.id}>
                       <span className="slack-system-notice-line" aria-hidden="true" />
@@ -959,16 +1082,16 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   <div className="slack-message" key={msg.id}>
                     <div
                       className="slack-message-avatar"
-                      style={{ backgroundColor: getAvatarColor(msg.sender) }}
+                      style={{ backgroundColor: getAvatarColor(senderLabel) }}
                     >
-                      {msg.sender.charAt(0).toUpperCase()}
+                      {senderLabel.charAt(0).toUpperCase()}
                     </div>
                     <div className="slack-message-content">
                       <div className="slack-message-header">
-                        <span className="slack-message-sender">{msg.sender}</span>
+                        <span className="slack-message-sender">{senderLabel}</span>
                         <span className="slack-message-time">{msg.time}</span>
                       </div>
-                      <div className={`slack-message-bubble ${msg.sender === 'User' ? 'slack-message-sender-user' : ''} ${msg.kind === 'response' ? 'slack-message-response' : ''} ${msg.kind === 'activity' ? 'slack-message-activity' : ''}`}>
+                      <div className={`slack-message-bubble ${senderLabel === 'User' ? 'slack-message-sender-user' : ''} ${msg.kind === 'response' ? 'slack-message-response' : ''} ${msg.kind === 'activity' ? 'slack-message-activity' : ''}`}>
                         <div className="slack-message-text">{msg.content}</div>
 
                         {msg.artifacts && msg.artifacts.length > 0 && (
@@ -980,28 +1103,22 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                                   <span className="artifact-filename">{art.path.split("/").pop()}</span>
                                   <span className="artifact-description">{art.description}</span>
                                 </div>
-                                {isPreviewableArtifact(art.path) && (
+                                {isPreviewableArtifact(art.path) ? (
                                   <button
                                     type="button"
                                     className="slack-artifact-download"
                                     onClick={() => handlePreviewArtifact(art.path)}
                                   >
-                                    Preview
-                                  </button>
-                                )}
-                                {(!yaaaDir || !(selectedTaskId || taskId)) ? (
-                                  <span className="slack-artifact-download disabled" style={{ opacity: 0.5, cursor: 'not-allowed' }}>
                                     Open
-                                  </span>
+                                  </button>
                                 ) : (
-                                  <a
-                                    className="slack-artifact-download"
-                                    href={getArtifactHref(yaaaDir, selectedTaskId || taskId, art.path)}
-                                    target="_blank"
-                                    rel="noreferrer"
+                                  <span
+                                    className="slack-artifact-download disabled"
+                                    style={{ opacity: 0.5, cursor: 'not-allowed' }}
+                                    title="Preview not supported for this file type yet"
                                   >
                                     Open
-                                  </a>
+                                  </span>
                                 )}
                               </div>
                             ))}
@@ -1013,12 +1130,51 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   );
                 })}
 
+                {/* Mission threads — one collapsed card per spawned sub-agent.
+                    YAAA's handoff shows inline; the full agent thread and proof
+                    of work open in a dedicated thread view. */}
+                {showTaskView && !selectedTaskId && missionThreads.length > 0 && (
+                  <div className="mission-threads" aria-label="Agent threads">
+                    <div className="mission-threads-title">Agent threads</div>
+                    {missionThreads.map(({ agent, activity, handoff }) => {
+                      const identity = labelForSender(agent.id);
+                      return (
+                        <div className="mission-thread-card" key={agent.id}>
+                          <div
+                            className="slack-message-avatar mission-thread-avatar"
+                            style={{ backgroundColor: getAvatarColor(identity) }}
+                          >
+                            {identity.charAt(0).toUpperCase()}
+                          </div>
+                          <div className="mission-thread-body">
+                            <div className="mission-thread-header">
+                              <span className="mission-thread-name">{identity}</span>
+                              <span className={`detail-status-pill ${agent.status}`}>{agent.status}</span>
+                            </div>
+                            <div className="mission-thread-handoff">
+                              <span className="mission-thread-handoff-label">{ORCHESTRATOR_DISPLAY} handoff</span>
+                              <div className="mission-thread-handoff-text">{handoff}</div>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            className="mission-thread-show-btn"
+                            onClick={() => setOpenThreadAgentId(agent.id)}
+                          >
+                            Show thread{activity.length > 0 ? ` · ${activity.length}` : ""} →
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
                 {/* Approval Banner inside chat list */}
                 {showTaskView && pendingApproval && (
                   <div className="approval-banner" style={{ marginTop: '1.25rem' }}>
                     <div className="approval-title">⚠️ Security Confirmation Required</div>
                     <div className="approval-body">
-                      <p>Agent <strong>{pendingApproval.agentId}</strong> requests permission to run:</p>
+                      <p>Agent <strong>{labelForSender(pendingApproval.agentId)}</strong> requests permission to run:</p>
                       <div className="approval-details">
                         <strong>Capability:</strong> {pendingApproval.toolCall.capability}<br />
                         <strong>Method:</strong> {pendingApproval.toolCall.method}<br />
@@ -1037,10 +1193,11 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   <div className="approval-banner" style={{ marginTop: '1.25rem' }}>
                     <div className="approval-title">Plan ready for review</div>
                     <div className="approval-body">
-                      The orchestrator has proposed the work shown in Todo and Progress. No agent actions have started yet.
+                      {ORCHESTRATOR_DISPLAY} has proposed a plan. Open it to read the full brief,
+                      leave comments, then accept or reject before any agent starts.
                     </div>
                     <div className="approval-actions">
-                      <button className="btn-approve" onClick={confirmPlan}>Confirm plan &amp; start agents</button>
+                      <button className="btn-approve" onClick={handleOpenPlanReview}>Review plan</button>
                     </div>
                   </div>
                 )}
@@ -1076,10 +1233,10 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                 <div className="slack-chat-input-box">
                   <span>
                     {selectedTaskId && "🔒 Archived channel — send a message to start a new mission."}
-                    {inConversationView && "💬 Chatting with @orchestrator — describe a mission to assemble the team."}
+                    {inConversationView && "💬 Chatting with YAAA — describe a mission to assemble the team."}
                     {!selectedTaskId && !inConversationView && awaitingConfirmation && "🗺️ Plan ready. Review Todo and Progress, then confirm to start agents."}
                     {!selectedTaskId && !inConversationView && running && "⚡ Mission in progress... Agent is running and printing thoughts."}
-                    {!selectedTaskId && !inConversationView && !running && success === true && "✅ Mission completed."}
+                    {!selectedTaskId && !inConversationView && !running && success === true && "✅ Mission completed. Send a follow-up to continue in this channel."}
                     {!selectedTaskId && !inConversationView && !running && success === false && "❌ Mission failed."}
                     {!selectedTaskId && !inConversationView && !running && success === null && "⚡ Channel initialized. Ready to execute."}
                   </span>
@@ -1087,7 +1244,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                 <MissionInput
                   value={goal}
                   onChange={setGoal}
-                  onSubmit={() => startTask()}
+                  onSubmit={handleChannelSend}
                   running={running || awaitingConfirmation}
                   placeholder="Message this channel…"
                 />
@@ -1111,10 +1268,11 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   </div>
                 ) : agents.map((agent) => {
                   const agentActivity = getAgentActivity(agent, logs);
+                  const identity = agentIdentity(agent.id, agent.role);
                   return (
                   <details className="agent-space-block" key={agent.id}>
                     <summary className="agent-space-block-label">
-                      <span>{agent.handle} · {agent.role}</span>
+                      <span>{identity.display} · {identity.mention}</span>
                       <span className={`detail-status-pill ${agent.status}`}>{agent.status}</span>
                     </summary>
                     <div className="agent-space-block-text">Model role: {agent.modelRole}</div>
@@ -1159,15 +1317,18 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                     <div className="slack-section-empty">Agents will join after the plan is confirmed.</div>
                   ) : (
                     <div className="mission-team-list">
-                      {agents.map((agent) => (
+                      {agents.map((agent) => {
+                        const identity = agentIdentity(agent.id, agent.role);
+                        return (
                         <div className="mission-team-member" key={agent.id}>
                           <span className={`mission-team-status ${agent.status}`} aria-label={agent.status} />
                           <div className="mission-team-identity">
-                            <span className="mission-team-handle">{agent.handle}</span>
-                            <span className="mission-team-role">{agent.role}</span>
+                            <span className="mission-team-handle">{identity.firstName} · {identity.mention}</span>
+                            <span className="mission-team-role">{identity.roleLabel}</span>
                           </div>
                         </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   )}
                 </div>
@@ -1210,26 +1371,21 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                                 <div className="artifact-desc">{art.description}</div>
                               </div>
                               <div className="artifact-actions">
-                                {isPreviewableArtifact(art.path) && (
+                                {isPreviewableArtifact(art.path) ? (
                                   <button
                                     type="button"
                                     className="artifact-link"
                                     onClick={() => handlePreviewArtifact(art.path)}
                                   >
-                                    Preview
+                                    Open
                                   </button>
-                                )}
-                                {(!yaaaDir || !(selectedTaskId || taskId)) ? (
-                                  <span className="artifact-link disabled">Open</span>
                                 ) : (
-                                  <a
-                                    className="artifact-link"
-                                    href={getArtifactHref(yaaaDir, selectedTaskId || taskId, art.path)}
-                                    target="_blank"
-                                    rel="noreferrer"
+                                  <span
+                                    className="artifact-link disabled"
+                                    title="Preview not supported for this file type yet"
                                   >
                                     Open
-                                  </a>
+                                  </span>
                                 )}
                               </div>
                             </div>
@@ -1421,8 +1577,10 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                     />
                   ) : artifactPreview.kind === "diagram" ? (
                     <ArchitectureViewer source={artifactPreview.content} />
-                  ) : (
+                  ) : /\.(md|markdown|txt)$/i.test(artifactPreview.path) ? (
                     <div className="markdown-preview">{renderMarkdown(artifactPreview.content)}</div>
+                  ) : (
+                    <pre className="code-preview">{artifactPreview.content}</pre>
                   )}
                   {annotating && (selectedTaskId || taskId) && (
                     <AnnotationOverlay
@@ -1433,6 +1591,152 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   )}
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ─── PLAN REVIEW MODAL (view MD, comment, accept/reject) ─── */}
+      {planReviewOpen && (
+        <div className="artifact-preview-overlay" onClick={handleClosePlanReview}>
+          <div className="artifact-preview-panel plan-review-panel" onClick={(e) => e.stopPropagation()}>
+            <div className="artifact-preview-header">
+              <span className="artifact-preview-title">Review plan · {currentChannelName}</span>
+              <button
+                type="button"
+                className="artifact-preview-close"
+                onClick={handleClosePlanReview}
+                aria-label="Close plan review"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="artifact-preview-body">
+              {planReviewLoading ? (
+                <div className="panel-empty">
+                  <div className="thinking-dots"><span /><span /><span /></div>
+                </div>
+              ) : planReviewMd ? (
+                <div className="markdown-preview">{renderMarkdown(planReviewMd)}</div>
+              ) : (
+                <div className="markdown-preview">
+                  {renderMarkdown(
+                    `## Proposed plan\n\n${
+                      displaySubtasks.length
+                        ? displaySubtasks
+                            .map((s, i) => `${i + 1}. **${s.title}** _(capability: ${s.capability || "n/a"})_`)
+                            .join("\n")
+                        : "_No subtasks were proposed._"
+                    }`,
+                  )}
+                </div>
+              )}
+            </div>
+            <div className="plan-review-footer">
+              {rejecting ? (
+                <>
+                  <label className="plan-review-label" htmlFor="plan-reject-reason">
+                    Why are you rejecting this plan?
+                  </label>
+                  <textarea
+                    id="plan-reject-reason"
+                    className="plan-review-textarea"
+                    placeholder="Tell YAAA what's wrong so it can re-plan…"
+                    value={rejectReason}
+                    onChange={(e) => setRejectReason(e.target.value)}
+                  />
+                  <div className="plan-review-actions">
+                    <button type="button" className="btn-reject" onClick={() => setRejecting(false)}>
+                      Back
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-approve"
+                      disabled={!rejectReason.trim()}
+                      onClick={handleSubmitReject}
+                    >
+                      Submit rejection
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <label className="plan-review-label" htmlFor="plan-comment">
+                    Comments (optional)
+                  </label>
+                  <textarea
+                    id="plan-comment"
+                    className="plan-review-textarea"
+                    placeholder="Leave comments for YAAA to address before starting…"
+                    value={planComment}
+                    onChange={(e) => setPlanComment(e.target.value)}
+                  />
+                  <div className="plan-review-actions">
+                    <button type="button" className="btn-reject" onClick={() => setRejecting(true)}>
+                      Reject
+                    </button>
+                    <button type="button" className="btn-approve" onClick={handleAcceptPlan}>
+                      {planComment.trim() ? "Accept (addressing comments)" : "Accept plan"}
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ─── AGENT THREAD OVERLAY (opened from a "Show thread" card) ─── */}
+      {openThread && (
+        <div className="artifact-preview-overlay" onClick={() => setOpenThreadAgentId(null)}>
+          <div className="artifact-preview-panel thread-panel" onClick={(e) => e.stopPropagation()}>
+            <div className="artifact-preview-header">
+              <button
+                type="button"
+                className="thread-back-btn"
+                onClick={() => setOpenThreadAgentId(null)}
+              >
+                ← Back
+              </button>
+              <span className="artifact-preview-title">
+                {labelForSender(openThread.agent.id)} · thread
+              </span>
+              <button
+                type="button"
+                className="artifact-preview-close"
+                onClick={() => setOpenThreadAgentId(null)}
+                aria-label="Close thread"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="artifact-preview-body">
+              <div className="thread-section">
+                <div className="thread-section-title">
+                  {ORCHESTRATOR_DISPLAY} → {labelForSender(openThread.agent.id)} · Handoff document
+                </div>
+                <div className="thread-handoff-doc">{openThread.handoff}</div>
+              </div>
+              <div className="thread-section">
+                <div className="thread-section-title">Thread activity ({openThread.activity.length})</div>
+                {openThread.activity.length === 0 ? (
+                  <div className="agent-space-block-text">No activity reported yet.</div>
+                ) : (
+                  openThread.activity.map((log) => (
+                    <div className="agent-space-action-row" key={log.id}>
+                      <span className="agent-space-action-icon" aria-hidden="true">💭</span>
+                      <span className="agent-space-action-text">{log.content}</span>
+                    </div>
+                  ))
+                )}
+              </div>
+              <div className="thread-section">
+                <div className="thread-section-title">Proof of work</div>
+                <div className="agent-space-block-text">
+                  Status: {openThread.agent.status}
+                  {openThread.agent.summary ? ` — ${openThread.agent.summary}` : ""}
+                </div>
+              </div>
             </div>
           </div>
         </div>

@@ -204,6 +204,31 @@ ipcMain.handle("confirm-task", async (_event, taskId) => {
   return { status: "started" };
 });
 
+ipcMain.handle("continue-task", async (_event, { taskId, message }) => {
+  if (killedTasks.has(taskId)) {
+    return { status: "error", error: "Mission was deleted" };
+  }
+  // A follow-up either gets a lightweight conversational reply (streamed as an
+  // orchestrator bubble) or re-plans on the SAME task/channel (streamed via the
+  // plan_updated event). The renderer already attached its listeners before
+  // invoking, so we can await and hand back which path was taken.
+  try {
+    const result = await workspace.continueMission(taskId, message, {
+      onEvent: (event) => forwardRuntimeEvent(taskId, event),
+      onApproval: makeApprovalHandler(taskId),
+    });
+    return { status: result.kind };
+  } catch (err) {
+    if (killedTasks.has(taskId)) return { status: "cancelled" };
+    sendToRenderer("task-complete", {
+      success: false,
+      summary: err?.message ?? String(err),
+      reason: isInsufficientFundsError(err) ? "insufficient_funds" : undefined,
+    });
+    return { status: "error", error: err?.message ?? String(err) };
+  }
+});
+
 ipcMain.handle("resolve-approval", async (_event, { callId, approved }) => {
   const resolve = pendingApprovals.get(callId);
   if (!resolve) {

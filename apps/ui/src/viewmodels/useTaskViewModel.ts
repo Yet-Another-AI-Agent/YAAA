@@ -6,6 +6,10 @@ import { formatAgentLifecycleNotice } from "../utils/agentWorkspace";
 
 export function useTaskViewModel() {
   const [goal, setGoal] = useState("");
+  // The mission text actually submitted for the active channel. Kept separate
+  // from `goal` so the composer can be cleared on send while the task view
+  // still shows the prompt that started the mission.
+  const [submittedPrompt, setSubmittedPrompt] = useState("");
   const [taskId, setTaskId] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [awaitingConfirmation, setAwaitingConfirmation] = useState(false);
@@ -55,6 +59,109 @@ export function useTaskViewModel() {
     };
   }, []);
 
+  /**
+   * Subscribe to the active task's event stream and route events into local
+   * state. Shared by startTask (new mission) and continueMission (follow-up on
+   * an existing mission), since a completed mission tears its subscription down.
+   */
+  const attachTaskEventStream = () => {
+    if (unsubscribeRef.current) {
+      unsubscribeRef.current();
+    }
+    unsubscribeRef.current = TaskModel.subscribeEvents(
+      (eventData) => {
+        const { topic, data } = eventData;
+
+        if (topic.endsWith("agent_status")) {
+          const index = agentsRef.current.findIndex((agent) => agent.id === data.id);
+          const previous = index < 0 ? undefined : agentsRef.current[index];
+          const nextAgents = index < 0
+            ? [...agentsRef.current, data]
+            : agentsRef.current.map((agent) => agent.id === data.id ? data : agent);
+          agentsRef.current = nextAgents;
+          setAgents(nextAgents);
+
+          const lifecycleNotice = formatAgentLifecycleNotice(previous, data);
+          if (lifecycleNotice) {
+            addLog("system", `[agent-lifecycle] ${lifecycleNotice}`);
+          }
+        }
+
+        else if (topic.includes("plan_updated")) {
+          if (data && data.subtasks) {
+            setSubtasks(data.subtasks);
+            const producedArtifacts: UIArtifact[] = [];
+            data.subtasks.forEach((st: any) => {
+              if (st.state === "completed" && st.artifacts) {
+                producedArtifacts.push(...st.artifacts);
+              }
+            });
+            setArtifacts(producedArtifacts);
+          }
+          setRunning(false);
+          setAwaitingConfirmation(true);
+          addLog("orchestrator", "Plan ready for your review. Confirm the mission to begin agent work.");
+        }
+
+        else if (topic.endsWith(".thought")) {
+          // Reasoning tokens — rendered as collapsible "thinking", not chat.
+          addLog("agent", data.content, "thinking");
+        }
+
+        else if (topic.endsWith(".tool_requested")) {
+          const agentName = topic.split(".").find((p) => p.includes("agent-")) || "agent";
+          addLog("agent", `🛠️ ${agentName}: ${data.content}`, "activity");
+        }
+
+        else if (topic.includes("topic_updated")) {
+          if (data && data.topic) {
+            setChannelTopic(data.topic);
+            loadTasks(); // Reload so the sidebar channel list picks up the new name
+          }
+        }
+
+        else if (topic.includes("task-started")) {
+          if (data && data.taskId) {
+            addLog("system", `Backend Task UUID: ${data.taskId}`);
+            loadTasks(); // Reload to capture any backend changes
+          }
+        }
+
+        else if (topic.includes("started") || topic.includes("completed") || topic.includes("failed")) {
+          if (data && data.note) {
+            addLog("orchestrator", data.note);
+          }
+        }
+      },
+      (approvalData) => {
+        const { agentId, toolCall } = approvalData;
+        addLog("system", `⚠️ Action paused. Approval required for ${toolCall.capability}.${toolCall.method}`);
+        setPendingApproval({ agentId, toolCall });
+      },
+      (resultData) => {
+        setSuccess(resultData.success);
+        setSummary(resultData.summary);
+        setRunning(false);
+        setAwaitingConfirmation(false);
+        // Surface the final answer as an assistant chat message. On failure
+        // the recovery banner carries the error instead, so skip it here.
+        if (resultData.success && resultData.summary) {
+          addLog("orchestrator", resultData.summary, "response");
+        }
+        if (resultData.reason === "insufficient_funds") {
+          addLog("system", "⚠️ API account is out of funds — update your key or add credit.");
+          setApiKeyPrompt("funds");
+        }
+        loadTasks(); // Reload list to show final status
+
+        if (unsubscribeRef.current) {
+          unsubscribeRef.current();
+          unsubscribeRef.current = null;
+        }
+      }
+    );
+  };
+
   const startTask = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (!goal.trim() || running || awaitingConfirmation) return;
@@ -69,7 +176,7 @@ export function useTaskViewModel() {
         setChatMessages((prev) => [
           ...prev,
           { id: `chat-user-${prev.length}`, sender: "User", content: submitted, time: now },
-          { id: `chat-orch-${prev.length}`, sender: "@orchestrator", content: route.reply, time: now },
+          { id: `chat-orch-${prev.length}`, sender: "YAAA", content: route.reply, time: now },
         ]);
         setGoal("");
         return;
@@ -92,7 +199,12 @@ export function useTaskViewModel() {
     setRunning(true);
     setAwaitingConfirmation(false);
 
-    addLog("system", `Submitting task to supervisor: "${goal}"`);
+    // The prompt now belongs to the task view; clear the composer so it goes
+    // blank on send instead of leaving the message stuck in the box.
+    setSubmittedPrompt(submitted);
+    setGoal("");
+
+    addLog("system", `Submitting task to YAAA: "${submitted}"`);
 
     try {
       if (unsubscribeRef.current) {
@@ -100,109 +212,58 @@ export function useTaskViewModel() {
       }
 
       // 1. Call Model to trigger task
-      const newTaskId = await TaskModel.startTask(goal);
+      const newTaskId = await TaskModel.startTask(submitted);
       setTaskId(newTaskId);
       addLog("system", `Task initialized. ID: ${newTaskId}. Listening to event stream...`);
       loadTasks(); // Update list immediately once startTask runs and task gets created
 
       // 2. Subscribe to Model events and delegate actions
-      unsubscribeRef.current = TaskModel.subscribeEvents(
-        (eventData) => {
-          const { topic, data } = eventData;
-          
-          if (topic.endsWith("agent_status")) {
-            const index = agentsRef.current.findIndex((agent) => agent.id === data.id);
-            const previous = index < 0 ? undefined : agentsRef.current[index];
-            const nextAgents = index < 0
-              ? [...agentsRef.current, data]
-              : agentsRef.current.map((agent) => agent.id === data.id ? data : agent);
-            agentsRef.current = nextAgents;
-            setAgents(nextAgents);
-
-            const lifecycleNotice = formatAgentLifecycleNotice(previous, data);
-            if (lifecycleNotice) {
-              addLog("system", `[agent-lifecycle] ${lifecycleNotice}`);
-            }
-          }
-
-          else if (topic.includes("plan_updated")) {
-            if (data && data.subtasks) {
-              setSubtasks(data.subtasks);
-              const producedArtifacts: UIArtifact[] = [];
-              data.subtasks.forEach((st: any) => {
-                if (st.state === "completed" && st.artifacts) {
-                  producedArtifacts.push(...st.artifacts);
-                }
-              });
-              setArtifacts(producedArtifacts);
-            }
-            setRunning(false);
-            setAwaitingConfirmation(true);
-            addLog("orchestrator", "Plan ready for your review. Confirm the mission to begin agent work.");
-          }
-
-          else if (topic.endsWith(".thought")) {
-            // Reasoning tokens — rendered as collapsible "thinking", not chat.
-            addLog("agent", data.content, "thinking");
-          }
-
-          else if (topic.endsWith(".tool_requested")) {
-            const agentName = topic.split(".").find((p) => p.includes("agent-")) || "agent";
-            addLog("agent", `🛠️ ${agentName}: ${data.content}`, "activity");
-          }
-
-          else if (topic.includes("topic_updated")) {
-            if (data && data.topic) {
-              setChannelTopic(data.topic);
-              loadTasks(); // Reload so the sidebar channel list picks up the new name
-            }
-          }
-
-          else if (topic.includes("task-started")) {
-            if (data && data.taskId) {
-              addLog("system", `Backend Task UUID: ${data.taskId}`);
-              loadTasks(); // Reload to capture any backend changes
-            }
-          }
-
-          else if (topic.includes("started") || topic.includes("completed") || topic.includes("failed")) {
-            if (data && data.note) {
-              addLog("orchestrator", data.note);
-            }
-          }
-        },
-        (approvalData) => {
-          const { agentId, toolCall } = approvalData;
-          addLog("system", `⚠️ Action paused. Approval required for ${toolCall.capability}.${toolCall.method}`);
-          setPendingApproval({ agentId, toolCall });
-        },
-        (resultData) => {
-          setSuccess(resultData.success);
-          setSummary(resultData.summary);
-          setRunning(false);
-          setAwaitingConfirmation(false);
-          // Surface the final answer as an assistant chat message. On failure
-          // the recovery banner carries the error instead, so skip it here.
-          if (resultData.success && resultData.summary) {
-            addLog("orchestrator", resultData.summary, "response");
-          }
-          if (resultData.reason === "insufficient_funds") {
-            addLog("system", "⚠️ API account is out of funds — update your key or add credit.");
-            setApiKeyPrompt("funds");
-          }
-          loadTasks(); // Reload list to show final status
-
-          if (unsubscribeRef.current) {
-            unsubscribeRef.current();
-            unsubscribeRef.current = null;
-          }
-        }
-      );
+      attachTaskEventStream();
 
     } catch (err: any) {
       addLog("system", `Error: ${err.message}`);
       setRunning(false);
       setAwaitingConfirmation(false);
+    }
+  };
+
+  /**
+   * Send a follow-up message to the already-open mission. Re-plans on the SAME
+   * channel (no new chat) with prior context, and re-attaches the event stream
+   * because a completed mission tears its subscription down.
+   */
+  const continueMission = async (message?: string) => {
+    const text = (message ?? goal).trim();
+    if (!taskId || !text || running || awaitingConfirmation) return;
+
+    // A follow-up produces a fresh plan; clear the prior plan/agents but keep
+    // accumulated artifacts so the mission's outputs persist across turns.
+    setSubtasks([]);
+    setAgents([]);
+    agentsRef.current = [];
+    setPendingApproval(null);
+    setSubmittedPrompt(text);
+    setGoal("");
+    setSuccess(null);
+    setSummary(null);
+    setRunning(true);
+    setAwaitingConfirmation(false);
+    addLog("system", `Following up on this mission: "${text}"`);
+
+    try {
+      attachTaskEventStream();
+      const result = await TaskModel.continueTask(taskId, text);
+      loadTasks();
+      // A conversational follow-up gets an inline reply (already streamed as an
+      // orchestrator bubble) and returns the composer to idle. A task follow-up
+      // stays "running" until the plan_updated event flips it to plan-review.
+      if (result?.status === "conversation") {
+        setRunning(false);
+        setAwaitingConfirmation(false);
+      }
+    } catch (err: any) {
+      addLog("system", `Error: ${err.message}`);
+      setRunning(false);
     }
   };
 
@@ -235,11 +296,14 @@ export function useTaskViewModel() {
     await loadTasks();
   };
 
-  const confirmPlan = async () => {
+  const confirmPlan = async (comments?: string) => {
     if (!taskId || running || !awaitingConfirmation) return;
     setAwaitingConfirmation(false);
     setRunning(true);
-    addLog("system", "Mission confirmed. Orchestrator is starting the approved plan.");
+    if (comments && comments.trim()) {
+      addLog("orchestrator", `Plan accepted with comments to address:\n${comments.trim()}`);
+    }
+    addLog("system", "Mission confirmed. YAAA is starting the approved plan.");
     try {
       await TaskModel.confirmTask(taskId);
       loadTasks();
@@ -250,9 +314,26 @@ export function useTaskViewModel() {
     }
   };
 
+  /**
+   * Reject the proposed plan with a required reason. There is no backend
+   * re-plan primitive yet, so this records the rejection reason as YAAA
+   * feedback and keeps the plan in review so the user can revise and resubmit.
+   */
+  const rejectPlan = async (reason: string) => {
+    if (!taskId || !awaitingConfirmation) return;
+    const trimmed = (reason || "").trim();
+    if (!trimmed) return;
+    addLog("system", `Plan rejected. Reason: ${trimmed}`);
+    addLog(
+      "orchestrator",
+      "Understood — I won't start this plan. Send a revised mission or more detail and I'll re-plan.",
+    );
+  };
+
   return {
     goal,
     setGoal,
+    submittedPrompt,
     taskId,
     setTaskId,
     running,
@@ -267,7 +348,9 @@ export function useTaskViewModel() {
     channelTopic,
     chatMessages,
     startTask,
+    continueMission,
     confirmPlan,
+    rejectPlan,
     resolveApproval,
     deleteTask,
     tasks,

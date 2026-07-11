@@ -2,12 +2,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, act, fireEvent } from "@testing-library/react";
 import { DashboardView } from "./DashboardView";
+import { agentIdentity, displaySender } from "../utils/displayNames";
 
 vi.mock("../assets/logo.jpg", () => ({ default: "logo.jpg" }));
 
 const makeViewModel = (overrides = {}) => ({
   goal: "",
   setGoal: vi.fn(),
+  submittedPrompt: "",
   taskId: null,
   setTaskId: vi.fn(),
   running: false,
@@ -22,7 +24,9 @@ const makeViewModel = (overrides = {}) => ({
   channelTopic: null,
   chatMessages: [],
   startTask: vi.fn(),
+  continueMission: vi.fn(),
   confirmPlan: vi.fn(),
+  rejectPlan: vi.fn(),
   resolveApproval: vi.fn(),
   deleteTask: vi.fn().mockResolvedValue(undefined),
   tasks: [],
@@ -74,7 +78,8 @@ describe("DashboardView", () => {
     render(<DashboardView viewModel={makeViewModel({ pendingApproval, taskId: "task-1", running: true })} />);
 
     expect(screen.getByText("Security Confirmation Required", { exact: false })).toBeTruthy();
-    expect(screen.getByText("agent-files")).toBeTruthy();
+    // The requesting agent is shown by its friendly human name, not the raw id.
+    expect(screen.getByText(displaySender("agent-files"))).toBeTruthy();
   });
 
   it("does not show approval banner when pendingApproval is null", () => {
@@ -180,7 +185,7 @@ describe("DashboardView", () => {
     })} />);
 
     await act(async () => {
-      fireEvent.click(screen.getAllByText("Preview")[0]);
+      fireEvent.click(screen.getAllByText("Open")[0]);
     });
 
     expect((window as any).electronAPI.readArtifact).toHaveBeenCalledWith("task-1", "summary.md");
@@ -208,7 +213,7 @@ describe("DashboardView", () => {
       ],
     })} />);
 
-    const previewButtons = screen.getAllByText("Preview");
+    const previewButtons = screen.getAllByText("Open");
     fireEvent.click(previewButtons[0]);
     fireEvent.click(previewButtons[1]);
 
@@ -220,13 +225,17 @@ describe("DashboardView", () => {
     expect(screen.getByRole("heading", { name: "Current preview" })).toBeTruthy();
   });
 
-  it("does not offer a preview button for non-Markdown artifacts", () => {
+  it("disables Open for artifacts the in-app viewer cannot render", () => {
     render(<DashboardView viewModel={makeViewModel({
       taskId: "task-1",
       artifacts: [{ path: "deck.pptx", mimeType: "application/vnd.ms-powerpoint", description: "Slides" }],
     })} />);
 
+    // No separate Preview control anymore; Open is the single viewer entry
+    // point and is disabled for unsupported binary types.
     expect(screen.queryByText("Preview")).toBeNull();
+    const open = screen.getByText("Open");
+    expect(open.className).toContain("disabled");
   });
 
   it("groups artifact tree metadata for plans, handoffs, media, and generated files", () => {
@@ -309,7 +318,8 @@ describe("DashboardView", () => {
       channelTopic: "codebase-analysis",
     })} />);
 
-    expect(screen.getByText("codebase-analysis")).toBeTruthy();
+    // Slug topics render as normal-English words (hyphens become spaces).
+    expect(screen.getByText("codebase analysis")).toBeTruthy();
   });
 
   it("does not contradict the plan-ready banner when a confirmed plan has no subtasks", () => {
@@ -322,7 +332,7 @@ describe("DashboardView", () => {
     expect(screen.getByText("This plan has no subtasks to review.")).toBeTruthy();
   });
 
-  it("renders a casual conversation as the #general channel with orchestrator bubbles", () => {
+  it("renders a casual conversation as the #general channel with YAAA bubbles", () => {
     render(<DashboardView viewModel={makeViewModel({
       chatMessages: [
         { id: "c1", sender: "User", content: "hi", time: "10:00" },
@@ -333,7 +343,9 @@ describe("DashboardView", () => {
     // Conversation renders in the chat view, not the home hero.
     expect(screen.queryByText(/Yet Another AI Agent/)).toBeNull();
     expect(screen.getByText("general")).toBeTruthy();
-    expect(screen.getByText("@orchestrator")).toBeTruthy();
+    // The orchestrator persona always surfaces as "YAAA".
+    expect(screen.getByText("YAAA")).toBeTruthy();
+    expect(screen.queryByText("@orchestrator")).toBeNull();
     expect(screen.getByText("Hello! What are we building today?")).toBeTruthy();
     // No plan/confirmation machinery appears for small talk.
     expect(screen.queryByText(/Plan ready/)).toBeNull();
@@ -410,12 +422,120 @@ describe("DashboardView", () => {
       logs: [{ id: "thought", time: "10:00", source: "agent", content: "[@sage-1] inspected the repository" }],
     })} />);
 
-    expect(screen.getAllByText("@sage-1")).toHaveLength(2);
+    // Both the chat bubble (keyed by the "@sage-1" handle) and the Mission Team
+    // card (keyed by the "agent-research" id) resolve to the same human name.
+    const identity = agentIdentity("agent-research", "Researcher");
+    expect(identity.roleLabel).toBe("Researcher");
+    // Name surfaces in the chat bubble sender and the agent thread card.
+    expect(screen.getAllByText(identity.display).length).toBeGreaterThan(0);
+    expect(screen.getByText(`${identity.firstName} · ${identity.mention}`)).toBeTruthy(); // team card
+    expect(screen.queryByText("@sage-1")).toBeNull(); // raw handle no longer surfaced
     expect(screen.getByLabelText("working")).toBeTruthy();
 
     fireEvent.click(screen.getByTitle("Agent Space"));
     const execution = screen.getByTestId("execution-activity") as HTMLDetailsElement;
     expect(execution.open).toBe(false);
-    expect(screen.getByText(/@sage-1 · Researcher/)).toBeTruthy();
+    expect(screen.getByText(`${identity.display} · ${identity.mention}`)).toBeTruthy();
+  });
+
+  it("no longer renders a New Mission back button in the topbar", () => {
+    render(<DashboardView viewModel={makeViewModel({ taskId: "task-1" })} />);
+    expect(screen.queryByText("← New Mission")).toBeNull();
+  });
+
+  it("routes a follow-up in an open mission to continueMission, not a new task", () => {
+    const continueMission = vi.fn();
+    const startTask = vi.fn();
+    render(<DashboardView viewModel={makeViewModel({
+      taskId: "task-1",
+      goal: "add a second file",
+      success: true, // mission finished → composer is idle and continuable
+      continueMission,
+      startTask,
+    })} />);
+
+    const input = screen.getByPlaceholderText("Message this channel…");
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(continueMission).toHaveBeenCalledWith("add a second file");
+    expect(startTask).not.toHaveBeenCalled();
+  });
+
+  it("opens the plan review modal and accepts with comments", async () => {
+    const confirmPlan = vi.fn();
+    (window as any).electronAPI.readTaskOrchestrator = vi
+      .fn()
+      .mockResolvedValue("# Plan\n\nStep one.");
+    render(<DashboardView viewModel={makeViewModel({
+      taskId: "task-1",
+      awaitingConfirmation: true,
+      subtasks: [{ id: "s1", title: "Do the thing", capability: "files", dependsOn: [], riskLevel: "low", successCriteria: "", state: "pending" }],
+      confirmPlan,
+    })} />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Review plan"));
+    });
+    // The proposed plan MD is shown in the modal.
+    expect(screen.getByRole("heading", { name: "Plan" })).toBeTruthy();
+
+    // Leaving a comment switches the accept button to "addressing comments".
+    fireEvent.change(screen.getByPlaceholderText(/Leave comments/), {
+      target: { value: "tighten the scope" },
+    });
+    fireEvent.click(screen.getByText("Accept (addressing comments)"));
+    expect(confirmPlan).toHaveBeenCalledWith("tighten the scope");
+  });
+
+  it("requires a reason to reject a plan", async () => {
+    const rejectPlan = vi.fn();
+    (window as any).electronAPI.readTaskOrchestrator = vi.fn().mockResolvedValue("# Plan");
+    render(<DashboardView viewModel={makeViewModel({
+      taskId: "task-1",
+      awaitingConfirmation: true,
+      rejectPlan,
+    })} />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Review plan"));
+    });
+    fireEvent.click(screen.getByText("Reject"));
+
+    // Submit stays disabled until a reason is entered.
+    const submit = screen.getByText("Submit rejection") as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+    fireEvent.change(screen.getByPlaceholderText(/what's wrong/), {
+      target: { value: "wrong approach" },
+    });
+    expect((screen.getByText("Submit rejection") as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(screen.getByText("Submit rejection"));
+    expect(rejectPlan).toHaveBeenCalledWith("wrong approach");
+  });
+
+  it("opens a spawned agent's thread and returns via the back button", () => {
+    render(<DashboardView viewModel={makeViewModel({
+      taskId: "task-1",
+      subtasks: [{ id: "research", title: "Investigate the repo", capability: "browser", dependsOn: [], riskLevel: "low", successCriteria: "Findings documented", state: "running" }],
+      agents: [{
+        id: "browser-agent-abcd",
+        handle: "@researcher-1",
+        displayName: "Researcher",
+        taskId: "task-1",
+        subtaskId: "research",
+        role: "ResearcherAgent",
+        modelRole: "worker",
+        status: "working",
+      }],
+    })} />);
+
+    // The handoff document is shown inline on the thread card.
+    expect(screen.getByText("Investigate the repo")).toBeTruthy();
+    fireEvent.click(screen.getByText(/Show thread/));
+    // Thread overlay shows the handoff document and success criteria.
+    expect(screen.getByText(/Handoff document/)).toBeTruthy();
+    expect(screen.getAllByText(/Findings documented/).length).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByText("← Back"));
+    expect(screen.queryByText(/Handoff document/)).toBeNull();
   });
 });

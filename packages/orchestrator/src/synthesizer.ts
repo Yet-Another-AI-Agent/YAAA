@@ -1,14 +1,14 @@
 import type { IMeshGateway, IStore } from "@yaaa/interfaces";
-import { container } from "@yaaa/platform";
+import { container, type Container } from "@yaaa/platform";
 import type { TaskPlan } from "@yaaa/shared";
 
 export class Synthesizer {
   private gateway: IMeshGateway;
   private store: IStore;
 
-  constructor() {
-    this.gateway = container.resolve<IMeshGateway>("IMeshGateway");
-    this.store = container.resolve<IStore>("IStore");
+  constructor(scope: Container = container) {
+    this.gateway = scope.resolve<IMeshGateway>("IMeshGateway");
+    this.store = scope.resolve<IStore>("IStore");
   }
 
   async synthesize(taskId: string, plan: TaskPlan): Promise<{ passed: boolean; summary: string }> {

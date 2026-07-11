@@ -3,6 +3,8 @@ const { contextBridge, ipcRenderer } = require("electron");
 contextBridge.exposeInMainWorld("electronAPI", {
   routeUserMessage: (message) => ipcRenderer.invoke("route-user-message", message),
   startTask: (goal) => ipcRenderer.invoke("start-task", goal),
+  continueTask: (taskId, message) =>
+    ipcRenderer.invoke("continue-task", { taskId, message }),
   confirmTask: (taskId) => ipcRenderer.invoke("confirm-task", taskId),
   resolveApproval: (callId, approved) =>
     ipcRenderer.invoke("resolve-approval", { callId, approved }),

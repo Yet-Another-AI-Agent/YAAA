@@ -3075,3 +3075,175 @@ body {
   font-family: var(--font-mono, monospace);
   font-size: 0.8em;
 }
+
+/* ─── Mission threads (collapsed sub-agent cards in chat) ─── */
+.mission-threads {
+  margin-top: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.mission-threads-title {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  font-weight: 700;
+  margin-bottom: 0.15rem;
+}
+.mission-thread-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+  padding: 0.85rem 1rem;
+  background: var(--bg-elevated, rgba(255, 255, 255, 0.03));
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+}
+.mission-thread-avatar {
+  flex-shrink: 0;
+}
+.mission-thread-body {
+  flex: 1;
+  min-width: 0;
+}
+.mission-thread-header {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.35rem;
+}
+.mission-thread-name {
+  font-weight: 700;
+  font-size: 0.9rem;
+  color: var(--text-primary);
+}
+.mission-thread-handoff-label {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  font-weight: 700;
+}
+.mission-thread-handoff-text {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  margin-top: 0.2rem;
+}
+.mission-thread-show-btn {
+  flex-shrink: 0;
+  align-self: center;
+  background: transparent;
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+  border-radius: 8px;
+  padding: 0.45rem 0.8rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: var(--transition-smooth);
+  white-space: nowrap;
+}
+.mission-thread-show-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+/* ─── Plan review modal ─── */
+.plan-review-panel {
+  max-width: 860px;
+}
+.plan-review-footer {
+  border-top: 1px solid var(--border-color);
+  padding: 1rem 1.5rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.plan-review-label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  font-weight: 700;
+}
+.plan-review-textarea {
+  width: 100%;
+  min-height: 68px;
+  resize: vertical;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 0.6rem 0.75rem;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 0.88rem;
+}
+.plan-review-textarea:focus {
+  outline: none;
+  border-color: var(--color-accent, #6a5cff);
+}
+.plan-review-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  margin-top: 0.25rem;
+}
+.btn-approve:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ─── Agent thread overlay ─── */
+.thread-panel {
+  max-width: 780px;
+}
+.thread-back-btn {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+  border-radius: 8px;
+  padding: 0.35rem 0.7rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  margin-right: auto;
+}
+.thread-back-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+.thread-section {
+  margin-bottom: 1.25rem;
+}
+.thread-section-title {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  font-weight: 700;
+  margin-bottom: 0.5rem;
+}
+.thread-handoff-doc {
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 0.85rem 1rem;
+  font-size: 0.88rem;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  line-height: 1.5;
+}
+
+/* ─── Code file preview ─── */
+.code-preview {
+  font-family: var(--font-mono, monospace);
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 1rem;
+  overflow-x: auto;
+  white-space: pre;
+}

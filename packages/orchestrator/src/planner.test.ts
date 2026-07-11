@@ -91,6 +91,25 @@ describe("Planner", () => {
     );
   });
 
+  it("threads the user profile and prior-mission summary into the planning prompt", async () => {
+    let sentMessages: any[] = [];
+    (mockGateway.chat as any).mockImplementation(async (msgs: any[]) => {
+      sentMessages = msgs;
+      return '```json\n{ "goal": "g", "subtasks": [] }\n```';
+    });
+
+    await planner.plan("Write report", "task-1", {
+      userProfile: { name: "Krishnaraj", profession: "Engineer" },
+      priorSummary: "Earlier we scaffolded the repo.",
+    });
+
+    const userMsg = sentMessages.find((m) => m.role === "user")?.content ?? "";
+    expect(userMsg).toContain("Krishnaraj");
+    expect(userMsg).toContain("Engineer");
+    expect(userMsg).toContain("Earlier we scaffolded the repo.");
+    expect(userMsg).toContain('Create a task plan for this goal: "Write report"');
+  });
+
   it("does not publish reasoning when no taskId is given", async () => {
     (mockGateway.chat as any).mockImplementation(async (_msgs: any, opts: any) => {
       opts.onReasoning?.("thinking without a task");

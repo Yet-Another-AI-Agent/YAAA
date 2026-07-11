@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Workspace } from "./workspace.js";
 
 const temporaryDirectories: string[] = [];
@@ -82,6 +82,73 @@ describe("Workspace", () => {
         expect.objectContaining({ handle: "@sage-1", status: "completed" }),
       ]),
     );
+  });
+
+  it("continues an existing mission in the same channel instead of creating a new task", async () => {
+    const workspace = createWorkspace();
+    const task = workspace.createTask("Create a file named notes.txt");
+    await workspace.prepareTask("Create a file named notes.txt", task);
+    await workspace.confirmTask(task.taskId);
+    expect(workspace.listTasks()).toHaveLength(1);
+
+    const result = await workspace.continueMission(task.taskId, "Now add a second note");
+    expect(result.kind).toBe("task");
+    const plan = result.kind === "task" ? result.plan : null;
+    expect(plan?.subtasks.length).toBeGreaterThan(0);
+
+    // No new channel/task was created — same id, still one task.
+    expect(workspace.listTasks()).toHaveLength(1);
+    expect(workspace.listTasks()[0].id).toBe(task.taskId);
+    // The follow-up produced a fresh plan awaiting confirmation on the same task.
+    expect(workspace.listTasks()[0].status).toBe("awaiting_confirmation");
+
+    // The follow-up message is persisted in the mission's conversation.
+    const conversations = await workspace.getTaskConversations(task.taskId);
+    const publicConv = conversations.find((c) => c.kind === "public");
+    expect(publicConv).toBeTruthy();
+    const messages = await workspace.getConversationMessages(task.taskId, publicConv!.id);
+    expect(messages.some((m) => m.content === "Now add a second note")).toBe(true);
+  });
+
+  it("refuses to continue an unknown mission", async () => {
+    const workspace = createWorkspace();
+    await expect(workspace.continueMission("not-a-real-task", "hi")).rejects.toThrow(
+      "Task not found.",
+    );
+  });
+
+  it("answers a conversational follow-up in-channel without re-planning", async () => {
+    const workspace = createWorkspace();
+    const task = workspace.createTask("Create a file named notes.txt");
+    await workspace.prepareTask("Create a file named notes.txt", task);
+    await workspace.confirmTask(task.taskId);
+
+    // Force the intent gate to classify the follow-up as small talk.
+    vi.spyOn(workspace, "routeUserMessage").mockResolvedValue({
+      kind: "conversation",
+      reply: "I created notes.txt with your note earlier. Anything else?",
+    });
+
+    const events: any[] = [];
+    const result = await workspace.continueMission(task.taskId, "what did you do?", {
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(result.kind).toBe("conversation");
+    if (result.kind === "conversation") {
+      expect(result.reply).toContain("notes.txt");
+    }
+    // No re-plan: the task stays in its completed state, still one task.
+    expect(workspace.listTasks()).toHaveLength(1);
+    expect(workspace.listTasks()[0].status).toBe("success");
+    // The reply was emitted as an orchestrator status event...
+    expect(events.some((e) => e.type === "status" && e.from === "orchestrator")).toBe(true);
+    // ...and persisted (user question + orchestrator reply) in the channel.
+    const conversations = await workspace.getTaskConversations(task.taskId);
+    const publicConv = conversations.find((c) => c.kind === "public");
+    const messages = await workspace.getConversationMessages(task.taskId, publicConv!.id);
+    expect(messages.some((m) => m.content === "what did you do?")).toBe(true);
+    expect(messages.some((m) => m.authorKind === "orchestrator")).toBe(true);
   });
 
   it("generates a channel topic alongside the plan without blocking it", async () => {

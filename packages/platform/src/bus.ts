@@ -11,8 +11,15 @@ interface Subscription {
 export class MessageBus implements IBus {
   private emitter = new EventEmitter();
   private subscriptions: Subscription[] = [];
+  private readonly injectedStore?: IStore;
 
-  constructor() {
+  /**
+   * @param store Persistence target for AgentMessages. Injected by the runtime
+   * so each task's bus writes to its own (scoped) store instead of resolving a
+   * process-global one. Falls back to the global container when omitted (tests).
+   */
+  constructor(store?: IStore) {
+    this.injectedStore = store;
     this.emitter.setMaxListeners(100);
   }
 
@@ -35,8 +42,9 @@ export class MessageBus implements IBus {
       const taskId = this.getTaskIdFromMessage(agentMsg);
       if (taskId) {
         try {
-          // Resolve store dynamically to prevent circular dependencies at container initialization
-          const store = container.resolve<IStore>("IStore");
+          // Prefer the injected (task-scoped) store; fall back to the global
+          // container for callers that still register it there (tests).
+          const store = this.injectedStore ?? container.resolve<IStore>("IStore");
           await store.saveMessage(taskId, agentMsg);
         } catch (err) {
           // Store might not be initialized or registered yet in unit tests, ignore

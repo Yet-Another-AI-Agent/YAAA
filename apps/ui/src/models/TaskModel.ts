@@ -82,6 +82,17 @@ export class TaskModel {
     return this.getElectronAPI().startTask(goal);
   }
 
+  /**
+   * Send a follow-up message to an existing mission. Re-plans on the SAME
+   * task/channel instead of creating a new one.
+   */
+  static async continueTask(
+    taskId: string,
+    message: string,
+  ): Promise<{ status: "conversation" | "task" | "cancelled" | "error"; error?: string }> {
+    return this.getElectronAPI().continueTask(taskId, message);
+  }
+
   static async confirmTask(taskId: string): Promise<{ status: string }> {
     return this.getElectronAPI().confirmTask(taskId);
   }
