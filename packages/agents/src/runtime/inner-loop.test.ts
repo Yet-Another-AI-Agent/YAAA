@@ -220,6 +220,37 @@ describe("InnerLoop Worker Loop", () => {
     expect(callCount).toBe(2);
   });
 
+  it("compacts bulky old tool results out of later prompts on a long run", async () => {
+    let turn = 0;
+    (mockGateway.chat as any).mockImplementation(async () => {
+      turn++;
+      if (turn < 6) {
+        return `\`\`\`json
+{ "call": { "capability": "files", "method": "writeFile", "args": { "path": "f.txt", "content": "x" } } }
+\`\`\``;
+      }
+      return `\`\`\`json
+{ "result": { "artifacts": [], "summary": "done" } }
+\`\`\``;
+    });
+    // Each tool result is large, so old ones must be elided from later prompts.
+    mockFilesProvider.writeFile.mockResolvedValue("y".repeat(1000));
+
+    await innerLoop.run({
+      agentId: "test-agent",
+      taskId: "task-123",
+      templateName: "FilesAgent",
+      instruction: "keep writing",
+      maxTurns: 10,
+    });
+
+    const lastPrompt = (mockGateway.chat as any).mock.calls.at(-1)[0];
+    const joined = lastPrompt.map((m: any) => m.content).join("\n");
+    expect(joined).toContain("elided to save context");
+    // The framing (system + brief) and most-recent turns are still present.
+    expect(lastPrompt[0].role).toBe("system");
+  });
+
   it("should throw error if template is not found in registry", async () => {
     await expect(
       innerLoop.run({
@@ -265,5 +296,95 @@ describe("InnerLoop Worker Loop", () => {
 
     expect(result.summary).toBe("Recovered from bad method");
     expect(callCount).toBe(2);
+  });
+
+  it("rolls the older history into an LLM summary once the cleared prompt is large", async () => {
+    // Large, never-elided assistant messages (compactMessages only elides bulky
+    // *tool-result* user messages), so the tool-result-cleared prompt grows past
+    // the ~24000-char summary threshold after a few turns.
+    const padding = "context filler ".repeat(650); // ~9700 chars
+    const toolCall =
+      "```json\n" +
+      '{ "call": { "capability": "files", "method": "writeFile", "args": { "path": "f.txt", "content": "x" } } }\n' +
+      "```";
+    const finalResult =
+      "```json\n" +
+      '{ "result": { "artifacts": [], "summary": "done long run" } }\n' +
+      "```";
+
+    let workerTurns = 0;
+    const workerPrompts: any[][] = [];
+    const utilityPrompts: any[][] = [];
+    (mockGateway.chat as any).mockImplementation(async (messages: any[], options: any) => {
+      if (options.modelRole === "utility") {
+        utilityPrompts.push(messages);
+        // No onReasoning must be forwarded to the summarization call.
+        expect(options.onReasoning).toBeUndefined();
+        return "COMPACT SUMMARY: wrote several files; work is mid-flight.";
+      }
+      workerTurns++;
+      if (workerTurns >= 6) return finalResult;
+      return `${padding}\n${toolCall}`;
+    });
+    // Large tool results too, though these are elided from later prompts.
+    mockFilesProvider.writeFile.mockResolvedValue("y".repeat(4000));
+
+    const result = await innerLoop.run({
+      agentId: "test-agent",
+      taskId: "task-123",
+      templateName: "FilesAgent",
+      instruction: "keep writing lots of files",
+      maxTurns: 10,
+    });
+
+    expect(result.summary).toBe("done long run");
+
+    // (a) At least one summarization call was made with modelRole "utility".
+    expect(utilityPrompts.length).toBeGreaterThanOrEqual(1);
+    const utilityCalls = (mockGateway.chat as any).mock.calls.filter(
+      (c: any[]) => c[1]?.modelRole === "utility",
+    );
+    expect(utilityCalls.length).toBeGreaterThanOrEqual(1);
+
+    // Separate which prompts went to the main (worker) model.
+    for (const c of (mockGateway.chat as any).mock.calls) {
+      if (c[1]?.modelRole === "worker") workerPrompts.push(c[0]);
+    }
+    // (b) A later MAIN prompt carries the injected summary note.
+    const someWorkerPromptHasSummary = workerPrompts.some((p) =>
+      p.map((m: any) => m.content).join("\n").includes("Summary of earlier work"),
+    );
+    expect(someWorkerPromptHasSummary).toBe(true);
+  });
+
+  it("does NOT summarize on small runs (no utility-model call)", async () => {
+    let callCount = 0;
+    (mockGateway.chat as any).mockImplementation(async (_messages: any[], options: any) => {
+      // Fail loudly if the cheap summarization tier ever fires on a tiny run.
+      expect(options.modelRole).not.toBe("utility");
+      callCount++;
+      if (callCount === 1) {
+        return `\`\`\`json
+{ "call": { "capability": "files", "method": "writeFile", "args": { "path": "s.txt", "content": "hi" } } }
+\`\`\``;
+      }
+      return `\`\`\`json
+{ "result": { "artifacts": [], "summary": "small done" } }
+\`\`\``;
+    });
+
+    const result = await innerLoop.run({
+      agentId: "test-agent",
+      taskId: "task-123",
+      templateName: "FilesAgent",
+      instruction: "small task",
+      maxTurns: 5,
+    });
+
+    expect(result.summary).toBe("small done");
+    const utilityCalls = (mockGateway.chat as any).mock.calls.filter(
+      (c: any[]) => c[1]?.modelRole === "utility",
+    );
+    expect(utilityCalls.length).toBe(0);
   });
 });

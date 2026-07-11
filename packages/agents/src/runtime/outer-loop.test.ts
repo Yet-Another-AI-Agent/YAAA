@@ -224,6 +224,64 @@ describe("OuterLoop Manager", () => {
     expect(failedAgents).toHaveLength(4);
   });
 
+  it("runs independent ready subtasks concurrently", async () => {
+    const parallelPlan: TaskPlan = {
+      goal: "Parallel task",
+      subtasks: [
+        {
+          id: "task-a",
+          title: "Independent A",
+          capability: "files",
+          dependsOn: [],
+          riskLevel: "low",
+          successCriteria: "a done",
+          state: "pending",
+        },
+        {
+          id: "task-b",
+          title: "Independent B",
+          capability: "files",
+          dependsOn: [],
+          riskLevel: "low",
+          successCriteria: "b done",
+          state: "pending",
+        },
+      ],
+    };
+
+    // Each agent's gateway call parks on a deferred promise so neither subtask
+    // can complete until we explicitly release it. That lets us assert both
+    // subtasks are simultaneously in flight before either finishes.
+    const resolvers: Array<(value: string) => void> = [];
+    const successJson = `\`\`\`json
+{"result": {"artifacts": [], "summary": "done"}}
+\`\`\``;
+    (mockGateway.chat as any).mockImplementation(
+      () => new Promise<string>((resolve) => resolvers.push(resolve)),
+    );
+
+    const runPromise = outerLoop.run("task-parallel", parallelPlan);
+
+    // Both subtasks reached the model before either was allowed to resolve —
+    // proof of genuine concurrency rather than serial execution (a serial loop
+    // would block on the first deferred call and never issue the second).
+    await vi.waitFor(() => {
+      expect(mockGateway.chat).toHaveBeenCalledTimes(2);
+    });
+    expect(resolvers).toHaveLength(2);
+
+    // Release both agents and let the run settle.
+    resolvers.forEach((resolve) => resolve(successJson));
+    await expect(runPromise).resolves.not.toThrow();
+
+    const savedAgents = (mockStore.saveAgent as any).mock.calls.map((c: any[]) => c[1]);
+    const completedSubtaskIds = savedAgents
+      .filter((agent: any) => agent.status === "completed")
+      .map((agent: any) => agent.subtaskId);
+    expect(completedSubtaskIds).toContain("task-a");
+    expect(completedSubtaskIds).toContain("task-b");
+  });
+
   it("recovers when a retry succeeds before the kill switch trips", async () => {
     (mockGateway.chat as any)
       .mockRejectedValueOnce(new Error("transient timeout"))

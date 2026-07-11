@@ -76,6 +76,26 @@ describe("MessageBus", () => {
     expect(mockStore.saveMessage).toHaveBeenCalledWith("task-99", agentMsg);
   });
 
+  it("persists to the injected (task-scoped) store, not the global one", async () => {
+    // Register a DIFFERENT store globally; the injected store must win so two
+    // concurrent task buses never write through each other's connection.
+    const globalStore: IStore = { ...mockStore, saveMessage: vi.fn() } as any;
+    container.register("IStore", globalStore);
+    const injectedStore: IStore = { ...mockStore, saveMessage: vi.fn() } as any;
+    const scopedBus = new MessageBus(injectedStore);
+
+    const agentMsg: AgentMessage = {
+      kind: "status",
+      from: "agent-1",
+      taskId: "task-77",
+      state: "working",
+    };
+    await scopedBus.publish("task.77.status", agentMsg);
+
+    expect(injectedStore.saveMessage).toHaveBeenCalledWith("task-77", agentMsg);
+    expect(globalStore.saveMessage).not.toHaveBeenCalled();
+  });
+
   it("should not crash if store is not registered in the container", async () => {
     // Clear dependencies so IStore isn't registered
     container.clear();

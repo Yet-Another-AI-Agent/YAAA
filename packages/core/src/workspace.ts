@@ -8,11 +8,13 @@ import { pauseController } from "@yaaa/platform";
 import { IntentRouter } from "@yaaa/orchestrator";
 import {
   ORCHESTRATOR_MD_HEADERS,
+  buildMissionSummary,
   type AgentMessage,
   type AgentRun,
   type Conversation,
   type ConversationAuthorKind,
   type ConversationMessage,
+  type DependencyOutput,
   type MentionRoute,
   type TaskPlan,
 } from "@yaaa/shared";
@@ -908,6 +910,7 @@ export class Workspace {
     goal: string,
     task: CreatedTask,
     hooks: RunTaskHooks = {},
+    options: { priorSummary?: string } = {},
   ): Promise<TaskPlan> {
     const config = this.loadConfig();
     const runtime = createRuntime({
@@ -931,7 +934,14 @@ export class Workspace {
     this.requestTopicGeneration(goal, task.taskId, config, hooks.onEvent);
 
     try {
-      const plan = await runtime.plan(goal);
+      const plan = await runtime.plan(goal, {
+        userProfile: {
+          name: config.userName,
+          profession: config.userProfession,
+          description: config.userDescription,
+        },
+        priorSummary: options.priorSummary,
+      });
       if (this.deletedTasks.has(task.taskId))
         throw new Error("Task was deleted.");
       this.updateTaskStatus(task.taskId, "awaiting_confirmation");
@@ -954,6 +964,118 @@ export class Workspace {
       if (this.deletedTasks.has(task.taskId)) {
         fs.rmSync(task.taskDir, { recursive: true, force: true });
       }
+    }
+  }
+
+  /**
+   * Continue an existing mission with a follow-up message instead of spawning a
+   * brand-new task/channel. The message is appended to the mission's public
+   * conversation, then a fresh plan is generated ON THE SAME task, seeded with a
+   * condensed summary of the prior plan and results so the orchestrator
+   * remembers what already happened. This is the fix for "every message opens a
+   * new chat".
+   */
+  async continueMission(
+    taskId: string,
+    message: string,
+    hooks: RunTaskHooks = {},
+  ): Promise<{ kind: "conversation"; reply: string } | { kind: "task"; plan: TaskPlan }> {
+    const task = this.requireTask(taskId);
+    if (this.activeTaskRuns.has(taskId)) {
+      throw new Error(
+        "This mission is still running. Wait for it to finish before sending a follow-up.",
+      );
+    }
+    await this.appendUserMessageToMission(taskId, message);
+
+    // Route the follow-up: small talk ("thanks", "what did you do?") gets a
+    // lightweight in-channel reply; an actionable request re-plans on the same
+    // task with prior context. Either way, no new channel is created.
+    const route = await this.routeUserMessage(message);
+    if (route.kind === "conversation") {
+      await this.appendOrchestratorReplyToMission(taskId, route.reply);
+      // Surface as an orchestrator bubble in the same channel (mapped to
+      // task.<id>.started → addLog("orchestrator", note) in the renderer).
+      hooks.onEvent?.({ type: "status", from: "orchestrator", note: route.reply });
+      return { kind: "conversation", reply: route.reply };
+    }
+
+    const priorSummary = await this.buildMissionPriorSummary(taskId);
+    const plan = await this.prepareTask(
+      message,
+      {
+        taskId,
+        taskDir: task.path,
+        workingDir: path.join(task.path, "working"),
+      },
+      hooks,
+      { priorSummary },
+    );
+    return { kind: "task", plan };
+  }
+
+  /** Append a user's follow-up into the mission's public conversation channel. */
+  private async appendUserMessageToMission(
+    taskId: string,
+    content: string,
+  ): Promise<void> {
+    await this.postToMissionPublicConversation(taskId, content, "user");
+  }
+
+  /** Append an orchestrator reply into the mission's public conversation channel. */
+  private async appendOrchestratorReplyToMission(
+    taskId: string,
+    content: string,
+  ): Promise<void> {
+    await this.postToMissionPublicConversation(taskId, content, "orchestrator");
+  }
+
+  /** Post a message (get-or-create the public channel) authored by user/orchestrator. */
+  private async postToMissionPublicConversation(
+    taskId: string,
+    content: string,
+    authorKind: ConversationAuthorKind,
+  ): Promise<void> {
+    await this.withConversationCoordinator(async (conversations) => {
+      const existing = (await conversations.listConversations(taskId)).find(
+        (conversation) => conversation.kind === "public" && !conversation.archivedAt,
+      );
+      const conversation =
+        existing ?? (await conversations.createPublicConversation({ taskId }));
+      await conversations.postMessage({
+        taskId,
+        conversationId: conversation.id,
+        authorId: authorKind,
+        authorKind,
+        content,
+      });
+    });
+  }
+
+  /** Condense the stored plan + agent results into a prior-mission summary. */
+  private async buildMissionPriorSummary(taskId: string): Promise<string> {
+    const store = new SqliteStore(this.tasksDir);
+    try {
+      const plan = await store.getPlan(taskId);
+      const messages = await store.getMessages(taskId);
+      const completedResults: DependencyOutput[] = messages
+        .filter((m: any) => m.kind === "result" && m.summary)
+        .map((m: any) => ({
+          id: String(m.from ?? "agent"),
+          title: String(m.from ?? "agent"),
+          summary: String(m.summary),
+        }));
+      return buildMissionSummary({
+        goal: plan?.goal ?? "",
+        subtasks: (plan?.subtasks ?? []).map((s) => ({
+          id: s.id,
+          title: s.title,
+          state: s.state ?? "pending",
+        })),
+        completedResults,
+      });
+    } finally {
+      store.closeAll();
     }
   }
 

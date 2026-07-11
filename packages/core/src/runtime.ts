@@ -7,9 +7,9 @@ import type {
   IStore,
   ModelRole,
 } from "@yaaa/interfaces";
-import { container, MessageBus, PermissionEngine } from "@yaaa/platform";
+import { Container, MessageBus, PermissionEngine } from "@yaaa/platform";
 import { SqliteStore, FilesFs, MeshGateway } from "@yaaa/providers";
-import { Supervisor } from "@yaaa/orchestrator";
+import { Supervisor, type PlanContext } from "@yaaa/orchestrator";
 import type { AgentRun, Subtask, TaskPlan } from "@yaaa/shared";
 import {
   type RuntimeEvent,
@@ -46,7 +46,7 @@ export interface Runtime {
   readonly store: IStore;
   readonly bus: IBus;
   /** Create a durable draft plan; it does not start any agent work. */
-  plan(goal: string): Promise<TaskPlan>;
+  plan(goal: string, context?: PlanContext): Promise<TaskPlan>;
   /** Execute a plan that was already reviewed by the user. */
   runPlan(plan: TaskPlan): Promise<TaskRunResult>;
   run(goal: string): Promise<TaskRunResult>;
@@ -141,7 +141,9 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   };
   assertActive();
   const store = new SqliteStore(config.tasksBaseDir);
-  const bus = new MessageBus();
+  // The bus persists to THIS task's store (injected), not a global one — so two
+  // concurrent task runtimes never write through each other's connection.
+  const bus = new MessageBus(store);
   const permissions = new PermissionEngine();
   const meshGateway = new MeshGateway({
     apiKey: config.apiKey,
@@ -185,11 +187,15 @@ export function createRuntime(config: RuntimeConfig): Runtime {
     },
   };
 
-  container.register("IStore", store);
-  container.register("IBus", bus);
-  container.register("PermissionEngine", permissions);
-  container.register("IMeshGateway", gateway);
-  container.register("capability:files", files);
+  // A per-task DI scope. Previously providers were registered into a global
+  // singleton container, so a second concurrent task would overwrite the first
+  // task's store/bus/files and corrupt it. Each runtime now owns its own scope.
+  const scope = new Container();
+  scope.register("IStore", store);
+  scope.register("IBus", bus);
+  scope.register("PermissionEngine", permissions);
+  scope.register("IMeshGateway", gateway);
+  scope.register("capability:files", files);
 
   if (config.onApproval) {
     permissions.registerApprovalHandler(config.onApproval);
@@ -224,18 +230,18 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   return {
     store,
     bus,
-    async plan(goal: string): Promise<TaskPlan> {
+    async plan(goal: string, context?: PlanContext): Promise<TaskPlan> {
       assertActive();
       emit({ type: "task-started", taskId });
-      const supervisor = new Supervisor();
-      const plan = await supervisor.createPlan(goal, taskId);
+      const supervisor = new Supervisor(scope);
+      const plan = await supervisor.createPlan(goal, taskId, context);
       assertActive();
       return plan;
     },
     async runPlan(plan: TaskPlan): Promise<TaskRunResult> {
       assertActive();
       activePlan = plan;
-      const supervisor = new Supervisor();
+      const supervisor = new Supervisor(scope);
       const result = await supervisor.runPlan(plan, taskId);
       assertActive();
       emit({ type: "complete", result });
@@ -247,6 +253,8 @@ export function createRuntime(config: RuntimeConfig): Runtime {
     },
     dispose(): void {
       store.closeAll();
+      // Release the per-task scope so its providers don't linger after the run.
+      scope.clear();
     },
   };
 }

@@ -1,9 +1,9 @@
 import crypto from "node:crypto";
 import type { IBus, IStore } from "@yaaa/interfaces";
-import { container } from "@yaaa/platform";
+import { container, type Container } from "@yaaa/platform";
 import { OuterLoop } from "@yaaa/agents";
 import type { TaskPlan } from "@yaaa/shared";
-import { Planner } from "./planner.js";
+import { Planner, type PlanContext } from "./planner.js";
 import { Synthesizer } from "./synthesizer.js";
 
 export class Supervisor {
@@ -13,21 +13,21 @@ export class Supervisor {
   private bus: IBus;
   private store: IStore;
 
-  constructor() {
-    this.planner = new Planner();
-    this.outerLoop = new OuterLoop();
-    this.synthesizer = new Synthesizer();
-    this.bus = container.resolve<IBus>("IBus");
-    this.store = container.resolve<IStore>("IStore");
+  constructor(scope: Container = container) {
+    this.planner = new Planner(scope);
+    this.outerLoop = new OuterLoop(scope);
+    this.synthesizer = new Synthesizer(scope);
+    this.bus = scope.resolve<IBus>("IBus");
+    this.store = scope.resolve<IStore>("IStore");
   }
 
   /** Generate a durable plan without permitting agent execution. */
-  async createPlan(goal: string, taskId?: string): Promise<TaskPlan> {
+  async createPlan(goal: string, taskId?: string, context?: PlanContext): Promise<TaskPlan> {
     const activeTaskId = taskId || crypto.randomUUID();
     await this.store.initTaskDb(activeTaskId);
 
     console.log(`[Orchestrator] Generating plan for goal: "${goal}"`);
-    const plan = await this.planner.plan(goal, activeTaskId);
+    const plan = await this.planner.plan(goal, activeTaskId, context);
     await this.store.savePlan(activeTaskId, plan);
     await this.bus.publish( `task.${activeTaskId}.plan_updated`, plan);
 
