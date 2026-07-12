@@ -32,7 +32,7 @@ Put content you generated inline in source.content; use source.path (task-relati
  */
 const TOOL_PROTOCOL = `
 
-You have native file tools: read_file, write_file, list_files, search_files. Call them directly to inspect and produce files — do not describe the calls in prose or JSON, just invoke the tools. When you write a file, pass its full final contents (no placeholders); the runtime tracks it as a produced artifact for you.
+You have native tools for files and, when granted to your role, command execution, web research, and Chromium browser automation. Call them directly — do not describe calls in prose or JSON. When you write a file, pass its full final contents (no placeholders); the runtime tracks it as a produced artifact for you.
 
 Work only inside the task workspace, never invent placeholder content, and keep outputs production quality. When the assignment is fully done, stop calling tools and reply with a short final message summarising what you produced.`;
 
@@ -54,9 +54,9 @@ When the task is fully complete, stop calling tools and reply with a short final
     systemPrompt: `You are an independent quality assurance and verification agent.
 Your job is to read the files produced by other workers (use the read_file, list_files and search_files tools), compare them against the user's goals and success criteria, and determine if they are fully correct.
 
-Do not write or modify files. When you are done, stop calling tools and reply with your assessment, ending with a final line in exactly this form:
-VERDICT: PASSED   (if everything meets the criteria)
-VERDICT: FAILED   (if anything is missing or wrong — explain what, above the verdict line)`,
+Do not write or modify files. Return only JSON in this exact shape:
+{"status":"passed"|"failed","summary":"concise assessment","findings":["specific finding"],"evidence":["file, command, or observation"]}
+Never report passed without concrete evidence.`,
     capabilities: ["files"],
     riskCeiling: "low",
     modelRole: "verifier",
@@ -66,7 +66,7 @@ VERDICT: FAILED   (if anything is missing or wrong — explain what, above the v
     role: "PrincipalSweAgent",
     handle: "@principal-swe",
     systemPrompt: `You are @principal-swe, a principal software engineer. You own complex backend architectures, high-concurrency systems, database internals, and microservice migrations. Design before you build, state trade-offs explicitly, and produce complete, runnable code.${TOOL_PROTOCOL}`,
-    capabilities: ["files"],
+    capabilities: ["files", "shell", "browser"],
     riskCeiling: "medium",
     modelRole: "worker",
   },
@@ -75,7 +75,7 @@ VERDICT: FAILED   (if anything is missing or wrong — explain what, above the v
     role: "UiArchitectAgent",
     handle: "@ui-architect",
     systemPrompt: `You are @ui-architect, a frontend specialist. You master modern frameworks, reactive state management, CSS layout (Flexbox/Grid), accessibility, and JS rendering libraries. Ship polished, responsive interfaces with clean component boundaries.${TOOL_PROTOCOL}`,
-    capabilities: ["files"],
+    capabilities: ["files", "shell", "browser"],
     riskCeiling: "medium",
     modelRole: "worker",
   },
@@ -84,7 +84,7 @@ VERDICT: FAILED   (if anything is missing or wrong — explain what, above the v
     role: "GraphicsEngineerAgent",
     handle: "@3d-graphics-engineer",
     systemPrompt: `You are @3d-graphics-engineer, an expert in WebGL, computational geometry, and rendering pipelines for web-based 3D software. Favor numerically robust geometry code and document coordinate conventions in every artifact.${TOOL_PROTOCOL}`,
-    capabilities: ["files"],
+    capabilities: ["files", "browser"],
     riskCeiling: "medium",
     modelRole: "worker",
   },
@@ -93,7 +93,7 @@ VERDICT: FAILED   (if anything is missing or wrong — explain what, above the v
     role: "ResearcherAgent",
     handle: "@researcher",
     systemPrompt: `You are @researcher, a deep-dive analyst. You gather information, synthesize documents, and produce competitor and market analyses. Separate verified facts from assumptions, and cite the origin of every claim in your write-ups.${TOOL_PROTOCOL}`,
-    capabilities: ["files"],
+    capabilities: ["files", "web", "browser"],
     riskCeiling: "low",
     modelRole: "worker",
   },
@@ -120,7 +120,7 @@ VERDICT: FAILED   (if anything is missing or wrong — explain what, above the v
     role: "DevOpsAgent",
     handle: "@devops",
     systemPrompt: `You are @devops, an infrastructure engineer. You own Docker, Kubernetes, CI/CD pipelines, and local environment/server configuration. Every change must be reversible and documented; never weaken security defaults silently.${TOOL_PROTOCOL}`,
-    capabilities: ["files"],
+    capabilities: ["files", "shell", "browser"],
     riskCeiling: "high",
     modelRole: "worker",
   },
@@ -128,8 +128,8 @@ VERDICT: FAILED   (if anything is missing or wrong — explain what, above the v
   QaTesterAgent: {
     role: "QaTesterAgent",
     handle: "@qa-tester",
-    systemPrompt: `You are @qa-tester, the dedicated code-quality enforcer. You write automated test suites, run coverage analysis, and enforce the >=95% line-coverage mandate. You never rubber-stamp a creator's own review — find the gaps, write the missing tests, and report failures with exact reproduction steps.${TOOL_PROTOCOL}`,
-    capabilities: ["files"],
+    systemPrompt: `You are @qa-tester, the dedicated code-quality enforcer. You write automated test suites, run coverage analysis, and enforce the >=95% line-coverage mandate. You never rubber-stamp a creator's own review. Your final response must be only JSON: {"status":"passed"|"failed","summary":"...","findings":["..."],"evidence":["..."]}.${TOOL_PROTOCOL}`,
+    capabilities: ["files", "shell", "browser"],
     riskCeiling: "low",
     modelRole: "verifier",
   },
@@ -137,70 +137,26 @@ VERDICT: FAILED   (if anything is missing or wrong — explain what, above the v
   CvTesterAgent: {
     role: "CvTesterAgent",
     handle: "@cv-tester",
-    systemPrompt: `You are @cv-tester, the visual QA agent. You verify GUIs by parsing screenshots and headless-browser captures into interactable coordinates, then confirm renders match the spec — no raw identifiers on screen, layouts aligned, states consistent. Report each check with the evidence you inspected.${TOOL_PROTOCOL}`,
-    capabilities: ["files"],
+    systemPrompt: `You are @cv-tester, the visual QA agent. You verify GUIs using screenshots and headless-browser captures. Your final response must be only JSON: {"status":"passed"|"failed","summary":"...","findings":["..."],"evidence":["..."]}. Never pass without visual evidence.${TOOL_PROTOCOL}`,
+    capabilities: ["files", "browser"],
     riskCeiling: "low",
     modelRole: "verifier",
   },
 };
 
-/** Keyword routing for specialist selection, checked in order. */
-const SPECIALIST_RULES: Array<{ pattern: RegExp; template: string }> = [
-  {
-    pattern:
-      /\b(webgl|3d|three\.?js|geometry|render(?:ing)? pipeline|aligner|mesh)\b/i,
-    template: "GraphicsEngineerAgent",
-  },
-  {
-    pattern:
-      /\b(docker|kubernetes|k8s|ci\/cd|pipeline|deploy(?:ment)?|infrastructure|terraform)\b/i,
-    template: "DevOpsAgent",
-  },
-  {
-    pattern:
-      /\b(pamphlet|logo|poster|graphic|visual design|brand|mockup|flyer)\b/i,
-    template: "DesignerAgent",
-  },
-  {
-    pattern:
-      /\b(ui|frontend|front-end|react|css|layout|component|dashboard|page design)\b/i,
-    template: "UiArchitectAgent",
-  },
-  {
-    pattern:
-      /\b(ad campaign|ads?|marketing|promo(?:tion(?:al)?)?|meta campaign|audience)\b/i,
-    template: "AdStrategistAgent",
-  },
-  {
-    pattern:
-      /\b(research|competitor|market analysis|scrape|investigate|literature)\b/i,
-    template: "ResearcherAgent",
-  },
-  {
-    pattern:
-      /\b(backend|database|microservice|kafka|api|concurrency|migration|schema)\b/i,
-    template: "PrincipalSweAgent",
-  },
-];
-
 /**
- * Choose the roster member for a subtask. Verification work goes to the
- * dedicated QA enforcer (visual checks to @cv-tester); creative/engineering
- * work routes by domain keywords; anything else falls back to the generalist
- * FilesAgent so existing flows keep working.
+ * Use the planner's schema-validated semantic routing decision. Legacy stored
+ * plans without that field use a capability-only fallback; titles are never
+ * interpreted with keywords or regexes here.
  */
 export function selectAgentTemplate(subtask: {
   capability: string;
-  title: string;
+  title?: string;
+  agentTemplate?: string;
 }): string {
-  const text = subtask.title;
-  if (subtask.capability === "verify") {
-    return /\b(visual|screenshot|gui|ui render|pixel|screen)\b/i.test(text)
-      ? "CvTesterAgent"
-      : "QaTesterAgent";
-  }
-  for (const rule of SPECIALIST_RULES) {
-    if (rule.pattern.test(text)) return rule.template;
-  }
+  if (subtask.agentTemplate && AGENT_REGISTRY[subtask.agentTemplate]) return subtask.agentTemplate;
+  if (subtask.capability === "verify") return "QaTesterAgent";
+  if (subtask.capability === "shell" || subtask.capability === "integration") return "DevOpsAgent";
+  if (subtask.capability === "browser") return "ResearcherAgent";
   return "FilesAgent";
 }

@@ -9,7 +9,7 @@ import type {
   ChatResult,
 } from "@yaaa/interfaces";
 import { Container, MessageBus, PermissionEngine } from "@yaaa/platform";
-import { SqliteStore, FilesFs, MeshGateway } from "@yaaa/providers";
+import { SqliteStore, FilesFs, MeshGateway, CmdTool, WebSearchTool, ChromiumTool } from "@yaaa/providers";
 import { ChatOpenAI } from "@langchain/openai";
 import { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { AIMessage } from "@langchain/core/messages";
@@ -22,7 +22,7 @@ import type { ChatResult as LcChatResult } from "@langchain/core/outputs";
  * calls tools; it just reports completion (verifiers pass).
  */
 class MockWorkerChatModel extends BaseChatModel {
-  constructor(private readonly role: ModelRole) {
+  constructor(private readonly roleOrModel: string) {
     super({});
   }
   _llmType() {
@@ -30,8 +30,8 @@ class MockWorkerChatModel extends BaseChatModel {
   }
   async _generate(): Promise<LcChatResult> {
     const text =
-      this.role === "verifier"
-        ? "Mock verification: all stated criteria appear satisfied.\nVERDICT: PASSED"
+      this.roleOrModel === "verifier"
+        ? JSON.stringify({ status: "passed", summary: "Mock verification: all stated criteria appear satisfied.", findings: [], evidence: ["Deterministic mock-mode verification"] })
         : "Mock mode: subtask completed (no live model configured).";
     const message = new AIMessage({ content: text });
     return { generations: [{ text, message }] };
@@ -65,6 +65,10 @@ export interface RuntimeConfig {
   onApproval?: (agentId: string, call: any) => Promise<boolean>;
   /** Cooperative cancellation checked between model and file operations. */
   isCancelled?: () => boolean;
+  /** API request timeout in milliseconds. */
+  timeout?: number;
+  /** Maximum number of retries for API requests. */
+  maxRetries?: number;
 }
 
 /**
@@ -93,16 +97,22 @@ function writeAgentLifecycleDocument(
   agent: AgentRun,
   subtask?: Subtask,
 ): void {
-  const agentDir = path.join(
+  const legacyAgentDir = path.join(
     config.tasksBaseDir,
     safePathSegment(agent.taskId),
     "agent-workspaces",
     safePathSegment(agent.id),
   );
-  fs.mkdirSync(agentDir, { recursive: true });
+  const workspaceAgentDir = path.join(
+    config.workingDir,
+    "agent-workspaces",
+    safePathSegment(agent.id),
+  );
+  fs.mkdirSync(legacyAgentDir, { recursive: true });
+  fs.mkdirSync(workspaceAgentDir, { recursive: true });
 
   if (agent.status === "working") {
-    const handsOn = `# HANDS_ON
+    const handsOn = `# handsOn
 
 - Task: ${agent.taskId}
 - Agent: ${agent.handle} (${agent.displayName})
@@ -110,20 +120,27 @@ function writeAgentLifecycleDocument(
 - Subtask: ${agent.subtaskId}
 - Started: ${agent.startedAt ?? "Not recorded"}
 
-## Boundaries
+## Orchestrator Assignment
 
 - Assigned objective: ${subtask?.title ?? "Complete the assigned subtask."}
 - Success criteria: ${subtask?.successCriteria ?? "Meet the reviewed plan's success criteria."}
 - Capability: ${subtask?.capability ?? agent.role}
+- Dependency subtasks: ${subtask?.dependsOn?.length ? subtask.dependsOn.join(", ") : "None"}
+
+## Working Contract
+
 - Work only inside the task workspace and request approval for gated actions.
-- Report changed files, tests, residual risks, and follow-up work in HANDS_OFF.md.
+- Create proof of work in agent-workspaces/${safePathSegment(agent.id)}/proofOfWork.md.
+- Create the final continuation handoff in agent-workspaces/${safePathSegment(agent.id)}/handOff.md.
+- Include work done, observations, suggestions, asset metadata, residual risks, and instructions for the orchestrator or a future agent.
 `;
-    fs.writeFileSync(path.join(agentDir, "HANDS_ON.md"), handsOn, "utf-8");
+    fs.writeFileSync(path.join(workspaceAgentDir, "handsOn.md"), handsOn, "utf-8");
+    fs.writeFileSync(path.join(legacyAgentDir, "HANDS_ON.md"), handsOn, "utf-8");
     return;
   }
 
   if (["completed", "failed", "exited"].includes(agent.status)) {
-    const handsOff = `# HANDS_OFF
+    const handsOff = `# handOff
 
 - Task: ${agent.taskId}
 - Agent: ${agent.handle} (${agent.displayName})
@@ -152,7 +169,7 @@ ${agent.summary?.trim() || "No summary was provided."}
 
 - _Record follow-up work or write None._
 `;
-    fs.writeFileSync(path.join(agentDir, "HANDS_OFF.md"), handsOff, "utf-8");
+    fs.writeFileSync(path.join(legacyAgentDir, "HANDS_OFF.md"), handsOff, "utf-8");
   }
 }
 
@@ -179,6 +196,8 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   const meshGateway = new MeshGateway({
     apiKey: config.apiKey,
     modelMapping: config.modelMapping as Record<ModelRole, string> | undefined,
+    timeout: config.timeout,
+    maxRetries: config.maxRetries,
   });
   const filesProvider = new FilesFs(config.workingDir);
   const gateway: IMeshGateway = {
@@ -198,13 +217,19 @@ export function createRuntime(config: RuntimeConfig): Runtime {
         yield chunk;
       }
     },
+    async generateImage(prompt: string, options?: { model?: string }): Promise<string> {
+      assertActive();
+      const response = await meshGateway.generateImage(prompt, options);
+      assertActive();
+      return response;
+    },
   };
   const files: IFiles = {
     async readFile(targetPath: string): Promise<string> {
       assertActive();
       return filesProvider.readFile(targetPath);
     },
-    async writeFile(targetPath: string, content: string): Promise<void> {
+    async writeFile(targetPath: string, content: string | Buffer): Promise<void> {
       assertActive();
       return filesProvider.writeFile(targetPath, content);
     },
@@ -233,25 +258,46 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   // paths keep using MeshGateway above; only the inner worker loop uses this.)
   const WORKER_MODEL_DEFAULTS: Record<ModelRole, string> = {
     planner: "anthropic/claude-sonnet-5",
-    worker: "openai/gpt-4o",
-    verifier: "google/gemini-3.1-pro",
-    utility: "openai/gpt-4o-mini",
+    worker: "anthropic/claude-sonnet-5",
+    verifier: "anthropic/claude-haiku-4.5",
+    utility: "anthropic/claude-haiku-4.5",
   };
   const hasApiKey = Boolean(config.apiKey || process.env.MESH_API_KEY);
-  const chatModelFactory = (role: ModelRole): BaseChatModel =>
-    hasApiKey
+  const timeout = config.timeout ?? (process.env.YAAA_TIMEOUT ? Number(process.env.YAAA_TIMEOUT) : (process.env.MESH_TIMEOUT ? Number(process.env.MESH_TIMEOUT) : 60000));
+  const maxRetries = config.maxRetries ?? (process.env.YAAA_MAX_RETRIES ? Number(process.env.YAAA_MAX_RETRIES) : (process.env.MESH_MAX_RETRIES ? Number(process.env.MESH_MAX_RETRIES) : 3));
+  const chatModelFactory = (roleOrModel: string): BaseChatModel => {
+    const isKnownRole = roleOrModel in WORKER_MODEL_DEFAULTS;
+    const model = isKnownRole
+      ? (config.modelMapping as Record<string, string> | undefined)?.[roleOrModel] || WORKER_MODEL_DEFAULTS[roleOrModel as ModelRole]
+      : roleOrModel;
+    // `temperature` is intentionally omitted: it is an optional sampling
+    // parameter, and Bedrock-backed models (which Mesh routes several providers
+    // to) now reject it outright with `ValidationException: temperature is
+    // deprecated for this model`. Leaving it undefined drops it from the request
+    // body entirely, so it works across every model. An operator who knows their
+    // models accept it can still force one via YAAA_TEMPERATURE.
+    const rawTemperature = process.env.YAAA_TEMPERATURE;
+    const temperature =
+      rawTemperature && Number.isFinite(Number(rawTemperature))
+        ? Number(rawTemperature)
+        : undefined;
+    return hasApiKey
       ? new ChatOpenAI({
           apiKey: config.apiKey || process.env.MESH_API_KEY,
-          model:
-            (config.modelMapping as Record<string, string> | undefined)?.[role] ||
-            WORKER_MODEL_DEFAULTS[role],
-          temperature: role === "utility" ? 0 : 0.1,
+          model,
+          temperature,
           configuration: { baseURL: process.env.MESH_BASE_URL || "https://api.meshapi.ai/v1" },
+          timeout,
+          maxRetries,
         })
-      : new MockWorkerChatModel(role);
+      : new MockWorkerChatModel(roleOrModel);
+  };
   scope.register("ChatModelFactory", chatModelFactory);
 
   scope.register("capability:files", files);
+  scope.register("capability:shell", new CmdTool());
+  scope.register("capability:web", new WebSearchTool());
+  scope.register("capability:browser", new ChromiumTool());
 
   if (config.onApproval) {
     permissions.registerApprovalHandler(config.onApproval);

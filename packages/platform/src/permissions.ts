@@ -1,10 +1,47 @@
 import path from "node:path";
+import { parse } from "shell-quote";
 import type { ToolCall } from "@yaaa/shared";
 
 export interface AgentScope {
   capabilities: string[];
   allowedPaths: string[]; // only relevant for files
   riskCeiling: "low" | "medium" | "high";
+}
+
+const HIGH_RISK_EXECUTABLES = new Set([
+  "rm", "rmdir", "sudo", "su", "doas", "mkfs", "fdisk", "dd", "format",
+  "shutdown", "reboot", "halt", "kill", "killall", "pkill", "chmod", "chown",
+  "mv", "eval", "source", "sh", "bash", "zsh", "powershell", "cmd",
+]);
+const SHELL_OPERATORS = new Set([">", ">>", "<", "<<", "|", "||", "&&", ";", "&", "(", ")"]);
+
+export function analyzeShellCommand(command: string): { risky: boolean; reasons: string[] } {
+  if (!command.trim()) return { risky: true, reasons: ["empty command"] };
+  try {
+    const tokens = parse(command);
+    const reasons: string[] = [];
+    let expectingExecutable = true;
+    for (const token of tokens) {
+      if (typeof token !== "string") {
+        const op = "op" in token ? token.op : undefined;
+        if (op && SHELL_OPERATORS.has(op)) {
+          reasons.push(`shell operator ${op}`);
+          expectingExecutable = true;
+        } else {
+          reasons.push("dynamic shell expansion");
+        }
+        continue;
+      }
+      if (expectingExecutable) {
+        const executable = path.basename(token).toLowerCase();
+        if (HIGH_RISK_EXECUTABLES.has(executable)) reasons.push(`high-risk executable ${executable}`);
+        expectingExecutable = false;
+      }
+    }
+    return { risky: reasons.length > 0, reasons: [...new Set(reasons)] };
+  } catch {
+    return { risky: true, reasons: ["command could not be safely parsed"] };
+  }
 }
 
 export type PermissionDecision = "auto" | "confirm" | "deny";
@@ -272,9 +309,7 @@ export class PermissionEngine {
   private isRiskyShellCall(call: ToolCall): boolean {
     if (call.capability !== "shell") return false;
     const command = String(call.args.command || "");
-    return ["rm ", "sudo ", "format ", "mkfs", "mv ", ">", ">>"].some(
-      (riskyCommand) => command.includes(riskyCommand),
-    );
+    return analyzeShellCommand(command).risky;
   }
 
   private validatePolicy(policy: PermissionPolicyInput): void {

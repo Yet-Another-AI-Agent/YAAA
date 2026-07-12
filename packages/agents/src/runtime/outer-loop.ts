@@ -1,17 +1,34 @@
 import type { IBus, IStore } from "@yaaa/interfaces";
 import { container, type Container } from "@yaaa/platform";
-import { type AgentRun, type Subtask, type TaskPlan, type LedgerEntry, type DependencyOutput, buildAgentBrief, isInsufficientFundsError } from "@yaaa/shared";
+import { type AgentRun, type Subtask, type TaskPlan, type LedgerEntry, type DependencyOutput, buildAgentBrief, getErrorFingerprint, isInsufficientFundsError } from "@yaaa/shared";
 import { AGENT_REGISTRY, selectAgentTemplate } from "../registry.js";
 import { InnerLoop } from "./inner-loop.js";
 
 // Gender-neutral display names for generalist agents without a roster handle.
 const AGENT_DISPLAY_NAMES = ["Sage", "Quill", "Harbor", "Nova", "Rowan", "Cedar"];
 
-// Anti-infinite-loop kill switch thresholds (blueprint Part VI.3): three
-// consecutive identical error states trigger a hard interrupt, and no
-// subtask may consume more than five agent attempts in total.
+// The retry decision is driven by the *shape of the failure*, not a fixed
+// attempt count: when the same error fingerprint recurs this many times the
+// agent is demonstrably stuck, so we stop and escalate to a different approach.
 const MAX_IDENTICAL_ERRORS = 3;
-const MAX_SUBTASK_ATTEMPTS = 5;
+
+// A pure safety backstop so an agent that fails a *different* way every single
+// time (and so never trips the recurrence detector above) still terminates.
+// It is not the primary control — the recurrence/kill-switch logic is — and it
+// is operator-tunable rather than a bare literal.
+function resolveMaxSubtaskAttempts(): number {
+  const raw = Number(process.env.YAAA_MAX_SUBTASK_ATTEMPTS);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 5;
+}
+
+/**
+ * Optional operator-configured model to use on retries, giving cross-provider
+ * resilience without hardcoding a specific (and possibly unavailable) model.
+ * When unset, retries reuse the agent's own configured model.
+ */
+function resolveBackupModel(): string | undefined {
+  return process.env.YAAA_BACKUP_MODEL?.trim() || undefined;
+}
 
 /** Run-wide mutable state shared (by reference) across concurrent subtasks. */
 interface RunContext {
@@ -84,6 +101,9 @@ export class OuterLoop {
   private async runSubtask(taskId: string, plan: TaskPlan, subtask: Subtask, ctx: RunContext): Promise<void> {
     const { subtaskStates, facts, assumptions, completedOutputs, allocateStep } = ctx;
     subtaskStates[subtask.id] = "running";
+    subtask.state = "running";
+    await this.store.savePlan(taskId, plan);
+    await this.bus.publish(`task.${taskId}.plan_updated`, plan);
 
     // Claim this subtask's first step number synchronously. The ledger entry
     // and the first spawned agent share it, mirroring the original serial
@@ -109,6 +129,8 @@ export class OuterLoop {
     });
 
     const templateName = this.selectTemplate(subtask);
+    const maxAttempts = resolveMaxSubtaskAttempts();
+    const backupModel = resolveBackupModel();
 
     // Anti-infinite-loop kill switch: track consecutive identical error
     // states. Three identical bounces trigger a hard interrupt — the
@@ -116,13 +138,20 @@ export class OuterLoop {
     // agent is spawned with orders to try a completely different
     // approach. If that also fails, the subtask is declared failed.
     let lastErrorMessage: string | null = null;
+    let lastErrorFingerprint: string | null = null;
     let identicalErrors = 0;
     let differentApproachAttempted = false;
     let attempts = 0;
 
     while (subtaskStates[subtask.id] === "running") {
       attempts++;
+      // First attempt uses the agent's own configured model (resolved from the
+      // role → model mapping, or dynamic planner assignment). Retries may switch to an operator-configured
+      // backup model for cross-provider resilience; when none is set they reuse
+      // the same configured model rather than a hardcoded, possibly-dead one.
+      const modelOverride = attempts > 1 ? backupModel : (subtask.model || undefined);
       const agent = this.createAgentRun(taskId, subtask, currentStep);
+      if (modelOverride) agent.modelRole = modelOverride;
       await this.recordAgentLifecycle(agent);
 
       // Gather the structured results of this subtask's completed
@@ -135,26 +164,43 @@ export class OuterLoop {
         ? `Previous agents failed ${identicalErrors} consecutive times with: "${lastErrorMessage}". Attempt a COMPLETELY DIFFERENT approach — do not repeat the failed strategy.`
         : undefined;
 
+      const workspacePrefix = `agent-workspaces/${agent.id}`;
       const instruction = buildAgentBrief({
         missionGoal: plan.goal,
         subtaskTitle: subtask.title,
         successCriteria: subtask.successCriteria,
         dependencyOutputs,
         retryDirective,
+        handsOnPath: `${workspacePrefix}/handsOn.md`,
+        proofOfWorkPath: `${workspacePrefix}/proofOfWork.md`,
+        handOffPath: `${workspacePrefix}/handOff.md`,
       });
 
       try {
+        console.log(`[OuterLoop] Executing subtask ${subtask.id} (attempt ${attempts})${modelOverride ? ` using backup model: ${modelOverride}` : ""}`);
         const result = await this.innerLoop.run({
           agentId: agent.id,
           taskId,
           templateName,
           instruction,
+          model: modelOverride,
         });
 
         subtaskStates[subtask.id] = "completed";
+        subtask.state = "completed";
         const summary = result.summary || JSON.stringify(result);
+        const handsOnArtifact = {
+          path: `${workspacePrefix}/handsOn.md`,
+          mimeType: "text/markdown",
+          description: `Orchestrator hands-on assignment for ${subtask.id}.`,
+        };
+        const resultArtifacts = [handsOnArtifact, ...(result.artifacts ?? [])];
+        subtask.result = summary;
+        subtask.artifacts = resultArtifacts;
+        await this.store.savePlan(taskId, plan);
+        await this.bus.publish(`task.${taskId}.plan_updated`, plan);
         facts.push(`Subtask ${subtask.id} finished. Summary: ${summary}`);
-        completedOutputs.set(subtask.id, { id: subtask.id, title: subtask.title, summary });
+        completedOutputs.set(subtask.id, { id: subtask.id, title: subtask.title, summary, artifacts: resultArtifacts });
         agent.status = "completed";
         agent.finishedAt = new Date().toISOString();
         agent.summary = summary;
@@ -169,7 +215,9 @@ export class OuterLoop {
           throw err;
         }
 
-        identicalErrors = err.message === lastErrorMessage ? identicalErrors + 1 : 1;
+        const fingerprint = getErrorFingerprint(err);
+        identicalErrors = fingerprint === lastErrorFingerprint ? identicalErrors + 1 : 1;
+        lastErrorFingerprint = fingerprint;
         lastErrorMessage = err.message;
 
         agent.status = "failed";
@@ -178,6 +226,16 @@ export class OuterLoop {
         await this.recordAgentLifecycle(agent);
         console.error(`Subtask ${subtask.id} attempt ${attempts} failed:`, err);
 
+        // Transient/rate-limit backoff is intentionally NOT done here: the model
+        // client already retries 5xx/429 with exponential backoff that honours
+        // the provider's Retry-After header, so an extra hardcoded sleep would
+        // only stack redundant, arbitrary waits on top of it.
+
+        // A recurring identical failure means the agent is genuinely stuck, so
+        // escalate to one fresh agent ordered to try a completely different
+        // approach. If even that keeps failing — or an agent that fails a new
+        // way every time never trips this and only the safety backstop stops it
+        // — the subtask is declared failed.
         const loopDetected = identicalErrors >= MAX_IDENTICAL_ERRORS;
         if (loopDetected && !differentApproachAttempted) {
           differentApproachAttempted = true;
@@ -191,8 +249,11 @@ export class OuterLoop {
           currentStep = allocateStep();
           continue;
         }
-        if (loopDetected || attempts >= MAX_SUBTASK_ATTEMPTS) {
+        if (loopDetected || differentApproachAttempted || attempts >= maxAttempts) {
           subtaskStates[subtask.id] = "failed";
+          subtask.state = "failed";
+          await this.store.savePlan(taskId, plan);
+          await this.bus.publish(`task.${taskId}.plan_updated`, plan);
           facts.push(`Subtask ${subtask.id} failed. Error: ${err.message}`);
         }
       }

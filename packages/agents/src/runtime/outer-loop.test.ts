@@ -14,16 +14,16 @@ import { OuterLoop } from "./outer-loop.js";
  * `responder` decides, per model turn, whether the agent finishes (returns an
  * AIMessage), fails (throws), or parks (returns a pending promise).
  */
-type Responder = (role: ModelRole, messages: BaseMessage[]) => Promise<AIMessage>;
+type Responder = (role: string, messages: BaseMessage[]) => Promise<AIMessage>;
 
 interface CapturedCall {
-  role: ModelRole;
+  role: string;
   messages: BaseMessage[];
 }
 
 class ProgrammableChatModel extends BaseChatModel {
   constructor(
-    private readonly role: ModelRole,
+    private readonly roleOrModel: string,
     private readonly responder: () => Responder,
     private readonly captured: CapturedCall[],
   ) {
@@ -33,8 +33,8 @@ class ProgrammableChatModel extends BaseChatModel {
     return "programmable-test-model";
   }
   async _generate(messages: BaseMessage[]): Promise<ChatResult> {
-    this.captured.push({ role: this.role, messages });
-    const message = await this.responder()(this.role, messages);
+    this.captured.push({ role: this.roleOrModel, messages });
+    const message = await this.responder()(this.roleOrModel, messages);
     const text = typeof message.content === "string" ? message.content : "";
     return { generations: [{ text, message }] };
   }
@@ -88,7 +88,7 @@ describe("OuterLoop Manager", () => {
     });
     container.register(
       "ChatModelFactory",
-      (role: ModelRole) => new ProgrammableChatModel(role, () => responder, captured),
+      (roleOrModel: string) => new ProgrammableChatModel(roleOrModel, () => responder, captured),
     );
 
     outerLoop = new OuterLoop();
@@ -115,6 +115,14 @@ describe("OuterLoop Manager", () => {
       "task-123",
       expect.objectContaining({ handle: "@sage-1", status: "working" }),
     );
+    expect(plan.subtasks[0].artifacts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: expect.stringMatching(/agent-workspaces\/.+\/handsOn\.md/) }),
+        expect.objectContaining({ path: expect.stringMatching(/agent-workspaces\/.+\/handOff\.md/) }),
+      ]),
+    );
+    const dependentBrief = captured.at(-1)?.messages.map((m) => String(m.content)).join("\n") ?? "";
+    expect(dependentBrief).toContain("handOff.md");
   });
 
   it("should throw an error if a subtask dependency loop or deadlock is detected", async () => {
@@ -230,5 +238,59 @@ describe("OuterLoop Manager", () => {
       (call: any[]) => typeof call[1]?.note === "string" && call[1].note.includes("Kill switch"),
     );
     expect(killSwitchNotes).toHaveLength(0);
+  });
+
+  it("does not add its own backoff sleep on a transient error (the model client handles that)", async () => {
+    const setTimeoutSpy = vi.spyOn(global, "setTimeout");
+    let attempt = 0;
+    responder = async () => {
+      attempt++;
+      if (attempt === 1) throw new Error("Rate limit exceeded");
+      return finalMessage("Recovered without an outer-loop sleep.");
+    };
+
+    await expect(outerLoop.run("task-backoff", singleSubtaskPlan())).resolves.not.toThrow();
+
+    // The outer loop no longer schedules its own exponential-backoff wait, so it
+    // never asks setTimeout for a multi-second delay between attempts.
+    const backoffWaits = setTimeoutSpy.mock.calls.filter(([, delay]) => typeof delay === "number" && delay >= 1000);
+    expect(backoffWaits).toHaveLength(0);
+    setTimeoutSpy.mockRestore();
+  });
+
+  it("reuses the agent's configured model across retries when no backup model is set", async () => {
+    delete process.env.YAAA_BACKUP_MODEL;
+    let attempt = 0;
+    responder = async () => {
+      attempt++;
+      if (attempt === 1) throw new Error("Rate limit exceeded");
+      return finalMessage("Succeeded on the same model.");
+    };
+
+    await expect(outerLoop.run("task-model-reuse", singleSubtaskPlan())).resolves.not.toThrow();
+
+    // Both attempts resolve through the files agent's own role ("worker"), never
+    // a hardcoded, possibly-unavailable fallback model id.
+    const workerCalls = captured.filter((c) => c.role === "worker");
+    expect(workerCalls).toHaveLength(2);
+  });
+
+  it("switches to the operator-configured backup model on retries", async () => {
+    process.env.YAAA_BACKUP_MODEL = "anthropic/claude-sonnet-5";
+    let attempt = 0;
+    responder = async () => {
+      attempt++;
+      if (attempt === 1) throw new Error("Rate limit exceeded");
+      return finalMessage("Succeeded on the backup model.");
+    };
+
+    try {
+      await expect(outerLoop.run("task-model-backup", singleSubtaskPlan())).resolves.not.toThrow();
+      const roles = captured.map((c) => c.role);
+      expect(roles[0]).toBe("worker");
+      expect(roles[1]).toBe("anthropic/claude-sonnet-5");
+    } finally {
+      delete process.env.YAAA_BACKUP_MODEL;
+    }
   });
 });

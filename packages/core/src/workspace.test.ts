@@ -151,7 +151,7 @@ describe("Workspace", () => {
     });
     await expect(workspace.getTaskAgents(task.taskId)).resolves.toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ handle: "@sage-1", status: "completed" }),
+        expect.objectContaining({ handle: "@researcher-1", status: "completed" }),
       ]),
     );
   });
@@ -551,7 +551,7 @@ describe("Workspace", () => {
     await workspace.confirmTask(task.taskId);
 
     const agents = await workspace.getTaskAgents(task.taskId);
-    const worker = agents.find((agent) => agent.handle === "@sage-1");
+    const worker = agents.find((agent) => agent.handle === "@researcher-1");
     expect(worker).toBeDefined();
 
     const conversation = await workspace.createPublicConversation(task.taskId);

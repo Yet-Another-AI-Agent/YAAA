@@ -49,11 +49,30 @@ describe("buildAgentBrief", () => {
 
   it("renders completed dependency results", () => {
     const dependencyOutputs: DependencyOutput[] = [
-      { id: "subtask-1", title: "Write the script", summary: "Created hello_world.py" },
+      {
+        id: "subtask-1",
+        title: "Write the script",
+        summary: "Created hello_world.py",
+        artifacts: [{ path: "agent-workspaces/a/handOff.md", mimeType: "text/markdown", description: "Continuation handoff" }],
+      },
     ];
     const brief = buildAgentBrief({ ...base, dependencyOutputs });
     expect(brief).toContain("## Results from completed dependencies");
     expect(brief).toContain("[subtask-1] Write the script: Created hello_world.py");
+    expect(brief).toContain("agent-workspaces/a/handOff.md");
+  });
+
+  it("renders the hands-on, proof, and handoff contract paths", () => {
+    const brief = buildAgentBrief({
+      ...base,
+      handsOnPath: "agent-workspaces/a/handsOn.md",
+      proofOfWorkPath: "agent-workspaces/a/proofOfWork.md",
+      handOffPath: "agent-workspaces/a/handOff.md",
+    });
+    expect(brief).toContain("## Handoff contract");
+    expect(brief).toContain("agent-workspaces/a/handsOn.md");
+    expect(brief).toContain("agent-workspaces/a/proofOfWork.md");
+    expect(brief).toContain("agent-workspaces/a/handOff.md");
   });
 
   it("states there are no dependencies yet for early steps", () => {

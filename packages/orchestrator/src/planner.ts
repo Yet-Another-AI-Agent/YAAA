@@ -30,7 +30,7 @@ export function getRequestedAgentCount(goal: string): number | null {
   if (!match) return null;
   const token = match[1].toLowerCase();
   const count = NUMBER_WORDS[token] ?? Number.parseInt(token, 10);
-  return Number.isInteger(count) && count > 0 && count <= 20 ? count : null;
+  return Number.isInteger(count) && count > 0 && count <= 300 ? count : null;
 }
 
 /** Render the plan-context preamble prepended to the planning request. */
@@ -79,6 +79,12 @@ export class Planner {
     const systemPrompt = `You are a central Task Planner for YAAA.
 Your job is to break down a user's task into a sequential, structured list of subtasks.
 Each subtask represents a step in a task graph and must declare its capabilities, dependencies, riskLevel, and success criteria.
+You must also choose the best agentTemplate from the allowed roster and explain that choice in routingReason.
+Choose the best fit model for the subtask and assign it to the 'model' property:
+- Use "anthropic/claude-sonnet-5" for coding, complex software/architectural decisions, layout designs, and PPT creation.
+- Use "google/gemini-3.5-flash" or "google/gemini-2.5-pro" for web research, image generation, and general text tasks.
+- Use "anthropic/claude-haiku-4.5" for simple file operations, QA verification, or unit testing.
+Make this semantic decision from the complete subtask, not by matching isolated keywords.
 
 Execution contract:
 - Every subtask is executed by a newly spawned agent. Therefore the number of subtasks is the number of agents that will be spawned.
@@ -87,8 +93,19 @@ Execution contract:
 ${requestedAgentCount ? `- This user explicitly requested exactly ${requestedAgentCount} agents, so this plan MUST contain exactly ${requestedAgentCount} subtasks.` : ""}
 
 Available capabilities:
-- "files": file read, write, search.
-- "verify": validation pass.
+- "files", "browser", "shell", "integration", "docs", and "verify".
+
+Allowed agentTemplate values:
+- FilesAgent: general file and document work
+- PrincipalSweAgent: backend and complex software engineering
+- UiArchitectAgent: frontend and interface engineering
+- GraphicsEngineerAgent: graphics, geometry, WebGL, and rendering
+- ResearcherAgent: web research and analysis
+- AdStrategistAgent: advertising and campaign strategy
+- DesignerAgent: visual and brand design
+- DevOpsAgent: infrastructure, deployment, and operational work
+- QaTesterAgent: functional and automated verification
+- CvTesterAgent: visual, screenshot, and GUI verification
 
 Risk levels:
 - "low": auto-run
@@ -105,7 +122,10 @@ You MUST return a JSON object that strictly adheres to this structure:
       "capability": "files",
       "dependsOn": [],
       "riskLevel": "low",
-      "successCriteria": "A text file battery_facts.txt exists with information."
+      "successCriteria": "A text file battery_facts.txt exists with information.",
+      "agentTemplate": "ResearcherAgent",
+      "routingReason": "The subtask requires gathering and validating factual information.",
+      "model": "google/gemini-3.5-flash"
     },
     {
       "id": "subtask-2",
@@ -113,7 +133,10 @@ You MUST return a JSON object that strictly adheres to this structure:
       "capability": "verify",
       "dependsOn": ["subtask-1"],
       "riskLevel": "low",
-      "successCriteria": "Verification status reports success."
+      "successCriteria": "Verification status reports success.",
+      "agentTemplate": "QaTesterAgent",
+      "routingReason": "Independent functional verification is required.",
+      "model": "anthropic/claude-haiku-4.5"
     }
   ]
 }
@@ -162,6 +185,20 @@ DO NOT output any conversational text before or after the JSON. Only return a va
     }
     const rawJson = JSON.parse(jsonMatch[1] || jsonMatch[0]);
     const plan = TaskPlanSchema.parse(rawJson);
+    for (const subtask of plan.subtasks) {
+      if (!subtask.agentTemplate || !subtask.routingReason) {
+        throw new Error(`Subtask ${subtask.id} is missing the required AI routing decision (agentTemplate and routingReason).`);
+      }
+      if (!subtask.model) {
+        if (subtask.capability === "verify") {
+          subtask.model = "anthropic/claude-haiku-4.5";
+        } else if (subtask.capability === "browser" || subtask.capability === "docs") {
+          subtask.model = "google/gemini-3.5-flash";
+        } else {
+          subtask.model = "anthropic/claude-sonnet-5";
+        }
+      }
+    }
     if (
       requestedAgentCount !== null &&
       plan.subtasks.length !== requestedAgentCount

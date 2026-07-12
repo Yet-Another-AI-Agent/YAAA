@@ -97,6 +97,13 @@ export class TaskModel {
     return this.getElectronAPI().confirmTask(taskId);
   }
 
+  static async rePlanWithFeedback(
+    taskId: string,
+    feedback: string,
+  ): Promise<{ status: string }> {
+    return this.getElectronAPI().rePlanWithFeedback(taskId, feedback);
+  }
+
   static async recordPlanReview(
     taskId: string,
     content: string,
@@ -196,6 +203,10 @@ export class TaskModel {
 
   static async postConversationMessage(message: Omit<UIConversationMessage, "id" | "createdAt">) {
     return this.getElectronAPI().postConversationMessage(message);
+  }
+
+  static async openWorkingFolder(taskId: string): Promise<boolean> {
+    return this.getElectronAPI().openWorkingFolder(taskId);
   }
 
   /**

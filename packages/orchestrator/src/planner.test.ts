@@ -34,7 +34,10 @@ describe("Planner", () => {
       "capability": "files",
       "dependsOn": [],
       "riskLevel": "low",
-      "successCriteria": "facts.txt exists"
+      "successCriteria": "facts.txt exists",
+      "agentTemplate": "ResearcherAgent",
+      "routingReason": "The work requires gathering and synthesizing facts.",
+      "model": "google/gemini-3.5-flash"
     }
   ]
 }
@@ -138,6 +141,9 @@ describe("Planner", () => {
           dependsOn: index === 0 ? [] : ["subtask-1"],
           riskLevel: "low",
           successCriteria: "Role assignment completed",
+          agentTemplate: index === 0 ? "PrincipalSweAgent" : "QaTesterAgent",
+          routingReason: index === 0 ? "Implementation role selected by planner." : "Independent verification role selected by planner.",
+          model: index === 0 ? "anthropic/claude-sonnet-5" : "anthropic/claude-haiku-4.5",
         })),
       })}\n\`\`\``,
     });

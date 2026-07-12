@@ -8,8 +8,10 @@ function makeGateway(
   const queue = Array.isArray(responses) ? [...responses] : null;
   return {
     chat: vi.fn(async (messages: ChatMessage[], _options: ChatOptions) => {
-      if (queue) return queue.shift() ?? "";
-      return (responses as (messages: ChatMessage[]) => string)(messages);
+      const content = queue
+        ? queue.shift() ?? ""
+        : (responses as (messages: ChatMessage[]) => string)(messages);
+      return { content };
     }),
     // biome-ignore lint/correctness/useYield: unused in these tests
     chatStream: vi.fn(async function* () {
@@ -47,15 +49,17 @@ describe("detectConversationalHeuristic", () => {
 });
 
 describe("IntentRouter", () => {
-  it("answers a greeting conversationally without calling the classifier", async () => {
-    const gateway = makeGateway(["Hello Ada! What are we building today?"]);
+  it("classifies a greeting with the model before answering", async () => {
+    const gateway = makeGateway([
+      '{"intent":"conversation","reply":"Hello Ada! What are we building today?"}',
+    ]);
     const router = new IntentRouter(gateway);
 
     const decision = await router.route("hi", { userName: "Ada" });
 
     expect(decision.intent).toBe("conversation");
     expect(decision.reply).toBe("Hello Ada! What are we building today?");
-    // Only the reply generation call — no classification round-trip.
+    // The classifier supplied a usable reply, so no second generation call.
     expect(gateway.chat).toHaveBeenCalledTimes(1);
   });
 
@@ -155,7 +159,10 @@ describe("IntentRouter", () => {
   });
 
   it("truncates absurdly long conversational replies", async () => {
-    const gateway = makeGateway(["a".repeat(5000)]);
+    const gateway = makeGateway([
+      '{"intent":"conversation","reply":""}',
+      "a".repeat(5000),
+    ]);
     const router = new IntentRouter(gateway);
 
     const decision = await router.route("hi");

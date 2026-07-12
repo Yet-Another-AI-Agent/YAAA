@@ -94,14 +94,28 @@ export function useTaskViewModel() {
               }
             });
             setArtifacts(producedArtifacts);
+
+            const hasStarted = data.subtasks.some((st: any) => st.state === "running" || st.state === "completed");
+            if (!hasStarted) {
+              setRunning(false);
+              setAwaitingConfirmation(true);
+              addLog(
+                "orchestrator",
+                "[plan-proposal] Implementation plan ready for review.",
+                "response",
+              );
+            }
           }
-          setRunning(false);
-          setAwaitingConfirmation(true);
-          addLog(
-            "orchestrator",
-            "[plan-proposal] Implementation plan ready for review.",
-            "response",
-          );
+        }
+
+        else if (topic.endsWith(".result")) {
+          if (data && data.artifacts) {
+            setArtifacts((prev) => {
+              const existingPaths = new Set(prev.map((a) => a.path));
+              const newArtifacts = data.artifacts.filter((a: any) => !existingPaths.has(a.path));
+              return [...prev, ...newArtifacts];
+            });
+          }
         }
 
         else if (topic.endsWith(".thought")) {
@@ -298,19 +312,38 @@ export function useTaskViewModel() {
     setAwaitingConfirmation(false);
     setRunning(true);
     const trimmedComments = comments?.trim();
-    const decisionMessage = trimmedComments
-      ? `Accepted the implementation plan with comments:\n${trimmedComments}`
-      : "Accepted the implementation plan.";
-    addLog("user", decisionMessage, "response");
-    addLog("system", "Mission confirmed. YAAA is starting the approved plan.");
-    try {
-      await TaskModel.recordPlanReview(targetTaskId, decisionMessage, "user");
-      await TaskModel.confirmTask(targetTaskId);
-      loadTasks();
-    } catch (err: any) {
-      addLog("system", `Unable to start approved mission: ${err.message}`);
-      setRunning(false);
-      setAwaitingConfirmation(true);
+
+    if (trimmedComments) {
+      // User has comments → silently replan incorporating the feedback
+      addLog("user", `Accepted plan with comments:\n${trimmedComments}`, "response");
+      addLog("system", "⟳ Incorporating your feedback and regenerating the plan automatically…");
+      try {
+        await TaskModel.recordPlanReview(
+          targetTaskId,
+          `Accepted the implementation plan with comments:\n${trimmedComments}`,
+          "user",
+        );
+        await TaskModel.rePlanWithFeedback(targetTaskId, trimmedComments);
+        loadTasks();
+      } catch (err: any) {
+        addLog("system", `Unable to replan: ${err.message}`);
+        setRunning(false);
+        setAwaitingConfirmation(true);
+      }
+    } else {
+      // No comments → proceed with the current plan as-is
+      const decisionMessage = "Accepted the implementation plan.";
+      addLog("user", decisionMessage, "response");
+      addLog("system", "Mission confirmed. YAAA is starting the approved plan.");
+      try {
+        await TaskModel.recordPlanReview(targetTaskId, decisionMessage, "user");
+        await TaskModel.confirmTask(targetTaskId);
+        loadTasks();
+      } catch (err: any) {
+        addLog("system", `Unable to start approved mission: ${err.message}`);
+        setRunning(false);
+        setAwaitingConfirmation(true);
+      }
     }
   };
 

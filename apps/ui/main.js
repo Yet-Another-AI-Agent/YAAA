@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain } from "electron";
+import { app, BrowserWindow, ipcMain, nativeImage, shell } from "electron";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Workspace } from "@yaaa/core";
@@ -6,6 +6,13 @@ import { isInsufficientFundsError } from "@yaaa/shared";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// The product name shown in the window title, macOS menu bar, and about panel.
+const APP_NAME = "YAAA";
+app.setName(APP_NAME);
+
+// The YAAA brand mark, used for the window and (on macOS) the dock icon.
+const appIcon = nativeImage.createFromPath(path.join(__dirname, "build/icon.png"));
 
 let mainWindow = null;
 
@@ -29,6 +36,8 @@ function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1300,
     height: 850,
+    title: APP_NAME,
+    icon: appIcon,
     backgroundColor: "#0b0e14",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
@@ -36,6 +45,10 @@ function createWindow() {
       nodeIntegration: false,
     },
   });
+
+  // Keep the window titled "YAAA" instead of adopting the loaded page's
+  // <title>, which the renderer would otherwise push into the title bar.
+  mainWindow.on("page-title-updated", (event) => event.preventDefault());
 
   const isDev = !app.isPackaged;
   if (isDev) {
@@ -104,8 +117,13 @@ function forwardRuntimeEvent(taskId, event) {
         data: { topic: event.topic },
       });
       break;
-    // "result" is surfaced through the final "complete" payload; "complete"
-    // is handled by the run() caller below.
+    case "result":
+      sendToRenderer("task-event", {
+        topic: `task.${taskId}.agent.${event.from}.result`,
+        data: { artifacts: event.artifacts, summary: event.summary },
+      });
+      break;
+    // "complete" is handled by the run() caller below.
     default:
       break;
   }
@@ -201,6 +219,38 @@ ipcMain.handle("confirm-task", async (_event, taskId) => {
       .finally(() => confirmingTasks.delete(taskId));
   }, 0);
 
+  return { status: "started" };
+});
+
+ipcMain.handle("replan-with-feedback", async (_event, { taskId, feedback }) => {
+  if (killedTasks.has(taskId) || confirmingTasks.has(taskId)) {
+    return { status: "error", error: "Task is already running or was deleted" };
+  }
+  confirmingTasks.add(taskId);
+  setTimeout(() => {
+    workspace
+      .rePlanWithFeedback(taskId, feedback, {
+        onEvent: (event) => forwardRuntimeEvent(taskId, event),
+        onApproval: makeApprovalHandler(taskId),
+      })
+      .then((result) => {
+        if (killedTasks.has(taskId)) return;
+        const reason =
+          !result.success && isInsufficientFundsError(result.summary)
+            ? "insufficient_funds"
+            : undefined;
+        sendToRenderer("task-complete", { ...result, reason });
+      })
+      .catch((err) => {
+        if (killedTasks.has(taskId)) return;
+        sendToRenderer("task-complete", {
+          success: false,
+          summary: err?.message ?? String(err),
+          reason: isInsufficientFundsError(err) ? "insufficient_funds" : undefined,
+        });
+      })
+      .finally(() => confirmingTasks.delete(taskId));
+  }, 0);
   return { status: "started" };
 });
 
@@ -353,9 +403,20 @@ ipcMain.handle("parse-resume", async (_event, text) => {
   }
 });
 
+ipcMain.handle("open-working-folder", async (_event, taskId) => {
+  if (!taskId) return false;
+  const folderPath = path.join(workspace.getYaaaDir(), "tasks", taskId, "working");
+  await shell.openPath(folderPath);
+  return true;
+});
+
 // ------------------------------------------------------------------- lifecycle
 
 app.whenReady().then(() => {
+  // On macOS the dock icon is set at runtime rather than via BrowserWindow.icon.
+  if (process.platform === "darwin" && app.dock && !appIcon.isEmpty()) {
+    app.dock.setIcon(appIcon);
+  }
   createWindow();
 
   app.on("activate", () => {

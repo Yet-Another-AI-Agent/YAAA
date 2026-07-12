@@ -90,31 +90,24 @@ describe("AGENT_REGISTRY", () => {
       ).toBe("QaTesterAgent");
     });
 
-    it("routes visual verification to the CV tester", () => {
+    it("uses the planner's structured visual-verification assignment", () => {
       expect(
         selectAgentTemplate({
           capability: "verify",
           title: "Verify the GUI screenshot alignment",
+          agentTemplate: "CvTesterAgent",
         }),
       ).toBe("CvTesterAgent");
     });
 
-    it.each([
-      [
-        "Migrate the legacy database to Kafka microservices",
-        "PrincipalSweAgent",
-      ],
-      ["Build the React dashboard layout with CSS grid", "UiArchitectAgent"],
-      ["Implement the WebGL aligner mesh viewer", "GraphicsEngineerAgent"],
-      ["Research competitor pricing for clear aligners", "ResearcherAgent"],
-      ["Plan the Meta ad campaign for the dental clinic", "AdStrategistAgent"],
-      ["Design the promotional pamphlet layout", "DesignerAgent"],
-      ["Set up the Docker and CI/CD pipeline", "DevOpsAgent"],
-      ["Write a summary file of battery facts", "FilesAgent"],
-    ])("routes %j to %s", (title, expected) => {
-      expect(selectAgentTemplate({ capability: "files", title })).toBe(
-        expected,
-      );
+    it("does not infer a specialist from title keywords", () => {
+      expect(selectAgentTemplate({ capability: "files", title: "Docker React research database" })).toBe("FilesAgent");
+    });
+
+    it("accepts every valid planner-selected specialist", () => {
+      for (const agentTemplate of ["PrincipalSweAgent", "UiArchitectAgent", "GraphicsEngineerAgent", "ResearcherAgent", "AdStrategistAgent", "DesignerAgent", "DevOpsAgent"]) {
+        expect(selectAgentTemplate({ capability: "files", agentTemplate })).toBe(agentTemplate);
+      }
     });
   });
 

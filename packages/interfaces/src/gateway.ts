@@ -40,4 +40,5 @@ export interface ChatResult {
 export interface IMeshGateway {
   chat(messages: ChatMessage[], options: ChatOptions): Promise<ChatResult>;
   chatStream(messages: ChatMessage[], options: ChatOptions): AsyncIterable<string>;
+  generateImage?(prompt: string, options?: { model?: string }): Promise<string>;
 }

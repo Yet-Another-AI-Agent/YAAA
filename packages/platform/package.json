@@ -9,7 +9,11 @@
     "build": "tsc -b"
   },
   "dependencies": {
+    "@yaaa/interfaces": "*",
     "@yaaa/shared": "*",
-    "@yaaa/interfaces": "*"
+    "shell-quote": "^1.10.0"
+  },
+  "devDependencies": {
+    "@types/shell-quote": "^1.7.5"
   }
 }

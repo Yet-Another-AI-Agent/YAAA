@@ -59,9 +59,14 @@ function getMediaKind(mimeType: string, extension: string): ArtifactMediaKind | 
 }
 
 function getHandoffKind(name: string): ArtifactHandoffKind | undefined {
-  const stem = name.replace(/\.[^.]+$/, "").replace(/[\s_-]+/g, "_").toUpperCase();
+  const stem = name
+    .replace(/\.[^.]+$/, "")
+    .replace(/([a-z])([A-Z])/g, "$1_$2")
+    .replace(/[\s_-]+/g, "_")
+    .toUpperCase();
   if (stem === "HANDS_ON") return "hands-on";
   if (stem === "HANDS_OFF") return "hands-off";
+  if (stem === "HAND_OFF") return "hands-off";
   return undefined;
 }
 

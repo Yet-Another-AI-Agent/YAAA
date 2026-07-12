@@ -708,14 +708,17 @@ describe("DashboardView", () => {
       }],
     })} />);
 
-    // The handoff document is shown inline on the thread card.
+    // The hands-on assignment is shown inline on the thread card while work is in progress.
     expect(screen.getByText("Investigate the repo")).toBeTruthy();
-    fireEvent.click(screen.getByText(/Show thread/));
-    // Thread overlay shows the handoff document and success criteria.
-    expect(screen.getByText(/Handoff document/)).toBeTruthy();
+    expect(screen.getByText(/handsOn · open/)).toBeTruthy();
+    expect(screen.queryByText(/handoff · open/)).toBeNull();
+    fireEvent.click(screen.getByText(/View channel/));
+    // Thread overlay shows the assignment and success criteria, but no agent handoff yet.
+    expect(screen.getByText(/handsOn assignment/)).toBeTruthy();
+    expect(screen.queryByText(/Handoff document/)).toBeNull();
     expect(screen.getAllByText(/Findings documented/).length).toBeGreaterThan(0);
 
     fireEvent.click(screen.getByText("← Back"));
-    expect(screen.queryByText(/Handoff document/)).toBeNull();
+    expect(screen.queryByText(/handsOn assignment/)).toBeNull();
   });
 });

@@ -39,4 +39,4 @@ fi
 
 npm install
 npx electron-rebuild -f -w better-sqlite3 --module-dir apps/ui
-npm run dev:ui
+sudo npm run dev:ui

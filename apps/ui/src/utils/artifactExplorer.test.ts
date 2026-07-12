@@ -7,6 +7,8 @@ describe("buildArtifactExplorer", () => {
       { path: "plans/IMPLEMENTATION_PLAN.md", mimeType: "text/markdown", description: "Execution plan" },
       { path: "agents/qa/HANDS_ON.md", mimeType: "text/markdown", description: "Boundaries" },
       { path: "agents/qa/HANDS-OFF.md", mimeType: "text/markdown", description: "Review summary" },
+      { path: "agent-workspaces/a/handsOn.md", mimeType: "text/markdown", description: "Assignment" },
+      { path: "agent-workspaces/a/handOff.md", mimeType: "text/markdown", description: "Continuation" },
       { path: "renders/final.PNG", mimeType: "application/octet-stream", description: "Hero image" },
       { path: "exports/results.csv", mimeType: "text/csv", description: "Results" },
     ]);
@@ -18,7 +20,7 @@ describe("buildArtifactExplorer", () => {
       depth: 1,
       typeLabel: "Plan",
     });
-    expect(groups[1].entries.map((entry) => entry.handoffKind)).toEqual(["hands-on", "hands-off"]);
+    expect(groups[1].entries.map((entry) => entry.handoffKind)).toEqual(["hands-off", "hands-on", "hands-on", "hands-off"]);
     expect(groups[2].entries[0]).toMatchObject({ mediaKind: "image", typeLabel: "Image" });
   });
 

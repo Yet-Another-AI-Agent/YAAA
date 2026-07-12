@@ -17,7 +17,7 @@ class FakeWorkerModel extends BaseChatModel {
     return "fake-worker";
   }
   async _generate(): Promise<LcChatResult> {
-    const text = this.role === "verifier" ? "OK\nVERDICT: PASSED" : "Subtask done";
+    const text = this.role === "verifier" ? JSON.stringify({ status: "passed", summary: "OK", findings: [], evidence: ["fake verification"] }) : "Subtask done";
     const message = new AIMessage({ content: text });
     return { generations: [{ text, message }] };
   }
@@ -92,7 +92,10 @@ describe("Supervisor", () => {
       "dependsOn": [],
       "riskLevel": "low",
       "successCriteria": "done",
-      "state": "pending"
+      "state": "pending",
+      "agentTemplate": "FilesAgent",
+      "routingReason": "General file work.",
+      "model": "anthropic/claude-sonnet-5"
     }
   ]
 }
@@ -148,7 +151,10 @@ describe("Supervisor", () => {
       "dependsOn": [],
       "riskLevel": "low",
       "successCriteria": "done",
-      "state": "pending"
+      "state": "pending",
+      "agentTemplate": "FilesAgent",
+      "routingReason": "General file work.",
+      "model": "anthropic/claude-sonnet-5"
     }
   ]
 }

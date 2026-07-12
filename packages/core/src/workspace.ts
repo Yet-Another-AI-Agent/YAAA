@@ -1027,6 +1027,52 @@ export class Workspace {
   }
 
   /**
+   * Re-generate a plan for a task incorporating user feedback/comments from the
+   * plan review stage, then automatically execute it without prompting the user
+   * to review again.
+   *
+   * Called when the user clicks "Accept (addressing comments)" — passes their
+   * structured comments as context so the AI generates a revised plan and
+   * immediately runs it silently.
+   */
+  async rePlanWithFeedback(
+    taskId: string,
+    feedback: string,
+    hooks: RunTaskHooks = {},
+  ): Promise<TaskRunResult> {
+    // Reset the task to planning status so prepareTask can drive the state machine
+    this.updateTaskStatus(taskId, "planning");
+
+    const taskMeta = this.getTask(taskId);
+    if (!taskMeta) throw new Error("Task not found.");
+
+    const task: CreatedTask = {
+      taskId,
+      taskDir: taskMeta.path,
+      workingDir: path.join(taskMeta.path, "working"),
+    };
+
+    hooks.onEvent?.({
+      type: "status",
+      from: "orchestrator",
+      note: "⟳ Incorporating your feedback and generating a revised plan…",
+    });
+
+    // Re-generate the plan with feedback injected as prior context
+    const newPlan = await this.prepareTask(
+      taskMeta.prompt,
+      task,
+      hooks,
+      {
+        priorSummary: `The user reviewed the initial plan and provided the following feedback to address:\n\n${feedback}\n\nIncorporate this feedback into a revised, improved plan.`,
+      },
+    );
+
+    // Immediately execute the revised plan (confirmTask without user gate)
+    return this.runTask(taskMeta.prompt, task, hooks, newPlan);
+  }
+
+  /**
    * Continue an existing mission with a follow-up message instead of spawning a
    * brand-new task/channel. The message is appended to the mission's public
    * conversation, then a fresh plan is generated ON THE SAME task, seeded with a
@@ -1211,8 +1257,8 @@ Analyze the conversation history. Decide if:
    - Clarifications/details.
    - Plan necessity.
    - Sub-agent requirements.
-2. You have a solid understanding and a multi-step plan of subtasks using specialized agents is needed -> Choose action "prepare_plan" and reply stating you are preparing the plan.
-3. You have a solid understanding and this is a simple query/task that does NOT require a multi-step plan -> Choose action "direct_execute" and write the direct reply/answer in the "reply" field.
+2. You have a solid understanding and the request needs any real work to be carried out -> Choose action "prepare_plan" and reply stating you are preparing the plan. This is REQUIRED whenever fulfilling the request depends on an external action or live data: web search, browsing, reading/writing files, running commands, or any tool use. A single-step request (e.g. "find the cheapest flight") still needs an agent to run the tools, so it is "prepare_plan", NOT "direct_execute".
+3. You can FULLY answer the request right now, purely from your own knowledge, with no external action, no tool, and no live/current data -> Choose action "direct_execute" and write the complete answer in the "reply" field. You have no tools in this step, so never promise to "search", "look up", "gather", or "fetch" anything under this action — if you would need to, choose "prepare_plan" instead.
 
 When action is "direct_execute" and your answer contains code, a Markdown document, tabular data, or any renderable content, you MUST embed it using the viewer protocol below inside the "reply" string — do not paste raw code or long Markdown as plain text. The fenced yaaa-viewer block goes inside the "reply" value (JSON-escaped like any other string content).
 ${VIEWER_PROTOCOL}
@@ -1320,7 +1366,12 @@ You must respond with ONLY a JSON object:
         let content = "";
         if (msg.kind === "thought") content = msg.content;
         else if (msg.kind === "status") content = msg.note || "";
-        else if (msg.kind === "result") content = msg.summary;
+        else if (msg.kind === "result") {
+          const artifactsList = (msg as any).artifacts && (msg as any).artifacts.length > 0
+            ? `\nArtifacts produced: ${JSON.stringify((msg as any).artifacts.map((a: any) => ({ path: a.path, mimeType: a.mimeType, description: a.description })))}`
+            : "";
+          content = msg.summary + artifactsList;
+        }
         else if (msg.kind === "info_request") content = msg.question;
         else if (msg.kind === "info_reply") content = msg.answer;
 
@@ -1339,12 +1390,17 @@ You must respond with ONLY a JSON object:
       content: "Formulating reply...",
     });
 
+    const task = this.requireTask(taskId);
     const messages: ChatMessage[] = [
       {
         role: "system",
         content: `You are @orchestrator, the friendly Team Lead of YAAA, an AI professional firm.
+The user's original task goal is: "${task.prompt}".
 You are chatting with the user in their channel. You have access to the conversation history.
 Please reply to the user's message in a helpful, friendly manner, maintaining the context of what was said before.
+
+If the user is asking about the status of the work, where the files/slides are, or asking to view/see the files, you MUST attach a viewer for those files/slides (using the fenced yaaa-viewer JSON block format specified in the protocol) so they render beautifully in the UI.
+
 ${VIEWER_PROTOCOL}`,
       },
       ...chatMessages,
