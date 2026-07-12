@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Workspace } from "./workspace.js";
+import { Workspace, buildPlanAcknowledgement } from "./workspace.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -19,6 +19,78 @@ afterEach(() => {
 });
 
 describe("Workspace", () => {
+  it("builds a concise pre-plan acknowledgement that honors explicit agent count", () => {
+    expect(
+      buildPlanAcknowledgement(
+        "spin 2 agents and one to write Python code and another to test",
+      ),
+    ).toBe(
+      "Got it — I’ll prepare a plan using exactly 2 agents, preserving the roles you requested. You can review it before any agent starts.",
+    );
+    expect(buildPlanAcknowledgement("Build a Python tool")).toContain(
+      "implementation plan",
+    );
+  });
+
+  it("emits the acknowledgement before returning a plan for review", async () => {
+    const workspace = createWorkspace();
+    const goal = "spin 2 agents and one to write Python code and another to test";
+    const task = workspace.createTask(goal);
+    vi.spyOn(workspace, "routeUserMessage").mockResolvedValue({ kind: "task" });
+    vi.spyOn(workspace, "evaluateConversationalOnboarding").mockResolvedValue({
+      thought: "A plan is appropriate.",
+      reply: "",
+      action: "prepare_plan",
+    });
+    vi.spyOn(workspace, "prepareTask").mockResolvedValue({ goal, subtasks: [] });
+    const events: any[] = [];
+
+    const result = await workspace.startConversationalOnboarding(task.taskId, goal, {
+      onEvent: (event) => events.push(event),
+    });
+
+    expect(result).toMatchObject({
+      kind: "task",
+      reply: expect.stringContaining("exactly 2 agents"),
+    });
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "status",
+        note: expect.stringContaining("review it before any agent starts"),
+      }),
+    );
+  });
+
+  it("persists plan proposals and review actions in task history", async () => {
+    const workspace = createWorkspace();
+    const task = workspace.createTask("Build a Python tool");
+
+    await workspace.recordPlanReviewMessage(
+      task.taskId,
+      "[plan-proposal] Implementation plan ready for review.",
+      "orchestrator",
+    );
+    await workspace.recordPlanReviewMessage(
+      task.taskId,
+      "Accepted the implementation plan with comments:\nkeep it small",
+      "user",
+    );
+
+    await expect(workspace.getTaskHistory(task.taskId)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "thought",
+          from: "orchestrator",
+          content: expect.stringContaining("[plan-proposal]"),
+        }),
+        expect.objectContaining({
+          kind: "thought",
+          from: "user",
+          content: expect.stringContaining("keep it small"),
+        }),
+      ]),
+    );
+  });
   it("persists onboarding configuration without exposing a missing profile", () => {
     const workspace = createWorkspace();
 
@@ -149,6 +221,38 @@ describe("Workspace", () => {
     const messages = await workspace.getConversationMessages(task.taskId, publicConv!.id);
     expect(messages.some((m) => m.content === "what did you do?")).toBe(true);
     expect(messages.some((m) => m.authorKind === "orchestrator")).toBe(true);
+  });
+
+  it("surfaces a direct_execute answer once — persisted, not re-emitted as a status event", async () => {
+    const workspace = createWorkspace();
+    const goal = "give me the trapping rain water code";
+    const task = workspace.createTask(goal);
+
+    // Skip the small-talk gate so onboarding reaches the evaluation step.
+    vi.spyOn(workspace, "routeUserMessage").mockResolvedValue({ kind: "task" });
+    const reply =
+      'Here you go:\n```yaaa-viewer\n{"type":"code","source":{"content":"function trap(){ return 0; }"},"language":"javascript"}\n```';
+    vi.spyOn(workspace, "evaluateConversationalOnboarding").mockResolvedValue({
+      thought: "Simple query — answer directly.",
+      reply,
+      action: "direct_execute",
+    });
+
+    const events: any[] = [];
+    const result = await workspace.startConversationalOnboarding(task.taskId, goal, {
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(result).toMatchObject({ kind: "direct_execute", reply });
+    // The reply reaches the renderer once via the task-complete summary
+    // (main.js). It must NOT also be re-emitted as an orchestrator status event,
+    // or the UI renders the same answer — and its viewer — twice.
+    expect(events.some((e) => e.type === "status" && e.note === reply)).toBe(false);
+    // It is still persisted in the channel for history/reload.
+    const conversations = await workspace.getTaskConversations(task.taskId);
+    const publicConv = conversations.find((c) => c.kind === "public");
+    const messages = await workspace.getConversationMessages(task.taskId, publicConv!.id);
+    expect(messages.some((m) => m.content === reply)).toBe(true);
   });
 
   it("generates a channel topic alongside the plan without blocking it", async () => {
@@ -358,6 +462,19 @@ describe("Workspace", () => {
     );
     expect(messages[0].content).toContain("Visual feedback on pamphlet.md");
     expect(messages[0].content).toContain("Logo is misaligned");
+  });
+
+  it("persists line comments with exact locations and routes them to the orchestrator", async () => {
+    const workspace = createWorkspace();
+    const task = workspace.createTask("Review a plan");
+    fs.writeFileSync(path.join(task.workingDir, "plan.md"), "# Plan\n- Deploy", "utf-8");
+    const comments = [{ line: 2, quote: "- Deploy", comment: "Add rollback steps" }];
+    const result = await workspace.saveLineComments(task.taskId, "plan.md", comments);
+    expect(JSON.parse(fs.readFileSync(result.annotationPath, "utf-8")).comments).toEqual(comments);
+    const conversation = (await workspace.getTaskConversations(task.taskId)).find((item) => item.kind === "public");
+    const messages = await workspace.getConversationMessages(task.taskId, conversation!.id);
+    expect(messages[0].content).toContain("line 2");
+    expect(messages[0].content).toContain("Add rollback steps");
   });
 
   it("rejects annotations for missing artifacts or empty comments", async () => {

@@ -9,6 +9,30 @@ export interface PlanContext {
   priorSummary?: string;
 }
 
+const NUMBER_WORDS: Record<string, number> = {
+  one: 1,
+  two: 2,
+  three: 3,
+  four: 4,
+  five: 5,
+  six: 6,
+  seven: 7,
+  eight: 8,
+  nine: 9,
+  ten: 10,
+};
+
+/** Return an explicit user-requested agent count, if the goal contains one. */
+export function getRequestedAgentCount(goal: string): number | null {
+  const match = goal.match(
+    /\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:collaborating\s+|specialized\s+)?agents?\b/i,
+  );
+  if (!match) return null;
+  const token = match[1].toLowerCase();
+  const count = NUMBER_WORDS[token] ?? Number.parseInt(token, 10);
+  return Number.isInteger(count) && count > 0 && count <= 20 ? count : null;
+}
+
 /** Render the plan-context preamble prepended to the planning request. */
 export function renderPlanContext(context?: PlanContext): string {
   if (!context) return "";
@@ -40,6 +64,7 @@ export class Planner {
   }
 
   async plan(goal: string, taskId?: string, context?: PlanContext): Promise<TaskPlan> {
+    const requestedAgentCount = getRequestedAgentCount(goal);
     // Surface the orchestrator's reasoning tokens as "thinking" for the UI.
     const onReasoning = taskId
       ? (reasoning: string) => {
@@ -54,6 +79,12 @@ export class Planner {
     const systemPrompt = `You are a central Task Planner for YAAA.
 Your job is to break down a user's task into a sequential, structured list of subtasks.
 Each subtask represents a step in a task graph and must declare its capabilities, dependencies, riskLevel, and success criteria.
+
+Execution contract:
+- Every subtask is executed by a newly spawned agent. Therefore the number of subtasks is the number of agents that will be spawned.
+- If the user explicitly requests an exact number of agents, return exactly that many subtasks. Bundle requirements, implementation, revisions, and verification work into those agents' assignments rather than creating extra workflow-step subtasks.
+- Preserve the requested role split in subtask titles and use dependencies to express handoffs between those agents.
+${requestedAgentCount ? `- This user explicitly requested exactly ${requestedAgentCount} agents, so this plan MUST contain exactly ${requestedAgentCount} subtasks.` : ""}
 
 Available capabilities:
 - "files": file read, write, search.
@@ -102,7 +133,7 @@ DO NOT output any conversational text before or after the JSON. Only return a va
     let response = firstRes.content;
 
     try {
-      return this.parseAndValidate(response);
+      return this.parseAndValidate(response, requestedAgentCount);
     } catch (err: any) {
       console.warn("First planning attempt failed validation. Retrying with error details...", err.message);
       
@@ -120,16 +151,25 @@ DO NOT output any conversational text before or after the JSON. Only return a va
       });
       response = retryRes.content;
 
-      return this.parseAndValidate(response);
+      return this.parseAndValidate(response, requestedAgentCount);
     }
   }
 
-  private parseAndValidate(output: string): TaskPlan {
+  private parseAndValidate(output: string, requestedAgentCount: number | null): TaskPlan {
     const jsonMatch = output.match(/```json\s*([\s\S]*?)\s*```/) || output.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
       throw new Error("No JSON code block found in model output.");
     }
     const rawJson = JSON.parse(jsonMatch[1] || jsonMatch[0]);
-    return TaskPlanSchema.parse(rawJson);
+    const plan = TaskPlanSchema.parse(rawJson);
+    if (
+      requestedAgentCount !== null &&
+      plan.subtasks.length !== requestedAgentCount
+    ) {
+      throw new Error(
+        `The user requested exactly ${requestedAgentCount} agents, but the plan contains ${plan.subtasks.length} subtasks. Each subtask spawns one agent, so return exactly ${requestedAgentCount} subtasks.`,
+      );
+    }
+    return plan;
   }
 }

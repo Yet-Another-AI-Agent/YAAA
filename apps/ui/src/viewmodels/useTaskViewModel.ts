@@ -97,7 +97,11 @@ export function useTaskViewModel() {
           }
           setRunning(false);
           setAwaitingConfirmation(true);
-          addLog("orchestrator", "Plan ready for your review. Confirm the mission to begin agent work.");
+          addLog(
+            "orchestrator",
+            "[plan-proposal] Implementation plan ready for review.",
+            "response",
+          );
         }
 
         else if (topic.endsWith(".thought")) {
@@ -208,9 +212,19 @@ export function useTaskViewModel() {
       setAwaitingConfirmation(false);
     }
   };
-  const continueMission = async (message?: string) => {
+  const continueMission = async (message?: string, taskIdOverride?: string) => {
     const text = (message ?? goal).trim();
-    if (!taskId || !text) return;
+    const targetTaskId = taskIdOverride ?? taskId;
+    if (!targetTaskId || !text) return;
+
+    // A task selected after an app restart exists in persistent storage but is
+    // not yet the view model's active task. Reactivate that exact mission so
+    // the backend continues against its stored conversation and plan history.
+    if (targetTaskId !== taskId) {
+      setTaskId(targetTaskId);
+      clearLogs();
+      setArtifacts([]);
+    }
 
     // A follow-up produces a fresh plan; clear the prior plan/agents but keep
     // accumulated artifacts so the mission's outputs persist across turns.
@@ -231,7 +245,7 @@ export function useTaskViewModel() {
 
     try {
       attachTaskEventStream();
-      const result = await TaskModel.continueTask(taskId, text);
+      const result = await TaskModel.continueTask(targetTaskId, text);
       loadTasks();
       if (result?.status === "conversation") {
         setRunning(false);
@@ -274,16 +288,24 @@ export function useTaskViewModel() {
     await loadTasks();
   };
 
-  const confirmPlan = async (comments?: string) => {
-    if (!taskId || running || !awaitingConfirmation) return;
+  const confirmPlan = async (comments?: string, taskIdOverride?: string) => {
+    const targetTaskId = taskIdOverride ?? taskId;
+    if (!targetTaskId || running || (!awaitingConfirmation && !taskIdOverride)) return;
+    if (targetTaskId !== taskId) {
+      setTaskId(targetTaskId);
+      attachTaskEventStream();
+    }
     setAwaitingConfirmation(false);
     setRunning(true);
-    if (comments && comments.trim()) {
-      addLog("orchestrator", `Plan accepted with comments to address:\n${comments.trim()}`);
-    }
+    const trimmedComments = comments?.trim();
+    const decisionMessage = trimmedComments
+      ? `Accepted the implementation plan with comments:\n${trimmedComments}`
+      : "Accepted the implementation plan.";
+    addLog("user", decisionMessage, "response");
     addLog("system", "Mission confirmed. YAAA is starting the approved plan.");
     try {
-      await TaskModel.confirmTask(taskId);
+      await TaskModel.recordPlanReview(targetTaskId, decisionMessage, "user");
+      await TaskModel.confirmTask(targetTaskId);
       loadTasks();
     } catch (err: any) {
       addLog("system", `Unable to start approved mission: ${err.message}`);
@@ -297,15 +319,19 @@ export function useTaskViewModel() {
    * re-plan primitive yet, so this records the rejection reason as YAAA
    * feedback and keeps the plan in review so the user can revise and resubmit.
    */
-  const rejectPlan = async (reason: string) => {
-    if (!taskId || !awaitingConfirmation) return;
+  const rejectPlan = async (reason: string, taskIdOverride?: string) => {
+    const targetTaskId = taskIdOverride ?? taskId;
+    if (!targetTaskId || (!awaitingConfirmation && !taskIdOverride)) return;
     const trimmed = (reason || "").trim();
     if (!trimmed) return;
-    addLog("system", `Plan rejected. Reason: ${trimmed}`);
-    addLog(
-      "orchestrator",
-      "Understood — I won't start this plan. Send a revised mission or more detail and I'll re-plan.",
-    );
+    if (targetTaskId !== taskId) setTaskId(targetTaskId);
+    setAwaitingConfirmation(true);
+    const rejection = `Rejected the implementation plan:\n${trimmed}`;
+    const reply = "Understood — I won't start this plan. Send a revised mission or more detail and I'll re-plan.";
+    addLog("user", rejection, "response");
+    addLog("orchestrator", reply, "response");
+    await TaskModel.recordPlanReview(targetTaskId, rejection, "user");
+    await TaskModel.recordPlanReview(targetTaskId, reply, "orchestrator");
   };
 
   return {

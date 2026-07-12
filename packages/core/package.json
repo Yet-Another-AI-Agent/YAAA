@@ -9,12 +9,14 @@
     "build": "tsc -b"
   },
   "dependencies": {
-    "@yaaa/shared": "*",
+    "@langchain/core": "^1.2.2",
+    "@langchain/openai": "^1.5.5",
+    "@yaaa/agents": "*",
     "@yaaa/interfaces": "*",
+    "@yaaa/orchestrator": "*",
     "@yaaa/platform": "*",
     "@yaaa/providers": "*",
-    "@yaaa/agents": "*",
-    "@yaaa/orchestrator": "*",
+    "@yaaa/shared": "*",
     "better-sqlite3": "^11.1.2"
   }
 }

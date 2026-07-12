@@ -39,9 +39,22 @@ const workspaceInstance = {
     .fn()
     .mockResolvedValue({ success: true, summary: "ok", plan: null }),
   prepareTask: vi.fn().mockResolvedValue({ goal: "do a thing", subtasks: [] }),
+  startConversationalOnboarding: vi.fn(async (_taskId, goal, hooks) => {
+    await workspaceInstance.prepareTask(
+      goal,
+      {
+        taskId: "task-123",
+        taskDir: "/tmp/task-123",
+        workingDir: "/tmp/task-123/working",
+      },
+      hooks,
+    );
+    return { kind: "task" };
+  }),
   confirmTask: vi
     .fn()
     .mockResolvedValue({ success: true, summary: "ok", plan: null }),
+  recordPlanReviewMessage: vi.fn().mockResolvedValue(undefined),
   listTasks: vi.fn().mockReturnValue([]),
   deleteTask: vi.fn(),
   getTaskHistory: vi.fn().mockResolvedValue([]),
@@ -70,6 +83,9 @@ const workspaceInstance = {
   saveArtifactAnnotations: vi
     .fn()
     .mockResolvedValue({ annotationPath: "/tmp/a.json", routes: [] }),
+  saveLineComments: vi
+    .fn()
+    .mockResolvedValue({ annotationPath: "/tmp/a.lines.json", routes: [] }),
   readArtifactBinary: vi
     .fn()
     .mockReturnValue({ dataUrl: "data:image/png;base64,AQID", mimeType: "image/png" }),
@@ -101,8 +117,10 @@ describe("Electron main (in-process, no CLI subprocess)", () => {
       "get-paused-agents",
       "list-mcp-integrations",
       "save-artifact-annotations",
+      "save-line-comments",
       "start-task",
       "confirm-task",
+      "record-plan-review",
       "resolve-approval",
       "list-tasks",
       "delete-task",
@@ -159,6 +177,15 @@ describe("Electron main (in-process, no CLI subprocess)", () => {
     );
   });
 
+  it("save-line-comments delegates line-addressed feedback to the workspace", async () => {
+    await import("./main.js");
+    const save = ipcHandlers.get("save-line-comments");
+    const comments = [{ line: 4, quote: "- Deploy", comment: "Add rollback steps" }];
+    const res = await save({}, { taskId: "task-123", artifactPath: "plan.md", comments });
+    expect(res).toEqual({ annotationPath: "/tmp/a.lines.json", routes: [] });
+    expect(workspaceInstance.saveLineComments).toHaveBeenCalledWith("task-123", "plan.md", comments);
+  });
+
   it("start-task scaffolds via the workspace and returns the real task id", async () => {
     await import("./main.js");
     const startTask = ipcHandlers.get("start-task");
@@ -209,15 +236,17 @@ describe("Electron main (in-process, no CLI subprocess)", () => {
     await import("./main.js");
     const startTask = ipcHandlers.get("start-task");
     await startTask({}, "do a thing");
-    // start-task defers the prepareTask() call by one tick so the renderer
-    // can attach listeners first; wait for it before reading the mock call.
+    const confirmTask = ipcHandlers.get("confirm-task");
+    await confirmTask({}, "task-123");
+    // confirm-task defers execution by one tick; wait until the workspace has
+    // received the approval hook used by running agents.
     await new Promise((r) => setTimeout(r, 10));
 
     // Simulate the runtime pausing this task's agent on an approval gate.
-    // workspaceInstance.prepareTask is a shared mock whose call history isn't
+    // workspaceInstance.confirmTask is a shared mock whose call history isn't
     // reset between tests, so grab the most recent call — index 0 would be a
     // stale closure from an earlier test's main.js module instance.
-    const hooks = workspaceInstance.prepareTask.mock.calls.at(-1)[2];
+    const hooks = workspaceInstance.confirmTask.mock.calls.at(-1)[1];
     const approvalPromise = hooks.onApproval("agent-1", {
       id: "call-1",
       capability: "files",

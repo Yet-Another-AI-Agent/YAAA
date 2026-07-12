@@ -97,6 +97,14 @@ export class TaskModel {
     return this.getElectronAPI().confirmTask(taskId);
   }
 
+  static async recordPlanReview(
+    taskId: string,
+    content: string,
+    authorKind: "user" | "orchestrator",
+  ): Promise<{ status: string }> {
+    return this.getElectronAPI().recordPlanReview(taskId, content, authorKind);
+  }
+
 
   static async resolveApproval(
     callId: string,
@@ -149,6 +157,14 @@ export class TaskModel {
     annotations: Array<{ x: number; y: number; width: number; height: number; comment: string }>,
   ): Promise<{ annotationPath: string; routes: unknown[] }> {
     return this.getElectronAPI().saveArtifactAnnotations(taskId, artifactPath, annotations);
+  }
+
+  static async saveLineComments(
+    taskId: string,
+    artifactPath: string,
+    comments: Array<{ line: number; quote: string; comment: string }>,
+  ): Promise<{ annotationPath: string; routes: unknown[] }> {
+    return this.getElectronAPI().saveLineComments(taskId, artifactPath, comments);
   }
   /**
    * Retrieves the complete execution log and chat history messages for a specific task.

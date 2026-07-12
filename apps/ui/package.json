@@ -13,6 +13,8 @@
     "dev:electron": "concurrently --kill-others-on-fail \"tsc -b -w\" \"npm run dev\" \"sleep 2 && electron .\""
   },
   "dependencies": {
+    "@e965/xlsx": "^0.20.3",
+    "@monaco-editor/react": "^4.7.0",
     "@yaaa/agents": "*",
     "@yaaa/core": "*",
     "@yaaa/interfaces": "*",
@@ -21,8 +23,14 @@
     "@yaaa/providers": "*",
     "@yaaa/shared": "*",
     "mermaid": "^11.16.0",
+    "pptx-preview": "^1.0.7",
     "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "react-data-grid": "^7.0.0-beta.47",
+    "react-dom": "^19.2.7",
+    "react-markdown": "^10.1.0",
+    "react-pdf": "^10.4.1",
+    "rehype-sanitize": "^6.0.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@electron/rebuild": "^3.7.2",

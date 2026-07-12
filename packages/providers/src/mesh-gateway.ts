@@ -17,6 +17,32 @@ function rethrowGatewayError(err: unknown): never {
   throw err as Error;
 }
 
+/**
+ * Tool names are `capability:method` internally (e.g. "files:readFile"), but the
+ * OpenAI-compatible API requires function names to match `^[a-zA-Z0-9_-]+$` — the
+ * colon is rejected with a 400. Encode the colon to a double underscore on the
+ * wire and decode it back when reading tool calls, keeping the internal
+ * `capability:method` convention untouched everywhere else.
+ */
+const TOOL_NAME_WIRE_SEPARATOR = "__";
+function encodeToolName(name: string): string {
+  return name.replace(/:/g, TOOL_NAME_WIRE_SEPARATOR);
+}
+function decodeToolName(name: string): string {
+  return name.replace(new RegExp(TOOL_NAME_WIRE_SEPARATOR, "g"), ":");
+}
+
+/** Some Bedrock-backed models reject the formerly valid temperature field. */
+function rejectsTemperature(err: unknown): boolean {
+  const message =
+    err instanceof Error
+      ? err.message
+      : typeof err === "object" && err !== null && "message" in err
+        ? String((err as { message?: unknown }).message)
+        : String(err);
+  return /temperature/i.test(message) && /deprecated|not supported|unsupported/i.test(message);
+}
+
 export interface MeshGatewayConfig {
   apiKey?: string;
   baseURL?: string;
@@ -82,19 +108,28 @@ export class MeshGateway implements IMeshGateway {
       const oaiTools = options.tools?.map((t) => ({
         type: "function" as const,
         function: {
-          name: t.name,
+          name: encodeToolName(t.name),
           description: t.description,
           parameters: t.parameters,
         },
       }));
 
-      const response = await this.openai.chat.completions.create({
-        model,
-        messages,
-        temperature: options.temperature ?? 0,
-        response_format: options.jsonMode ? { type: "json_object" } : undefined,
-        tools: oaiTools,
-      });
+      const createCompletion = (includeTemperature: boolean) =>
+        this.openai.chat.completions.create({
+          model,
+          messages,
+          ...(includeTemperature ? { temperature: options.temperature ?? 0 } : {}),
+          response_format: options.jsonMode ? { type: "json_object" } : undefined,
+          tools: oaiTools,
+        });
+
+      let response;
+      try {
+        response = await createCompletion(true);
+      } catch (err) {
+        if (!rejectsTemperature(err)) throw err;
+        response = await createCompletion(false);
+      }
 
       const message = response.choices[0]?.message as
         | (typeof response.choices[0]["message"] & {
@@ -110,7 +145,7 @@ export class MeshGateway implements IMeshGateway {
 
       const toolCalls = message?.tool_calls?.map((tc) => ({
         id: tc.id,
-        name: tc.function.name,
+        name: decodeToolName(tc.function.name),
         args: JSON.parse(tc.function.arguments),
       }));
 
@@ -138,12 +173,21 @@ export class MeshGateway implements IMeshGateway {
 
     const model = this.modelMapping[options.modelRole];
     try {
-      const stream = await this.openai.chat.completions.create({
-        model,
-        messages,
-        temperature: options.temperature ?? 0,
-        stream: true,
-      });
+      const createStream = (includeTemperature: boolean) =>
+        this.openai.chat.completions.create({
+          model,
+          messages,
+          ...(includeTemperature ? { temperature: options.temperature ?? 0 } : {}),
+          stream: true,
+        });
+
+      let stream;
+      try {
+        stream = await createStream(true);
+      } catch (err) {
+        if (!rejectsTemperature(err)) throw err;
+        stream = await createStream(false);
+      }
 
       for await (const chunk of stream) {
         const delta = chunk.choices[0]?.delta as
