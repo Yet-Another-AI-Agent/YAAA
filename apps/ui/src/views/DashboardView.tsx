@@ -8,6 +8,12 @@ import { ApiKeyModal } from "../components/ApiKeyModal";
 import { MissionInput } from "../components/MissionInput";
 import { ThinkingPanel } from "../components/ThinkingPanel";
 import {
+  RichMessageContent,
+  UniversalViewer,
+  inferViewerKind,
+  type ViewerSpec,
+} from "../components/UniversalViewer";
+import {
   getAgentActivity,
   getVisibleLogContent,
   isActiveAgent,
@@ -27,21 +33,31 @@ const { ORCHESTRATOR_MD_HEADERS } = shared;
 
 function TypingText({ text, onComplete }: { text: string; onComplete?: () => void }) {
   const [displayedLength, setDisplayedLength] = useState(0);
+  const onCompleteRef = useRef(onComplete);
+
+  useEffect(() => {
+    onCompleteRef.current = onComplete;
+  }, [onComplete]);
 
   useEffect(() => {
     setDisplayedLength(0);
     const interval = setInterval(() => {
       setDisplayedLength((prev) => {
-        if (prev >= text.length) {
+        const next = Math.min(prev + 2, text.length);
+        if (next >= text.length) {
           clearInterval(interval);
-          onComplete?.();
-          return text.length;
         }
-        return prev + 2;
+        return next;
       });
     }, 8);
     return () => clearInterval(interval);
-  }, [text, onComplete]);
+  }, [text]);
+
+  useEffect(() => {
+    if (text.length > 0 && displayedLength >= text.length) {
+      onCompleteRef.current?.();
+    }
+  }, [displayedLength, text.length]);
 
   const slicedText = text.substring(0, displayedLength);
   return <>{renderMarkdown(slicedText)}</>;
@@ -254,14 +270,10 @@ function formatChannelName(prompt: string): string {
 }
 
 /**
- * Files the in-app viewer can render: markdown/plaintext, images, graphTD
- * diagrams, and common source/config text files. Binary office docs
- * (PPT/PDF/Excel) still need a dedicated renderer and are excluded.
+ * Files the in-app viewer can render directly or through a specialized viewer.
  */
 function isPreviewableArtifact(artPath: string): boolean {
-  return /\.(md|markdown|txt|mmd|mermaid|png|jpe?g|gif|webp|svg|py|js|jsx|ts|tsx|json|ya?ml|toml|html?|css|scss|sh|bash|c|cc|cpp|h|hpp|java|go|rs|rb|php|sql|xml|csv|env|ini|cfg|log)$/i.test(
-    artPath,
-  );
+  return Boolean(inferViewerKind(artPath)) || /\.(mmd|mermaid|png|jpe?g|gif|webp|svg)$/i.test(artPath);
 }
 
 export function DashboardView({ viewModel }: DashboardViewProps) {
@@ -307,6 +319,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   const [confirmWorkspaceDelete, setConfirmWorkspaceDelete] = useState(false);
   const [orchestratorMd, setOrchestratorMd] = useState<string | null>(null);
   const [historyMessages, setHistoryMessages] = useState<any[]>([]);
+  const [resumedHistoryMessages, setResumedHistoryMessages] = useState<any[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const activeHistoryRequestRef = useRef<string | null>(null);
   const [typedMessageIds, setTypedMessageIds] = useState<Set<string>>(new Set());
@@ -329,6 +342,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   const [artifactPreviewLoading, setArtifactPreviewLoading] = useState(false);
   const [artifactPreviewError, setArtifactPreviewError] = useState<string | null>(null);
   const [annotating, setAnnotating] = useState(false);
+  const [viewerModal, setViewerModal] = useState<ViewerSpec | null>(null);
   const activeArtifactRequestRef = useRef(0);
 
   // Plan review modal: view the proposed orchestrator.md, comment on it, then
@@ -415,14 +429,14 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     };
   }, [selectedTaskId]);
 
-  // Load the proposed plan (orchestrator.md) for the live task whenever the
-  // review modal is opened.
+  // Load the proposed plan for either a live or reopened persisted task.
   useEffect(() => {
     let active = true;
-    if (planReviewOpen && taskId) {
+    const reviewTaskId = selectedTaskId || taskId;
+    if (planReviewOpen && reviewTaskId) {
       setPlanReviewLoading(true);
       setPlanReviewMd(null);
-      TaskModel.readTaskOrchestrator(taskId)
+      TaskModel.readTaskOrchestrator(reviewTaskId)
         .then((content) => {
           if (active) setPlanReviewMd(content);
         })
@@ -437,7 +451,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     return () => {
       active = false;
     };
-  }, [planReviewOpen, taskId]);
+  }, [planReviewOpen, selectedTaskId, taskId]);
 
   // Resolve any raw sender key (agent id OR roster handle) back to its agent,
   // so a chat bubble keyed by "@sage-1" and a team card keyed by "agent-research"
@@ -465,11 +479,17 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   };
 
   /**
-   * Route the channel composer: a live, open mission continues in-channel (no
-   * new chat); the home view and archived channels start a fresh mission.
+   * Route the channel composer: both a live mission and a persisted channel
+   * continue in place. Only the home view starts a fresh mission.
    */
   const handleChannelSend = () => {
-    if (taskId && !selectedTaskId) {
+    if (selectedTaskId) {
+      const persistedTaskId = selectedTaskId;
+      setResumedHistoryMessages(historyMessages);
+      setSelectedTaskId(null);
+      setShowTaskView(true);
+      continueMission(goal, persistedTaskId);
+    } else if (taskId) {
       continueMission(goal);
     } else {
       startTask();
@@ -482,6 +502,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
       setShowTaskView(true);
       setSidebarOpen(false); // Collapse sidebar
     } else {
+      setResumedHistoryMessages([]);
       setSelectedTaskId(id);
       setShowTaskView(false);
       setSidebarOpen(false); // Collapse sidebar
@@ -533,6 +554,11 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     if (!activeTaskId) return;
     const requestId = activeArtifactRequestRef.current + 1;
     activeArtifactRequestRef.current = requestId;
+    const viewerKind = inferViewerKind(artPath);
+    if (viewerKind && ["pdf", "pptx", "spreadsheet"].includes(viewerKind)) {
+      setViewerModal({ type: viewerKind, source: { path: artPath }, display: "popup", title: artPath.split("/").pop() });
+      return;
+    }
     const kind = getMediaKind(artPath);
     setArtifactPreviewError(null);
     setArtifactPreviewLoading(true);
@@ -573,6 +599,8 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   };
 
   const handleNewMission = () => {
+    setResumedHistoryMessages([]);
+    setHistoryMessages([]);
     setSelectedTaskId(null);
     setShowTaskView(false);
     setGoal("");
@@ -586,6 +614,24 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     setPlanReviewOpen(true);
   };
 
+  const handleOpenRejectReview = () => {
+    setPlanComment("");
+    setRejectReason("");
+    setRejecting(true);
+    setPlanReviewOpen(true);
+  };
+
+  const activateSelectedPlan = () => {
+    const targetTaskId = selectedTaskId || taskId;
+    const wasSelected = Boolean(selectedTaskId);
+    if (wasSelected) {
+      setResumedHistoryMessages(historyMessages);
+      setSelectedTaskId(null);
+      setShowTaskView(true);
+    }
+    return { targetTaskId, wasSelected };
+  };
+
   const handleClosePlanReview = () => {
     setPlanReviewOpen(false);
     setRejecting(false);
@@ -593,21 +639,31 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
 
   const handleAcceptPlan = () => {
     const comment = planComment;
+    const { targetTaskId, wasSelected } = activateSelectedPlan();
     setPlanReviewOpen(false);
     setRejecting(false);
     setPlanComment("");
     setRejectReason("");
-    confirmPlan(comment);
+    if (wasSelected && targetTaskId) confirmPlan(comment, targetTaskId);
+    else confirmPlan(comment);
+  };
+
+  const handleAcceptProposal = () => {
+    const { targetTaskId, wasSelected } = activateSelectedPlan();
+    if (wasSelected && targetTaskId) confirmPlan(undefined, targetTaskId);
+    else confirmPlan();
   };
 
   const handleSubmitReject = () => {
     if (!rejectReason.trim()) return;
     const reason = rejectReason;
+    const { targetTaskId, wasSelected } = activateSelectedPlan();
     setPlanReviewOpen(false);
     setRejecting(false);
     setRejectReason("");
     setPlanComment("");
-    rejectPlan(reason);
+    if (wasSelected && targetTaskId) rejectPlan(reason, targetTaskId);
+    else rejectPlan(reason);
   };
 
   const formatDate = (dateStr: string): string => {
@@ -647,9 +703,15 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     if (inConversationView) {
       // #general — casual chat with @orchestrator; plain bubbles only.
       displayMessages = chatMessages.map((m) => ({ ...m, kind: "message", artifacts: [] }));
-    } else if (selectedTaskId) {
-      // Add historical messages
-      historyMessages.forEach((msg, idx) => {
+    } else {
+      // A selected archived task reads directly from history. Once the user
+      // resumes it, retain that same history ahead of new live logs.
+      const visibleHistory = selectedTaskId
+        ? historyMessages
+        : showTaskView
+          ? resumedHistoryMessages
+          : [];
+      visibleHistory.forEach((msg, idx) => {
         let sender = msg.from || "Agent";
         let content = "";
         let artifactsList = msg.artifacts || [];
@@ -669,39 +731,86 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
           content = typeof msg.data === "string" ? msg.data : JSON.stringify(msg);
         }
 
+        // Public-channel user and orchestrator turns are persisted as
+        // `thought` AgentMessages for storage compatibility. They are still
+        // ordinary chat messages; only internal agent thoughts belong in the
+        // collapsible ThinkingPanel.
+        const isPersistedChatTurn =
+          msg.kind === "thought" &&
+          (msg.from === "user" || msg.from === "orchestrator");
+        const isPlanProposal = content.startsWith("[plan-proposal]");
+        if (isPlanProposal) {
+          content = content.replace(/^\[plan-proposal\]\s*/, "");
+        }
+
         displayMessages.push({
           id: msg.id || `hist-${idx}`,
           sender,
           time: msg.timestamp ? formatDate(msg.timestamp) : "",
           content,
-          kind: msg.kind === "thought" ? "thinking" : msg.kind,
+          kind: isPlanProposal
+            ? "plan_proposal"
+            : isPersistedChatTurn
+              ? "response"
+            : msg.kind === "thought"
+              ? "thinking"
+              : msg.kind,
           artifacts: artifactsList,
+          isHistorical: true,
         });
       });
-    } else if (showTaskView) {
-      // Add live logs. System status logs are rendered inline
-      // and cleared upon completion.
-      logs.forEach((log) => {
-        let sender = "Agent";
-        if (log.source === "system") sender = "System";
-        else if (log.source === "orchestrator") sender = "Orchestrator";
-        else if (log.source === "user") sender = "User";
 
-        let content = getVisibleLogContent(log.content);
-        const agentMatch = log.content.match(/^\[([^\]]+)\] (.*)/);
-        if (agentMatch) {
-          sender = agentMatch[1];
-          content = agentMatch[2];
-        }
-        displayMessages.push({
-          id: log.id,
-          sender,
-          time: log.time,
-          content,
-          kind: isAgentLifecycleLog(log) ? "lifecycle" : log.kind,
-          artifacts: [],
+      if (showTaskView && !selectedTaskId) {
+        // Add live logs. System status logs are rendered inline
+        // and cleared upon completion.
+        logs.forEach((log) => {
+          let sender = "Agent";
+          if (log.source === "system") sender = "System";
+          else if (log.source === "orchestrator") sender = "Orchestrator";
+          else if (log.source === "user") sender = "User";
+
+          let content = getVisibleLogContent(log.content);
+          const isPlanProposal = content.startsWith("[plan-proposal]");
+          if (isPlanProposal) {
+            content = content.replace(/^\[plan-proposal\]\s*/, "");
+          }
+          const agentMatch = log.content.match(/^\[([^\]]+)\] (.*)/);
+          if (agentMatch) {
+            sender = agentMatch[1];
+            content = agentMatch[2];
+          }
+          displayMessages.push({
+            id: log.id,
+            sender,
+            time: log.time,
+            content,
+            kind: isPlanProposal
+              ? "plan_proposal"
+              : isAgentLifecycleLog(log)
+                ? "lifecycle"
+                : log.kind,
+            artifacts: [],
+          });
         });
-      });
+      }
+
+      const planIsAwaiting = selectedTaskId
+        ? selectedTask?.status === "awaiting_confirmation"
+        : awaitingConfirmation;
+      if (
+        planIsAwaiting &&
+        !displayMessages.some((message) => message.kind === "plan_proposal")
+      ) {
+        displayMessages.push({
+          id: `plan-proposal-${selectedTaskId || taskId || "active"}`,
+          sender: "Orchestrator",
+          time: "",
+          content: "Implementation plan ready for review.",
+          kind: "plan_proposal",
+          artifacts: [],
+          isHistorical: Boolean(selectedTaskId),
+        });
+      }
     }
 
     const displaySubtasks = selectedTaskId ? parsedOrchestrator.subtasks : subtasks;
@@ -730,6 +839,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     selectedTask,
     orchestratorMd,
     historyMessages,
+    resumedHistoryMessages,
     showTaskView,
     goal,
     submittedPrompt,
@@ -1056,6 +1166,52 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                     return null;
                   }
                   const senderLabel = labelForSender(msg.sender);
+                  if (msg.kind === "plan_proposal") {
+                    const canReview =
+                      currentStatus === "awaiting_confirmation" && !running;
+                    return (
+                      <div className="slack-message" key={msg.id} data-testid="plan-proposal-message">
+                        <div
+                          className="slack-message-avatar"
+                          style={{ backgroundColor: getAvatarColor(senderLabel) }}
+                        >
+                          {senderLabel.charAt(0).toUpperCase()}
+                        </div>
+                        <div className="slack-message-content">
+                          <div className="slack-message-header">
+                            <span className="slack-message-sender">{senderLabel}</span>
+                            <span className="slack-message-time">{msg.time}</span>
+                          </div>
+                          <div className="slack-message-bubble slack-message-response">
+                            <div className="slack-message-text">
+                              <strong>Implementation plan proposed</strong>
+                              <p>{msg.content}</p>
+                              {displaySubtasks.length > 0 && (
+                                <ol>
+                                  {displaySubtasks.map((subtask: any) => (
+                                    <li key={subtask.id}>{subtask.title}</li>
+                                  ))}
+                                </ol>
+                              )}
+                            </div>
+                            {canReview && (
+                              <div className="approval-actions">
+                                <button type="button" className="btn-reject" onClick={handleOpenRejectReview}>
+                                  Reject plan
+                                </button>
+                                <button type="button" className="btn btn-secondary" onClick={handleOpenPlanReview}>
+                                  Review plan
+                                </button>
+                                <button type="button" className="btn-approve" onClick={handleAcceptProposal}>
+                                  Accept plan
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  }
                   return msg.kind === "lifecycle" || msg.kind === "system" ? (
                     <div className="slack-system-notice" role="status" key={msg.id}>
                       <span className="slack-system-notice-line" aria-hidden="true" />
@@ -1077,10 +1233,14 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                       </div>
                       <div className={`slack-message-bubble ${senderLabel === 'User' ? 'slack-message-sender-user' : ''} ${msg.kind === 'response' ? 'slack-message-response' : ''} ${msg.kind === 'activity' ? 'slack-message-activity' : ''}`}>
                         <div className="slack-message-text">
-                          {(msg.id === displayMessages.filter(m => m.sender !== 'User' && m.kind === 'response').pop()?.id && !selectedTaskId && running && !typedMessageIds.has(msg.id)) ? (
+                          {(msg.id === displayMessages.filter(m => m.sender !== 'User' && m.kind === 'response').pop()?.id && !selectedTaskId && !msg.isHistorical && !typedMessageIds.has(msg.id) && !msg.content.includes("```yaaa-viewer")) ? (
                             <TypingText text={msg.content} onComplete={() => handleTypeComplete(msg.id)} />
                           ) : (
-                            renderMarkdown(msg.content)
+                            <RichMessageContent
+                              content={msg.content}
+                              taskId={(selectedTaskId || taskId) ?? undefined}
+                              onOpen={setViewerModal}
+                            />
                           )}
                         </div>
 
@@ -1178,20 +1338,6 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                     </div>
                   </div>
                 )}
-
-                {showTaskView && awaitingConfirmation && !selectedTaskId && (
-                  <div className="approval-banner" style={{ marginTop: '1.25rem' }}>
-                    <div className="approval-title">Plan ready for review</div>
-                    <div className="approval-body">
-                      {ORCHESTRATOR_DISPLAY} has proposed a plan. Open it to read the full brief,
-                      leave comments, then accept or reject before any agent starts.
-                    </div>
-                    <div className="approval-actions">
-                      <button className="btn-approve" onClick={handleOpenPlanReview}>Review plan</button>
-                    </div>
-                  </div>
-                )}
-
 
                 {/* Failure banner (success answers render as a chat reply). */}
                 {showTaskView && success === false && (
@@ -1555,10 +1701,12 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                     />
                   ) : artifactPreview.kind === "diagram" ? (
                     <ArchitectureViewer source={artifactPreview.content} />
-                  ) : /\.(md|markdown|txt)$/i.test(artifactPreview.path) ? (
-                    <div className="markdown-preview">{renderMarkdown(artifactPreview.content)}</div>
+                  ) : /\.(md|markdown)$/i.test(artifactPreview.path) ? (
+                    <UniversalViewer spec={{ type: "markdown", source: { content: artifactPreview.content } }} taskId={(selectedTaskId || taskId) ?? undefined} />
+                  ) : /\.txt$/i.test(artifactPreview.path) ? (
+                    <div className="markdown-preview">{artifactPreview.content}</div>
                   ) : (
-                    <pre className="code-preview">{artifactPreview.content}</pre>
+                    <UniversalViewer spec={{ type: "code", source: { content: artifactPreview.content, path: artifactPreview.path } }} taskId={(selectedTaskId || taskId) ?? undefined} />
                   )}
                   {annotating && (selectedTaskId || taskId) && (
                     <AnnotationOverlay
@@ -1569,6 +1717,20 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   )}
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {viewerModal && (
+        <div className="artifact-preview-overlay" onClick={() => setViewerModal(null)} data-testid="universal-viewer-modal">
+          <div className="artifact-preview-panel universal-viewer-panel" onClick={(event) => event.stopPropagation()}>
+            <div className="artifact-preview-header">
+              <span className="artifact-preview-title">{viewerModal.title || viewerModal.source.path?.split("/").pop() || `${viewerModal.type} viewer`}</span>
+              <button type="button" className="artifact-preview-close" onClick={() => setViewerModal(null)} aria-label="Close viewer">✕</button>
+            </div>
+            <div className="artifact-preview-body">
+              <UniversalViewer spec={viewerModal} taskId={(selectedTaskId || taskId) ?? undefined} />
             </div>
           </div>
         </div>
@@ -1595,7 +1757,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   <div className="thinking-dots"><span /><span /><span /></div>
                 </div>
               ) : planReviewMd ? (
-                <div className="markdown-preview">{renderMarkdown(planReviewMd)}</div>
+                <UniversalViewer spec={{ type: "markdown-annotated", source: { content: planReviewMd, path: "orchestrator.md" } }} taskId={(selectedTaskId || taskId) ?? undefined} />
               ) : (
                 <div className="markdown-preview">
                   {renderMarkdown(

@@ -10,6 +10,36 @@ import type {
 } from "@yaaa/interfaces";
 import { Container, MessageBus, PermissionEngine } from "@yaaa/platform";
 import { SqliteStore, FilesFs, MeshGateway } from "@yaaa/providers";
+import { ChatOpenAI } from "@langchain/openai";
+import { BaseChatModel } from "@langchain/core/language_models/chat_models";
+import { AIMessage } from "@langchain/core/messages";
+import type { ChatResult as LcChatResult } from "@langchain/core/outputs";
+
+/**
+ * Deterministic stand-in for the worker/verifier chat model when no API key is
+ * set — the ReAct-agent equivalent of MeshGateway's mock mode, so keyless demos
+ * and tests still complete a task lifecycle without any network calls. It never
+ * calls tools; it just reports completion (verifiers pass).
+ */
+class MockWorkerChatModel extends BaseChatModel {
+  constructor(private readonly role: ModelRole) {
+    super({});
+  }
+  _llmType() {
+    return "yaaa-mock-worker";
+  }
+  async _generate(): Promise<LcChatResult> {
+    const text =
+      this.role === "verifier"
+        ? "Mock verification: all stated criteria appear satisfied.\nVERDICT: PASSED"
+        : "Mock mode: subtask completed (no live model configured).";
+    const message = new AIMessage({ content: text });
+    return { generations: [{ text, message }] };
+  }
+  override bindTools() {
+    return this;
+  }
+}
 import { Supervisor, type PlanContext } from "@yaaa/orchestrator";
 import type { AgentRun, Subtask, TaskPlan } from "@yaaa/shared";
 import {
@@ -196,6 +226,31 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   scope.register("IBus", bus);
   scope.register("PermissionEngine", permissions);
   scope.register("IMeshGateway", gateway);
+
+  // Chat-model factory for worker/verifier ReAct agents. LangGraph's
+  // createReactAgent needs a LangChain chat model; Mesh is OpenAI-compatible, so
+  // ChatOpenAI is pointed at the Mesh base URL. (The planner/synthesizer/intent
+  // paths keep using MeshGateway above; only the inner worker loop uses this.)
+  const WORKER_MODEL_DEFAULTS: Record<ModelRole, string> = {
+    planner: "anthropic/claude-sonnet-5",
+    worker: "openai/gpt-4o",
+    verifier: "google/gemini-3.1-pro",
+    utility: "openai/gpt-4o-mini",
+  };
+  const hasApiKey = Boolean(config.apiKey || process.env.MESH_API_KEY);
+  const chatModelFactory = (role: ModelRole): BaseChatModel =>
+    hasApiKey
+      ? new ChatOpenAI({
+          apiKey: config.apiKey || process.env.MESH_API_KEY,
+          model:
+            (config.modelMapping as Record<string, string> | undefined)?.[role] ||
+            WORKER_MODEL_DEFAULTS[role],
+          temperature: role === "utility" ? 0 : 0.1,
+          configuration: { baseURL: process.env.MESH_BASE_URL || "https://api.meshapi.ai/v1" },
+        })
+      : new MockWorkerChatModel(role);
+  scope.register("ChatModelFactory", chatModelFactory);
+
   scope.register("capability:files", files);
 
   if (config.onApproval) {

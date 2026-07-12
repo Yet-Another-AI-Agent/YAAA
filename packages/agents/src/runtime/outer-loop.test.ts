@@ -1,36 +1,67 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { container, PermissionEngine } from "@yaaa/platform";
-import type { IBus, IStore, IMeshGateway } from "@yaaa/interfaces";
+import type { IBus, IStore, ModelRole } from "@yaaa/interfaces";
 import type { TaskPlan } from "@yaaa/shared";
+import { BaseChatModel } from "@langchain/core/language_models/chat_models";
+import { AIMessage, type BaseMessage } from "@langchain/core/messages";
+import type { ChatResult } from "@langchain/core/outputs";
 import { OuterLoop } from "./outer-loop.js";
 
+/**
+ * The outer loop's job is orchestration — dependency ordering, concurrency, the
+ * retry/kill-switch state machine — not agent internals. So we control what each
+ * inner agent does purely through the chat model the runtime hands it: a shared
+ * `responder` decides, per model turn, whether the agent finishes (returns an
+ * AIMessage), fails (throws), or parks (returns a pending promise).
+ */
+type Responder = (role: ModelRole, messages: BaseMessage[]) => Promise<AIMessage>;
+
+interface CapturedCall {
+  role: ModelRole;
+  messages: BaseMessage[];
+}
+
+class ProgrammableChatModel extends BaseChatModel {
+  constructor(
+    private readonly role: ModelRole,
+    private readonly responder: () => Responder,
+    private readonly captured: CapturedCall[],
+  ) {
+    super({});
+  }
+  _llmType() {
+    return "programmable-test-model";
+  }
+  async _generate(messages: BaseMessage[]): Promise<ChatResult> {
+    this.captured.push({ role: this.role, messages });
+    const message = await this.responder()(this.role, messages);
+    const text = typeof message.content === "string" ? message.content : "";
+    return { generations: [{ text, message }] };
+  }
+  override bindTools() {
+    return this;
+  }
+}
+
+const finalMessage = (text: string) => new AIMessage({ content: text });
+
 describe("OuterLoop Manager", () => {
-  let mockGateway: IMeshGateway;
   let mockBus: IBus;
   let mockStore: IStore;
   let permissions: PermissionEngine;
   let outerLoop: OuterLoop;
+  let captured: CapturedCall[];
+  // Default: every agent finishes immediately with a generic summary.
+  let responder: Responder = async (role) =>
+    role === "verifier" ? finalMessage("Looks good.\nVERDICT: PASSED") : finalMessage("Subtask completed.");
 
   beforeEach(() => {
     container.clear();
+    captured = [];
+    responder = async (role) =>
+      role === "verifier" ? finalMessage("Looks good.\nVERDICT: PASSED") : finalMessage("Subtask completed.");
 
-    mockGateway = {
-      chat: vi.fn().mockResolvedValue(`\`\`\`json
-{
-  "result": {
-    "artifacts": [],
-    "summary": "Completed subtask facts check."
-  }
-}
-\`\`\``),
-      chatStream: vi.fn(),
-    };
-
-    mockBus = {
-      publish: vi.fn(),
-      subscribe: vi.fn(),
-    };
-
+    mockBus = { publish: vi.fn(), subscribe: vi.fn() } as any;
     mockStore = {
       initTaskDb: vi.fn(),
       saveMessage: vi.fn(),
@@ -43,14 +74,22 @@ describe("OuterLoop Manager", () => {
       getAuditLogs: vi.fn(),
       saveAgent: vi.fn(),
       getAgents: vi.fn(),
-    };
-
+    } as any;
     permissions = new PermissionEngine();
 
-    container.register("IMeshGateway", mockGateway);
     container.register("IBus", mockBus);
     container.register("IStore", mockStore);
     container.register("PermissionEngine", permissions);
+    container.register("capability:files", {
+      readFile: vi.fn().mockResolvedValue(""),
+      writeFile: vi.fn().mockResolvedValue(undefined),
+      listFiles: vi.fn().mockResolvedValue([]),
+      searchFiles: vi.fn().mockResolvedValue([]),
+    });
+    container.register(
+      "ChatModelFactory",
+      (role: ModelRole) => new ProgrammableChatModel(role, () => responder, captured),
+    );
 
     outerLoop = new OuterLoop();
   });
@@ -59,90 +98,36 @@ describe("OuterLoop Manager", () => {
     const plan: TaskPlan = {
       goal: "Run test task",
       subtasks: [
-        {
-          id: "task-1",
-          title: "Write file facts",
-          capability: "files",
-          dependsOn: [],
-          riskLevel: "low",
-          successCriteria: "file exists",
-          state: "pending",
-        },
-        {
-          id: "task-2",
-          title: "Verify task facts contents",
-          capability: "verify",
-          dependsOn: ["task-1"], // depends on task-1
-          riskLevel: "low",
-          successCriteria: "facts verified",
-          state: "pending",
-        },
+        { id: "task-1", title: "Write file facts", capability: "files", dependsOn: [], riskLevel: "low", successCriteria: "file exists", state: "pending" },
+        { id: "task-2", title: "Verify task facts contents", capability: "verify", dependsOn: ["task-1"], riskLevel: "low", successCriteria: "facts verified", state: "pending" },
       ],
     };
-
-    // Mock verifier subtask response
-    (mockGateway.chat as any).mockImplementation(async (messages: any[], options: any) => {
-      if (options.modelRole === "verifier") {
-        return `\`\`\`json
-{
-  "verification": {
-    "status": "passed",
-    "reason": "OK"
-  }
-}
-\`\`\``;
-      }
-      return `\`\`\`json
-{
-  "result": {
-    "artifacts": [],
-    "summary": "Subtask completed successfully."
-  }
-}
-\`\`\``;
-    });
 
     await expect(outerLoop.run("task-123", plan)).resolves.not.toThrow();
 
     expect(mockStore.savePlan).toHaveBeenCalledWith("task-123", plan);
     expect(mockStore.saveLedgerEntry).toHaveBeenCalled();
-    expect(mockBus.publish).toHaveBeenCalledWith("task.task-123.started", expect.objectContaining({
-      kind: "status",
-      state: "working",
-    }));
-    expect(mockStore.saveAgent).toHaveBeenCalledWith("task-123", expect.objectContaining({
-      handle: "@sage-1",
-      status: "working",
-    }));
+    expect(mockBus.publish).toHaveBeenCalledWith(
+      "task.task-123.started",
+      expect.objectContaining({ kind: "status", state: "working" }),
+    );
+    expect(mockStore.saveAgent).toHaveBeenCalledWith(
+      "task-123",
+      expect.objectContaining({ handle: "@sage-1", status: "working" }),
+    );
   });
 
   it("should throw an error if a subtask dependency loop or deadlock is detected", async () => {
     const deadlockedPlan: TaskPlan = {
       goal: "Deadlock task",
       subtasks: [
-        {
-          id: "task-1",
-          title: "Task 1",
-          capability: "files",
-          dependsOn: ["task-2"], // cyclic dependency
-          riskLevel: "low",
-          successCriteria: "done",
-          state: "pending",
-        },
-        {
-          id: "task-2",
-          title: "Task 2",
-          capability: "files",
-          dependsOn: ["task-1"], // cyclic dependency
-          riskLevel: "low",
-          successCriteria: "done",
-          state: "pending",
-        },
+        { id: "task-1", title: "Task 1", capability: "files", dependsOn: ["task-2"], riskLevel: "low", successCriteria: "done", state: "pending" },
+        { id: "task-2", title: "Task 2", capability: "files", dependsOn: ["task-1"], riskLevel: "low", successCriteria: "done", state: "pending" },
       ],
     };
 
     await expect(outerLoop.run("task-deadlock", deadlockedPlan)).rejects.toThrow(
-      "Deadlock detected in subtask execution dependency graph."
+      "Deadlock detected in subtask execution dependency graph.",
     );
   });
 
@@ -150,73 +135,45 @@ describe("OuterLoop Manager", () => {
     const failingPlan: TaskPlan = {
       goal: "Failing task",
       subtasks: [
-        {
-          id: "task-1",
-          title: "Failing subtask",
-          capability: "files",
-          dependsOn: [],
-          riskLevel: "low",
-          successCriteria: "done",
-          state: "pending",
-        },
-        {
-          id: "task-2",
-          title: "Dependent pending subtask",
-          capability: "files",
-          dependsOn: ["task-1"],
-          riskLevel: "low",
-          successCriteria: "done",
-          state: "pending",
-        },
+        { id: "task-1", title: "Failing subtask", capability: "files", dependsOn: [], riskLevel: "low", successCriteria: "done", state: "pending" },
+        { id: "task-2", title: "Dependent pending subtask", capability: "files", dependsOn: ["task-1"], riskLevel: "low", successCriteria: "done", state: "pending" },
       ],
     };
 
-    // Force mock gateway to throw an error for worker loop
-    (mockGateway.chat as any).mockRejectedValue(new Error("LLM failure"));
+    responder = async () => {
+      throw new Error("LLM failure");
+    };
 
     await expect(outerLoop.run("task-failing", failingPlan)).rejects.toThrow(
-      "Task execution failed due to subtask failure."
+      "Task execution failed due to subtask failure.",
     );
   });
 
   const singleSubtaskPlan = (): TaskPlan => ({
     goal: "Kill switch task",
     subtasks: [
-      {
-        id: "task-1",
-        title: "Write the report file",
-        capability: "files",
-        dependsOn: [],
-        riskLevel: "low",
-        successCriteria: "report exists",
-        state: "pending",
-      },
+      { id: "task-1", title: "Write the report file", capability: "files", dependsOn: [], riskLevel: "low", successCriteria: "report exists", state: "pending" },
     ],
   });
 
   it("trips the kill switch after 3 identical errors and retries once with a different approach", async () => {
-    (mockGateway.chat as any).mockRejectedValue(new Error("segfault in strategy A"));
+    responder = async () => {
+      throw new Error("segfault in strategy A");
+    };
 
     await expect(outerLoop.run("task-loop", singleSubtaskPlan())).rejects.toThrow(
-      "Task execution failed due to subtask failure."
+      "Task execution failed due to subtask failure.",
     );
 
-    // Hard interrupt was broadcast to the channel/Agent Space.
     expect(mockBus.publish).toHaveBeenCalledWith(
       "task.task-loop.started",
-      expect.objectContaining({
-        kind: "status",
-        note: expect.stringContaining("Kill switch"),
-      }),
+      expect.objectContaining({ kind: "status", note: expect.stringContaining("Kill switch") }),
     );
 
-    // The replacement agent was explicitly ordered to change approach.
-    const instructions = (mockGateway.chat as any).mock.calls.map(
-      (call: any[]) => call[0].map((m: any) => m.content).join("\n"),
-    );
-    expect(
-      instructions.some((text: string) => text.includes("COMPLETELY DIFFERENT")),
-    ).toBe(true);
+    // The replacement agent was explicitly ordered to change approach — the
+    // directive is threaded into the instruction the model receives.
+    const instructions = captured.map((c) => c.messages.map((m) => String(m.content)).join("\n"));
+    expect(instructions.some((text) => text.includes("COMPLETELY DIFFERENT"))).toBe(true);
 
     // 3 identical failures + 1 different-approach attempt = 4 agents, all failed.
     const savedAgents = (mockStore.saveAgent as any).mock.calls.map((c: any[]) => c[1]);
@@ -228,50 +185,25 @@ describe("OuterLoop Manager", () => {
     const parallelPlan: TaskPlan = {
       goal: "Parallel task",
       subtasks: [
-        {
-          id: "task-a",
-          title: "Independent A",
-          capability: "files",
-          dependsOn: [],
-          riskLevel: "low",
-          successCriteria: "a done",
-          state: "pending",
-        },
-        {
-          id: "task-b",
-          title: "Independent B",
-          capability: "files",
-          dependsOn: [],
-          riskLevel: "low",
-          successCriteria: "b done",
-          state: "pending",
-        },
+        { id: "task-a", title: "Independent A", capability: "files", dependsOn: [], riskLevel: "low", successCriteria: "a done", state: "pending" },
+        { id: "task-b", title: "Independent B", capability: "files", dependsOn: [], riskLevel: "low", successCriteria: "b done", state: "pending" },
       ],
     };
 
-    // Each agent's gateway call parks on a deferred promise so neither subtask
-    // can complete until we explicitly release it. That lets us assert both
-    // subtasks are simultaneously in flight before either finishes.
-    const resolvers: Array<(value: string) => void> = [];
-    const successJson = `\`\`\`json
-{"result": {"artifacts": [], "summary": "done"}}
-\`\`\``;
-    (mockGateway.chat as any).mockImplementation(
-      () => new Promise<string>((resolve) => resolvers.push(resolve)),
-    );
+    // Each agent's first model turn parks on a deferred promise so neither
+    // subtask can finish until we release it — proving genuine concurrency.
+    const resolvers: Array<() => void> = [];
+    responder = () =>
+      new Promise<AIMessage>((resolve) => resolvers.push(() => resolve(finalMessage("done"))));
 
     const runPromise = outerLoop.run("task-parallel", parallelPlan);
 
-    // Both subtasks reached the model before either was allowed to resolve —
-    // proof of genuine concurrency rather than serial execution (a serial loop
-    // would block on the first deferred call and never issue the second).
     await vi.waitFor(() => {
-      expect(mockGateway.chat).toHaveBeenCalledTimes(2);
+      expect(captured.length).toBe(2);
     });
     expect(resolvers).toHaveLength(2);
 
-    // Release both agents and let the run settle.
-    resolvers.forEach((resolve) => resolve(successJson));
+    resolvers.forEach((release) => release());
     await expect(runPromise).resolves.not.toThrow();
 
     const savedAgents = (mockStore.saveAgent as any).mock.calls.map((c: any[]) => c[1]);
@@ -283,17 +215,17 @@ describe("OuterLoop Manager", () => {
   });
 
   it("recovers when a retry succeeds before the kill switch trips", async () => {
-    (mockGateway.chat as any)
-      .mockRejectedValueOnce(new Error("transient timeout"))
-      .mockResolvedValue(`\`\`\`json
-{"result": {"artifacts": [], "summary": "Recovered on retry."}}
-\`\`\``);
+    let attempt = 0;
+    responder = async () => {
+      attempt++;
+      if (attempt === 1) throw new Error("transient timeout");
+      return finalMessage("Recovered on retry.");
+    };
 
     await expect(outerLoop.run("task-retry", singleSubtaskPlan())).resolves.not.toThrow();
 
     const savedAgents = (mockStore.saveAgent as any).mock.calls.map((c: any[]) => c[1]);
     expect(savedAgents.some((agent: any) => agent.status === "completed")).toBe(true);
-    // No kill-switch broadcast for a one-off transient failure.
     const killSwitchNotes = (mockBus.publish as any).mock.calls.filter(
       (call: any[]) => typeof call[1]?.note === "string" && call[1].note.includes("Kill switch"),
     );

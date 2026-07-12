@@ -5,7 +5,8 @@ import crypto from "node:crypto";
 import Database from "better-sqlite3";
 import { SqliteStore, MeshGateway } from "@yaaa/providers";
 import { pauseController } from "@yaaa/platform";
-import { IntentRouter } from "@yaaa/orchestrator";
+import { IntentRouter, getRequestedAgentCount } from "@yaaa/orchestrator";
+import { VIEWER_PROTOCOL } from "@yaaa/agents";
 import type { ChatMessage } from "@yaaa/interfaces";
 import {
   ORCHESTRATOR_MD_HEADERS,
@@ -71,6 +72,15 @@ export interface ResumeProfile {
   name: string;
   profession: string;
   description: string;
+}
+
+/** Concise chat response shown immediately before a draft plan is generated. */
+export function buildPlanAcknowledgement(goal: string): string {
+  const requestedAgentCount = getRequestedAgentCount(goal);
+  if (requestedAgentCount !== null) {
+    return `Got it — I’ll prepare a plan using exactly ${requestedAgentCount} agents, preserving the roles you requested. You can review it before any agent starts.`;
+  }
+  return "Got it — I’ll prepare a concise implementation plan for your review. No agents will start until you approve it.";
 }
 
 interface McpIntegrationRow {
@@ -519,6 +529,16 @@ export class Workspace {
     }
   }
 
+  /** Persist a plan-review action into the mission's durable chat history. */
+  async recordPlanReviewMessage(
+    taskId: string,
+    content: string,
+    authorKind: "user" | "orchestrator",
+  ): Promise<void> {
+    this.requireTask(taskId);
+    await this.postToMissionPublicConversation(taskId, content, authorKind);
+  }
+
   async createPublicConversation(
     taskId: string,
     title?: string,
@@ -687,25 +707,28 @@ export class Workspace {
     return { kind: "task" };
   }
 
-  /**
-   * Read a binary artifact (image) as a data-URL for in-app preview. Applies
-   * the same containment rules as {@link readArtifact}; refuses non-image
-   * extensions and files over 8 MB.
-   */
+  /** Read a supported binary artifact as a local data URL for the renderer. */
   readArtifactBinary(
     taskId: string,
     artifactPath: string,
   ): { dataUrl: string; mimeType: string } | null {
-    const IMAGE_MIME: Record<string, string> = {
+    const BINARY_MIME: Record<string, string> = {
       ".png": "image/png",
       ".jpg": "image/jpeg",
       ".jpeg": "image/jpeg",
       ".gif": "image/gif",
       ".webp": "image/webp",
       ".svg": "image/svg+xml",
+      ".pdf": "application/pdf",
+      ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
+      ".xls": "application/vnd.ms-excel",
+      ".csv": "text/csv",
+      ".tsv": "text/tab-separated-values",
     };
     if (!this.getTask(taskId)) return null;
-    const mimeType = IMAGE_MIME[path.extname(artifactPath).toLowerCase()];
+    const mimeType = BINARY_MIME[path.extname(artifactPath).toLowerCase()];
     if (!mimeType) return null;
     try {
       const workingDir = fs.realpathSync(
@@ -721,12 +744,42 @@ export class Workspace {
         return null;
       }
       const stats = fs.statSync(filePath);
-      if (!stats.isFile() || stats.size > 8 * 1024 * 1024) return null;
+      if (!stats.isFile() || stats.size > 50 * 1024 * 1024) return null;
       const base64 = fs.readFileSync(filePath).toString("base64");
       return { dataUrl: `data:${mimeType};base64,${base64}`, mimeType };
     } catch {
       return null;
     }
+  }
+
+  /** Persist line-addressed review comments and announce them to the agents. */
+  async saveLineComments(
+    taskId: string,
+    artifactPath: string,
+    comments: Array<{ line: number; quote: string; comment: string }>,
+  ): Promise<{ annotationPath: string; routes: MentionRoute[] }> {
+    const task = this.requireTask(taskId);
+    const source = artifactPath === "orchestrator.md" ? this.readOrchestrator(taskId) : this.readArtifact(taskId, artifactPath);
+    if (source === null) {
+      throw new Error("Commented markdown artifact was not found.");
+    }
+    for (const item of comments) {
+      if (!Number.isInteger(item.line) || item.line < 1 || typeof item.comment !== "string" || !item.comment.trim()) {
+        throw new Error("Each line comment needs a positive line number and comment.");
+      }
+    }
+    const payload = { artifactPath, createdAt: new Date().toISOString(), comments };
+    const annotationsDir = path.join(task.path, "annotations");
+    fs.mkdirSync(annotationsDir, { recursive: true });
+    const annotationPath = path.join(annotationsDir, `${artifactPath.replace(/[^a-zA-Z0-9._-]/g, "_")}.lines.json`);
+    fs.writeFileSync(annotationPath, JSON.stringify(payload, null, 2), "utf-8");
+    const readable = comments.map((item) => `line ${item.line} (${JSON.stringify(item.quote)}): ${item.comment}`).join("; ");
+    const routed = await this.withConversationCoordinator(async (conversations) => {
+      const existing = (await conversations.listConversations(taskId)).find((conversation) => conversation.kind === "public" && !conversation.archivedAt);
+      const conversation = existing ?? (await conversations.createPublicConversation({ taskId }));
+      return conversations.postMessage({ taskId, conversationId: conversation.id, authorId: "user", authorKind: "user", content: `@orchestrator Line comments on ${artifactPath}: ${readable}. Machine-readable comments: ${JSON.stringify(comments)}` });
+    });
+    return { annotationPath, routes: routed.routes };
   }
 
   // ------------------------------------------------------- visual annotations
@@ -955,6 +1008,10 @@ export class Workspace {
         plan,
         [],
       );
+      await this.appendOrchestratorReplyToMission(
+        task.taskId,
+        "[plan-proposal] Implementation plan ready for review.",
+      );
       return plan;
     } catch (err) {
       if (!this.deletedTasks.has(task.taskId)) {
@@ -994,8 +1051,9 @@ export class Workspace {
       const decision = await this.evaluateConversationalOnboarding(taskId, message, hooks);
       if (decision.action === "prepare_plan") {
         this.updateTaskStatus(taskId, "planning");
-        await this.appendOrchestratorReplyToMission(taskId, decision.reply);
-        hooks.onEvent?.({ type: "status", from: "orchestrator", note: decision.reply });
+        const acknowledgement = buildPlanAcknowledgement(message);
+        await this.appendOrchestratorReplyToMission(taskId, acknowledgement);
+        hooks.onEvent?.({ type: "status", from: "orchestrator", note: acknowledgement });
 
         const plan = await this.prepareTask(
           task.prompt,
@@ -1011,7 +1069,9 @@ export class Workspace {
       } else if (decision.action === "direct_execute") {
         this.updateTaskStatus(taskId, "success");
         await this.appendOrchestratorReplyToMission(taskId, decision.reply);
-        hooks.onEvent?.({ type: "status", from: "orchestrator", note: decision.reply });
+        // The reply is surfaced live to the renderer via the task-complete
+        // summary (see main.js). Emitting an onEvent status note here too would
+        // render the same answer twice, so direct_execute skips it.
         return { kind: "direct_execute", reply: decision.reply };
       } else {
         await this.appendOrchestratorReplyToMission(taskId, decision.reply);
@@ -1033,6 +1093,9 @@ export class Workspace {
       return { kind: "conversation", reply };
     }
 
+    const acknowledgement = buildPlanAcknowledgement(message);
+    await this.appendOrchestratorReplyToMission(taskId, acknowledgement);
+    hooks.onEvent?.({ type: "status", from: "orchestrator", note: acknowledgement });
     const priorSummary = await this.buildMissionPriorSummary(taskId);
     const plan = await this.prepareTask(
       message,
@@ -1067,8 +1130,9 @@ export class Workspace {
 
     if (decision.action === "prepare_plan") {
       this.updateTaskStatus(taskId, "planning");
-      await this.appendOrchestratorReplyToMission(taskId, decision.reply);
-      hooks.onEvent?.({ type: "status", from: "orchestrator", note: decision.reply });
+      const acknowledgement = buildPlanAcknowledgement(goal);
+      await this.appendOrchestratorReplyToMission(taskId, acknowledgement);
+      hooks.onEvent?.({ type: "status", from: "orchestrator", note: acknowledgement });
 
       const task = this.getTask(taskId);
       if (task) {
@@ -1083,11 +1147,13 @@ export class Workspace {
           {}
         );
       }
-      return { kind: "task", reply: decision.reply };
+      return { kind: "task", reply: acknowledgement };
     } else if (decision.action === "direct_execute") {
       this.updateTaskStatus(taskId, "success");
       await this.appendOrchestratorReplyToMission(taskId, decision.reply);
-      hooks.onEvent?.({ type: "status", from: "orchestrator", note: decision.reply });
+      // The reply is surfaced live to the renderer via the task-complete
+      // summary (see main.js). Emitting an onEvent status note here too would
+      // render the same answer twice, so direct_execute skips it.
       return { kind: "direct_execute", reply: decision.reply };
     } else {
       await this.appendOrchestratorReplyToMission(taskId, decision.reply);
@@ -1148,10 +1214,13 @@ Analyze the conversation history. Decide if:
 2. You have a solid understanding and a multi-step plan of subtasks using specialized agents is needed -> Choose action "prepare_plan" and reply stating you are preparing the plan.
 3. You have a solid understanding and this is a simple query/task that does NOT require a multi-step plan -> Choose action "direct_execute" and write the direct reply/answer in the "reply" field.
 
+When action is "direct_execute" and your answer contains code, a Markdown document, tabular data, or any renderable content, you MUST embed it using the viewer protocol below inside the "reply" string — do not paste raw code or long Markdown as plain text. The fenced yaaa-viewer block goes inside the "reply" value (JSON-escaped like any other string content).
+${VIEWER_PROTOCOL}
+
 You must respond with ONLY a JSON object:
 {
   "thought": "Your step-by-step reasoning about the request complexity, what details are missing, whether a plan is needed, and if you are ready.",
-  "reply": "Your message to the user.",
+  "reply": "Your message to the user (embed a yaaa-viewer block here when the answer includes code or other renderable content).",
   "action": "chat" | "prepare_plan" | "direct_execute"
 }`,
       },
@@ -1275,7 +1344,8 @@ You must respond with ONLY a JSON object:
         role: "system",
         content: `You are @orchestrator, the friendly Team Lead of YAAA, an AI professional firm.
 You are chatting with the user in their channel. You have access to the conversation history.
-Please reply to the user's message in a helpful, friendly manner, maintaining the context of what was said before.`,
+Please reply to the user's message in a helpful, friendly manner, maintaining the context of what was said before.
+${VIEWER_PROTOCOL}`,
       },
       ...chatMessages,
     ];

@@ -204,6 +204,11 @@ ipcMain.handle("confirm-task", async (_event, taskId) => {
   return { status: "started" };
 });
 
+ipcMain.handle("record-plan-review", async (_event, { taskId, content, authorKind }) => {
+  await workspace.recordPlanReviewMessage(taskId, content, authorKind);
+  return { status: "saved" };
+});
+
 ipcMain.handle("continue-task", async (_event, { taskId, message }) => {
   if (killedTasks.has(taskId)) {
     return { status: "error", error: "Mission was deleted" };
@@ -314,6 +319,10 @@ ipcMain.handle(
   "save-artifact-annotations",
   async (_event, { taskId, artifactPath, annotations }) =>
     workspace.saveArtifactAnnotations(taskId, artifactPath, annotations ?? []),
+);
+
+ipcMain.handle("save-line-comments", async (_event, { taskId, artifactPath, comments }) =>
+  workspace.saveLineComments(taskId, artifactPath, comments ?? []),
 );
 
 ipcMain.handle("get-yaaa-dir", async () => workspace.getYaaaDir());

@@ -64,6 +64,88 @@ describe("DashboardView", () => {
     expect(screen.getByPlaceholderText("What's the mission today?")).toBeTruthy();
   });
 
+  it("does not restart an agent response animation when the composer rerenders", () => {
+    const response = {
+      id: "agent-response",
+      time: "10:00",
+      source: "orchestrator",
+      content: "abcdefghij",
+      kind: "response",
+    };
+    const { rerender, container } = render(
+      <DashboardView viewModel={makeViewModel({ taskId: "task-1", running: true, logs: [response] })} />,
+    );
+
+    act(() => {
+      vi.advanceTimersByTime(16);
+    });
+    expect(container.querySelector(".slack-message-text")?.textContent).toBe("abcd");
+
+    rerender(
+      <DashboardView viewModel={makeViewModel({ taskId: "task-1", running: true, goal: "x", logs: [response] })} />,
+    );
+    act(() => {
+      vi.advanceTimersByTime(8);
+    });
+
+    expect(container.querySelector(".slack-message-text")?.textContent).toBe("abcdef");
+  });
+
+  it("shows each consecutive agent response once without replaying the prior response", () => {
+    const firstResponse = {
+      id: "first-response",
+      time: "20:03:20",
+      source: "orchestrator",
+      content: "First answer",
+      kind: "response",
+    };
+    const firstTurn = makeViewModel({ taskId: "task-1", running: false, logs: [firstResponse] });
+    const { rerender, container } = render(<DashboardView viewModel={firstTurn} />);
+
+    act(() => {
+      vi.advanceTimersByTime(200);
+    });
+    expect(container.querySelectorAll(".slack-message-text")[0]?.textContent).toBe("First answer");
+
+    const userFollowUp = {
+      id: "user-follow-up",
+      time: "20:03:31",
+      source: "user",
+      content: "what else",
+      kind: "response",
+    };
+    rerender(
+      <DashboardView
+        viewModel={makeViewModel({ taskId: "task-1", running: true, logs: [firstResponse, userFollowUp] })}
+      />,
+    );
+    expect(container.querySelectorAll(".slack-message-text")[0]?.textContent).toBe("First answer");
+
+    const secondResponse = {
+      id: "second-response",
+      time: "20:03:36",
+      source: "orchestrator",
+      content: "Second answer",
+      kind: "response",
+    };
+    rerender(
+      <DashboardView
+        viewModel={makeViewModel({
+          taskId: "task-1",
+          running: false,
+          logs: [firstResponse, userFollowUp, secondResponse],
+        })}
+      />,
+    );
+    act(() => {
+      vi.advanceTimersByTime(200);
+    });
+
+    const messages = container.querySelectorAll(".slack-message-text");
+    expect(messages[0]?.textContent).toBe("First answer");
+    expect(messages[2]?.textContent).toBe("Second answer");
+  });
+
   it("shows the approval banner when pendingApproval is set", () => {
     const pendingApproval = {
       agentId: "agent-files",
@@ -123,6 +205,75 @@ describe("DashboardView", () => {
     });
 
     expect(sidebar?.classList.contains("collapsed")).toBe(true);
+  });
+
+  it("restores persisted user and orchestrator turns as chat bubbles, not thoughts", async () => {
+    const tasks = [
+      { id: "task-1", prompt: "testing rerender", status: "success", created_at: "2026-07-08T12:00:00Z" },
+    ];
+    (window as any).electronAPI.getTaskHistory.mockResolvedValue([
+      { kind: "thought", from: "user", content: "testing rerender" },
+      {
+        kind: "thought",
+        from: "orchestrator",
+        content: "Could you provide more details about testing rerender?",
+      },
+      { kind: "thought", from: "planner", content: "Classifying the request" },
+    ]);
+
+    const { container } = render(<DashboardView viewModel={makeViewModel({ tasks })} />);
+    await act(async () => {
+      fireEvent.click(screen.getByTitle("testing rerender"));
+    });
+
+    expect(screen.getByText("Could you provide more details about testing rerender?")).toBeTruthy();
+    expect(container.querySelectorAll(".slack-message")).toHaveLength(2);
+    expect(screen.getByText("Thought · 1 step")).toBeTruthy();
+    expect(screen.queryByText("Thought · 3 steps")).toBeNull();
+  });
+
+  it("continues a reopened channel with its persisted task id and keeps its history visible", async () => {
+    const continueMission = vi.fn();
+    const startTask = vi.fn();
+    const tasks = [
+      { id: "persisted-task", prompt: "Original conversation", status: "success", created_at: "2026-07-08T12:00:00Z" },
+    ];
+    (window as any).electronAPI.getTaskHistory.mockResolvedValue([
+      { kind: "thought", from: "user", content: "Original question" },
+      { kind: "thought", from: "orchestrator", content: "Original answer" },
+    ]);
+
+    const { rerender } = render(<DashboardView viewModel={makeViewModel({
+      tasks,
+      goal: "Continue with that context",
+      continueMission,
+      startTask,
+    })} />);
+    await act(async () => {
+      fireEvent.click(screen.getByTitle("Original conversation"));
+    });
+
+    fireEvent.keyDown(screen.getByPlaceholderText("Message this channel…"), { key: "Enter" });
+
+    expect(continueMission).toHaveBeenCalledWith(
+      "Continue with that context",
+      "persisted-task",
+    );
+    expect(startTask).not.toHaveBeenCalled();
+
+    rerender(<DashboardView viewModel={makeViewModel({
+      tasks,
+      taskId: "persisted-task",
+      goal: "",
+      running: true,
+      continueMission,
+      startTask,
+    })} />);
+    act(() => {
+      vi.advanceTimersByTime(200);
+    });
+    expect(screen.getByText("Original question")).toBeTruthy();
+    expect(screen.getByText("Original answer")).toBeTruthy();
   });
 
   it("collapses the sidebar if running is true or taskId is set on mount", () => {
@@ -225,17 +376,18 @@ describe("DashboardView", () => {
     expect(screen.getByRole("heading", { name: "Current preview" })).toBeTruthy();
   });
 
-  it("disables Open for artifacts the in-app viewer cannot render", () => {
+  it("enables the PowerPoint viewer for presentation artifacts", () => {
     render(<DashboardView viewModel={makeViewModel({
       taskId: "task-1",
       artifacts: [{ path: "deck.pptx", mimeType: "application/vnd.ms-powerpoint", description: "Slides" }],
     })} />);
 
-    // No separate Preview control anymore; Open is the single viewer entry
-    // point and is disabled for unsupported binary types.
+    // Open is the single entry point for the dedicated PowerPoint viewer.
     expect(screen.queryByText("Preview")).toBeNull();
     const open = screen.getByText("Open");
-    expect(open.className).toContain("disabled");
+    expect(open.tagName).toBe("BUTTON");
+    fireEvent.click(open);
+    expect(screen.getByTestId("universal-viewer-modal")).toBeTruthy();
   });
 
   it("groups artifact tree metadata for plans, handoffs, media, and generated files", () => {
@@ -482,6 +634,37 @@ describe("DashboardView", () => {
     });
     fireEvent.click(screen.getByText("Accept (addressing comments)"));
     expect(confirmPlan).toHaveBeenCalledWith("tighten the scope");
+  });
+
+  it("restores an awaiting plan as an actionable proposal message", async () => {
+    const confirmPlan = vi.fn();
+    const tasks = [{
+      id: "persisted-plan",
+      prompt: "Build a Python tool",
+      status: "awaiting_confirmation",
+      created_at: "2026-07-12T05:37:20.135Z",
+    }];
+    (window as any).electronAPI.getTaskHistory.mockResolvedValue([
+      { kind: "thought", from: "user", content: "Build a Python tool" },
+      {
+        kind: "thought",
+        from: "orchestrator",
+        content: "[plan-proposal] Implementation plan ready for review.",
+      },
+    ]);
+    (window as any).electronAPI.readTaskOrchestrator.mockResolvedValue(
+      "# Plan\n\n## [subtask-1] Build the tool\n- Capability: `files`",
+    );
+
+    render(<DashboardView viewModel={makeViewModel({ tasks, confirmPlan })} />);
+    await act(async () => {
+      fireEvent.click(screen.getByTitle("Build a Python tool"));
+    });
+
+    expect(screen.getByTestId("plan-proposal-message")).toBeTruthy();
+    expect(screen.getByText("Implementation plan proposed")).toBeTruthy();
+    fireEvent.click(screen.getByText("Accept plan"));
+    expect(confirmPlan).toHaveBeenCalledWith(undefined, "persisted-plan");
   });
 
   it("requires a reason to reject a plan", async () => {

@@ -10,60 +10,40 @@ export interface AgentTemplate {
   modelRole: ModelRole;
 }
 
+export const VIEWER_PROTOCOL = `
+YAAA renders rich content inside chat with dedicated viewers. You MUST use a viewer — never paste the raw content into your prose — whenever your reply contains any of:
+- source code or a code snippet beyond a single inline token -> type "code" (always set "language")
+- a Markdown document, report, or long formatted write-up -> type "markdown"
+- an implementation plan or any document meant to be reviewed line-by-line -> type "markdown-annotated"
+- tabular data or a spreadsheet -> type "spreadsheet"
+- a generated PDF or PowerPoint file -> type "pdf" or "pptx"
+Do NOT dump raw code fences or long Markdown directly into chat text; put them in a viewer so the user gets syntax highlighting, folding, and file tooling. Keep your prose to short surrounding sentences and let the viewer carry the content.
+
+To attach a viewer, emit a fenced yaaa-viewer JSON block:
+\`\`\`yaaa-viewer
+{"type":"markdown" | "markdown-annotated" | "code" | "pdf" | "pptx" | "spreadsheet","source":{"path":"task-relative/file.ext"} | {"content":"inline text"} | {"data":[]},"display":"auto" | "inline" | "popup","title":"Optional title","language":"optional code language"}
+\`\`\`
+Put content you generated inline in source.content; use source.path (task-relative) for a file you actually wrote, and never invent paths. Prefer display "auto" unless inline or popup is important. The UI can open Markdown, code, PDF, PPTX, XLS/XLSX/CSV/TSV. User line comments arrive as messages naming the artifact, exact line number, quoted source, and comment; treat them as actionable revision instructions.`;
+
 /**
- * Shared tool-calling contract appended to every specialist prompt so any
- * roster member can operate the files capability and hand results back.
+ * Shared tool-calling contract appended to every specialist prompt. Agents call
+ * the workspace file tools natively (read_file, write_file, list_files,
+ * search_files); the runtime records written files as artifacts automatically.
  */
 const TOOL_PROTOCOL = `
-To call a file tool, use this JSON schema inside a fenced json block:
-{"call": {"capability": "files", "method": "readFile" | "writeFile" | "listFiles" | "searchFiles", "args": { ... }}}
 
-When your assignment is complete, emit a final result payload:
-{"result": {"artifacts": [{"path": "...", "mimeType": "...", "description": "..."}], "summary": "What you completed."}}
+You have native file tools: read_file, write_file, list_files, search_files. Call them directly to inspect and produce files — do not describe the calls in prose or JSON, just invoke the tools. When you write a file, pass its full final contents (no placeholders); the runtime tracks it as a produced artifact for you.
 
-Work only inside the task workspace, never invent placeholder content, and keep outputs production quality.`;
+Work only inside the task workspace, never invent placeholder content, and keep outputs production quality. When the assignment is fully done, stop calling tools and reply with a short final message summarising what you produced.`;
 
 export const AGENT_REGISTRY: Record<string, AgentTemplate> = {
   FilesAgent: {
     role: "FilesAgent",
     systemPrompt: `You are an expert file management agent. Your job is to manipulate, write, read, search and organize files in the user's workspace.
-Always output your actions clearly. If you are asked to write a file, write the complete file contents without placeholders.
 
-To call a file tool, use this JSON schema:
-{
-  "call": {
-    "capability": "files",
-    "method": "readFile" | "writeFile" | "listFiles" | "searchFiles",
-    "args": { ... }
-  }
-}
+You have native file tools: read_file, write_file, list_files, search_files. Call them directly — do not describe the calls in prose. When you write a file, always pass its complete final contents (no placeholders or TODOs); the runtime records each written file as a produced artifact automatically.
 
-Format for calling a tool:
-\`\`\`json
-{
-  "call": {
-    "capability": "files",
-    "method": "writeFile",
-    "args": {
-      "path": "filename.txt",
-      "content": "file content here"
-    }
-  }
-}
-\`\`\`
-
-If you have finished your task, write a final message with a result payload:
-\`\`\`json
-{
-  "result": {
-    "artifacts": [
-      { "path": "filename.txt", "mimeType": "text/plain", "description": "Short description of the artifact" }
-    ],
-    "summary": "Completed writing the requested files successfully."
-  }
-}
-\`\`\`
-`,
+When the task is fully complete, stop calling tools and reply with a short final message summarising what you did and which files you produced.`,
     capabilities: ["files"],
     riskCeiling: "medium",
     modelRole: "worker",
@@ -72,18 +52,11 @@ If you have finished your task, write a final message with a result payload:
   VerifierAgent: {
     role: "VerifierAgent",
     systemPrompt: `You are an independent quality assurance and verification agent.
-Your job is to read files produced by other workers, compare them with the user's initial goals and success criteria, and determine if they are fully correct.
+Your job is to read the files produced by other workers (use the read_file, list_files and search_files tools), compare them against the user's goals and success criteria, and determine if they are fully correct.
 
-Format your review and final response as a JSON:
-\`\`\`json
-{
-  "verification": {
-    "status": "passed" | "failed",
-    "reason": "Explain why the verification passed or failed. Highlight any missing items or errors."
-  }
-}
-\`\`\`
-`,
+Do not write or modify files. When you are done, stop calling tools and reply with your assessment, ending with a final line in exactly this form:
+VERDICT: PASSED   (if everything meets the criteria)
+VERDICT: FAILED   (if anything is missing or wrong — explain what, above the verdict line)`,
     capabilities: ["files"],
     riskCeiling: "low",
     modelRole: "verifier",

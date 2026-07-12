@@ -1,8 +1,30 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { container, PermissionEngine } from "@yaaa/platform";
-import type { IBus, IStore, IMeshGateway } from "@yaaa/interfaces";
+import type { IBus, IStore, IMeshGateway, ModelRole } from "@yaaa/interfaces";
 import { OuterLoop } from "@yaaa/agents";
+import { BaseChatModel } from "@langchain/core/language_models/chat_models";
+import { AIMessage } from "@langchain/core/messages";
+import type { ChatResult as LcChatResult } from "@langchain/core/outputs";
 import { Supervisor } from "./supervisor.js";
+
+/** Minimal fake worker/verifier model so the inner ReAct loop finishes without a
+ * live model — mirrors the runtime's keyless mock. */
+class FakeWorkerModel extends BaseChatModel {
+  constructor(private readonly role: ModelRole) {
+    super({});
+  }
+  _llmType() {
+    return "fake-worker";
+  }
+  async _generate(): Promise<LcChatResult> {
+    const text = this.role === "verifier" ? "OK\nVERDICT: PASSED" : "Subtask done";
+    const message = new AIMessage({ content: text });
+    return { generations: [{ text, message }] };
+  }
+  override bindTools() {
+    return this;
+  }
+}
 
 describe("Supervisor", () => {
   let mockGateway: IMeshGateway;
@@ -41,6 +63,13 @@ describe("Supervisor", () => {
     container.register("IBus", mockBus);
     container.register("IStore", mockStore);
     container.register("PermissionEngine", new PermissionEngine());
+    container.register("capability:files", {
+      readFile: vi.fn().mockResolvedValue(""),
+      writeFile: vi.fn().mockResolvedValue(undefined),
+      listFiles: vi.fn().mockResolvedValue([]),
+      searchFiles: vi.fn().mockResolvedValue([]),
+    });
+    container.register("ChatModelFactory", (role: ModelRole) => new FakeWorkerModel(role));
 
     supervisor = new Supervisor();
   });
@@ -51,7 +80,8 @@ describe("Supervisor", () => {
     // 3. Mock Synthesizer response
     (mockGateway.chat as any).mockImplementation(async (messages: any[], options: any) => {
       if (options.modelRole === "planner") {
-        return `\`\`\`json
+        return {
+          content: `\`\`\`json
 {
   "goal": "Test goal",
   "subtasks": [
@@ -66,27 +96,20 @@ describe("Supervisor", () => {
     }
   ]
 }
-\`\`\``;
-      }
-      if (options.modelRole === "worker") {
-        return `\`\`\`json
-{
-  "result": {
-    "artifacts": [],
-    "summary": "Subtask done"
-  }
-}
-\`\`\``;
+\`\`\``,
+        };
       }
       if (options.modelRole === "verifier") {
-        return `\`\`\`json
+        return {
+          content: `\`\`\`json
 {
   "passed": true,
   "summary": "Task fully verified"
 }
-\`\`\``;
+\`\`\``,
+        };
       }
-      return "{}";
+      return { content: "{}" };
     });
 
     const result = await supervisor.runTask("Test goal");
@@ -100,7 +123,7 @@ describe("Supervisor", () => {
       goal: "Review before execution",
       subtasks: [],
     };
-    (mockGateway.chat as any).mockResolvedValue(`\`\`\`json\n${JSON.stringify(plan)}\n\`\`\``);
+    (mockGateway.chat as any).mockResolvedValue({ content: `\`\`\`json\n${JSON.stringify(plan)}\n\`\`\`` });
     const runSpy = vi.spyOn(OuterLoop.prototype, "run");
 
     await expect(supervisor.createPlan("Review before execution", "task-draft")).resolves.toEqual(plan);
@@ -113,7 +136,8 @@ describe("Supervisor", () => {
 
   it("should handle failures during task execution and return success: false", async () => {
     // 1. Mock Planner response
-    (mockGateway.chat as any).mockResolvedValue(`\`\`\`json
+    (mockGateway.chat as any).mockResolvedValue({
+      content: `\`\`\`json
 {
   "goal": "Test goal",
   "subtasks": [
@@ -128,7 +152,8 @@ describe("Supervisor", () => {
     }
   ]
 }
-\`\`\``);
+\`\`\``,
+    });
 
     // Mock OuterLoop to throw an error to hit the Supervisor catch block
     const runSpy = vi.spyOn(OuterLoop.prototype, "run").mockRejectedValue(new Error("Execution failed"));

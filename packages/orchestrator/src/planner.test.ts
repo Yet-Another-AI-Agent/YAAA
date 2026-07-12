@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { container } from "@yaaa/platform";
 import type { IMeshGateway, IBus } from "@yaaa/interfaces";
-import { Planner } from "./planner.js";
+import { Planner, getRequestedAgentCount } from "./planner.js";
 
 describe("Planner", () => {
   let mockGateway: IMeshGateway;
@@ -40,7 +40,7 @@ describe("Planner", () => {
 }
 \`\`\``;
 
-    (mockGateway.chat as any).mockResolvedValue(mockResponse);
+    (mockGateway.chat as any).mockResolvedValue({ content: mockResponse });
 
     const plan = await planner.plan("Write report");
     expect(plan.goal).toBe("Write report");
@@ -53,14 +53,14 @@ describe("Planner", () => {
     (mockGateway.chat as any).mockImplementation(async () => {
       chatCount++;
       if (chatCount === 1) {
-        return "invalid-json-output";
+        return { content: "invalid-json-output" };
       }
-      return `\`\`\`json
+      return { content: `\`\`\`json
 {
   "goal": "Write report",
   "subtasks": []
 }
-\`\`\``;
+\`\`\`` };
     });
 
     const plan = await planner.plan("Write report");
@@ -70,7 +70,7 @@ describe("Planner", () => {
   });
 
   it("should propagate parsing failure if both attempts are invalid JSON", async () => {
-    (mockGateway.chat as any).mockResolvedValue("completely-invalid-output");
+    (mockGateway.chat as any).mockResolvedValue({ content: "completely-invalid-output" });
 
     await expect(planner.plan("Write report")).rejects.toThrow(
       "No JSON code block found in model output."
@@ -80,7 +80,7 @@ describe("Planner", () => {
   it("publishes planner reasoning as a thought when a taskId is given", async () => {
     (mockGateway.chat as any).mockImplementation(async (_msgs: any, opts: any) => {
       opts.onReasoning?.("decomposing the goal");
-      return '```json\n{ "goal": "g", "subtasks": [] }\n```';
+      return { content: '```json\n{ "goal": "g", "subtasks": [] }\n```' };
     });
 
     await planner.plan("Write report", "task-123");
@@ -95,7 +95,7 @@ describe("Planner", () => {
     let sentMessages: any[] = [];
     (mockGateway.chat as any).mockImplementation(async (msgs: any[]) => {
       sentMessages = msgs;
-      return '```json\n{ "goal": "g", "subtasks": [] }\n```';
+      return { content: '```json\n{ "goal": "g", "subtasks": [] }\n```' };
     });
 
     await planner.plan("Write report", "task-1", {
@@ -113,11 +113,47 @@ describe("Planner", () => {
   it("does not publish reasoning when no taskId is given", async () => {
     (mockGateway.chat as any).mockImplementation(async (_msgs: any, opts: any) => {
       opts.onReasoning?.("thinking without a task");
-      return '```json\n{ "goal": "g", "subtasks": [] }\n```';
+      return { content: '```json\n{ "goal": "g", "subtasks": [] }\n```' };
     });
 
     await planner.plan("Write report");
 
     expect(mockBus.publish).not.toHaveBeenCalled();
+  });
+
+  it("recognizes explicit numeric and word-form agent counts", () => {
+    expect(getRequestedAgentCount("spin 2 agents to code and test")).toBe(2);
+    expect(getRequestedAgentCount("use two collaborating agents")).toBe(2);
+    expect(getRequestedAgentCount("build and test this")).toBeNull();
+  });
+
+  it("retries a plan that would spawn more agents than explicitly requested", async () => {
+    const makePlan = (count: number) => ({
+      content: `\`\`\`json\n${JSON.stringify({
+        goal: "Code and test",
+        subtasks: Array.from({ length: count }, (_, index) => ({
+          id: `subtask-${index + 1}`,
+          title: index === 0 ? "Python developer" : "Python tester",
+          capability: index === 0 ? "files" : "verify",
+          dependsOn: index === 0 ? [] : ["subtask-1"],
+          riskLevel: "low",
+          successCriteria: "Role assignment completed",
+        })),
+      })}\n\`\`\``,
+    });
+    (mockGateway.chat as any)
+      .mockResolvedValueOnce(makePlan(6))
+      .mockResolvedValueOnce(makePlan(2));
+
+    const plan = await planner.plan(
+      "spin 2 agents and one to write Python code and another to test",
+    );
+
+    expect(plan.subtasks).toHaveLength(2);
+    expect(mockGateway.chat).toHaveBeenCalledTimes(2);
+    const retryMessages = (mockGateway.chat as any).mock.calls[1][0];
+    expect(retryMessages.at(-1).content).toContain(
+      "Each subtask spawns one agent",
+    );
   });
 });

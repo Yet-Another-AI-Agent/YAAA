@@ -6,6 +6,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
   continueTask: (taskId, message) =>
     ipcRenderer.invoke("continue-task", { taskId, message }),
   confirmTask: (taskId) => ipcRenderer.invoke("confirm-task", taskId),
+  recordPlanReview: (taskId, content, authorKind) =>
+    ipcRenderer.invoke("record-plan-review", { taskId, content, authorKind }),
 
   resolveApproval: (callId, approved) =>
     ipcRenderer.invoke("resolve-approval", { callId, approved }),
@@ -22,6 +24,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
       artifactPath,
       annotations,
     }),
+  saveLineComments: (taskId, artifactPath, comments) =>
+    ipcRenderer.invoke("save-line-comments", { taskId, artifactPath, comments }),
   getTaskHistory: (taskId) => ipcRenderer.invoke("get-task-history", taskId),
   getTaskAgents: (taskId) => ipcRenderer.invoke("get-task-agents", taskId),
   createPublicConversation: (taskId, title) =>

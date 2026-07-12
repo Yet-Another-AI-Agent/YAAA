@@ -33,7 +33,7 @@ describe("MeshGateway", () => {
       [{ role: "user", content: "test" }],
       { modelRole: "planner" }
     );
-    expect(response).toContain("goal");
+    expect(response.content).toContain("goal");
   });
 
   it("should yield mock streaming chunks when in Mock Mode", async () => {
@@ -74,8 +74,39 @@ describe("MeshGateway", () => {
       [{ role: "user", content: "hello" }],
       { modelRole: "planner", onReasoning }
     );
-    expect(response).toBe("the answer");
+    expect(response.content).toBe("the answer");
     expect(onReasoning).toHaveBeenCalledWith("let me think...");
+  });
+
+  it("sends API-safe tool names (colon → __) and decodes tool calls back", async () => {
+    const gateway = new MeshGateway({ apiKey: "some-key" });
+    mockCreate.mockResolvedValue({
+      choices: [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              { id: "call-1", function: { name: "files__readFile", arguments: '{"path":"a.txt"}' } },
+            ],
+          },
+        },
+      ],
+    });
+    const response = await gateway.chat(
+      [{ role: "user", content: "read a file" }],
+      {
+        modelRole: "worker",
+        tools: [
+          { name: "files:readFile", description: "Read a file.", parameters: { type: "object", properties: {} } },
+        ],
+      },
+    );
+    // Wire name must satisfy the provider's ^[a-zA-Z0-9_-]+$ constraint.
+    const sentName = mockCreate.mock.calls[0][0].tools[0].function.name;
+    expect(sentName).toBe("files__readFile");
+    expect(sentName).toMatch(/^[a-zA-Z0-9_-]+$/);
+    // The returned tool call is decoded back to the internal capability:method form.
+    expect(response.toolCalls?.[0].name).toBe("files:readFile");
   });
 
   it("should not call onReasoning when the provider returns no reasoning", async () => {
@@ -98,13 +129,13 @@ describe("MeshGateway", () => {
       [{ role: "user", content: "start work" }],
       { modelRole: "worker" },
     );
-    expect(firstWorkerReply).toContain('"call"');
+    expect(firstWorkerReply.content).toContain('"call"');
 
     const completedWorkerReply = await gateway.chat(
       [{ role: "user", content: "Tool Execution Result: success" }],
       { modelRole: "worker" },
     );
-    expect(completedWorkerReply).toContain('"result"');
+    expect(completedWorkerReply.content).toContain('"result"');
 
     const topic = await gateway.chat(
       [
@@ -113,17 +144,17 @@ describe("MeshGateway", () => {
       ],
       { modelRole: "utility" },
     );
-    expect(topic).toBe("ship-the-release");
+    expect(topic.content).toBe("ship-the-release");
 
     const finalVerification = await gateway.chat(
       [{ role: "system", content: "Act as the final synthesis and verification judge" }],
       { modelRole: "verifier" },
     );
-    expect(finalVerification).toContain('"passed": true');
+    expect(finalVerification.content).toContain('"passed": true');
 
     await expect(
       gateway.chat([{ role: "user", content: "fallback" }], { modelRole: "utility" }),
-    ).resolves.toBe("{}");
+    ).resolves.toMatchObject({ content: "{}" });
   });
 
   it("should make a real OpenAI call if API key is provided", async () => {
@@ -139,7 +170,40 @@ describe("MeshGateway", () => {
     );
 
     expect(mockCreate).toHaveBeenCalled();
-    expect(response).toBe("real-gateway-reply");
+    expect(response.content).toBe("real-gateway-reply");
+  });
+
+  it("retries without temperature when a Bedrock-backed model deprecates it", async () => {
+    const gateway = new MeshGateway({ apiKey: "some-key" });
+    mockCreate
+      .mockRejectedValueOnce(
+        new Error("ValidationException: `temperature` is deprecated for this model"),
+      )
+      .mockResolvedValueOnce({
+        choices: [{ message: { content: "continued older chat" } }],
+      });
+
+    await expect(
+      gateway.chat(
+        [{ role: "user", content: "continue" }],
+        { modelRole: "utility", temperature: 0.3 },
+      ),
+    ).resolves.toMatchObject({ content: "continued older chat" });
+
+    expect(mockCreate).toHaveBeenCalledTimes(2);
+    expect(mockCreate.mock.calls[0][0]).toHaveProperty("temperature", 0.3);
+    expect(mockCreate.mock.calls[1][0]).not.toHaveProperty("temperature");
+  });
+
+  it("does not hide unrelated provider validation failures", async () => {
+    const gateway = new MeshGateway({ apiKey: "some-key" });
+    const error = new Error("ValidationException: malformed messages");
+    mockCreate.mockRejectedValueOnce(error);
+
+    await expect(
+      gateway.chat([{ role: "user", content: "continue" }], { modelRole: "utility" }),
+    ).rejects.toBe(error);
+    expect(mockCreate).toHaveBeenCalledTimes(1);
   });
 
   it("should return an empty string when a real response has no content", async () => {
@@ -148,7 +212,7 @@ describe("MeshGateway", () => {
 
     await expect(
       gateway.chat([{ role: "user", content: "hello" }], { modelRole: "planner", jsonMode: true }),
-    ).resolves.toBe("");
+    ).resolves.toMatchObject({ content: "" });
   });
 
   it("should support real stream responses if API key is provided", async () => {
@@ -175,6 +239,30 @@ describe("MeshGateway", () => {
 
     expect(mockCreateStream).toHaveBeenCalled();
     expect(chunks).toEqual(["part1", "part2"]);
+  });
+
+  it("retries streaming without temperature when the selected model rejects it", async () => {
+    const gateway = new MeshGateway({ apiKey: "some-key" });
+    const fallbackStream = {
+      async *[Symbol.asyncIterator]() {
+        yield { choices: [{ delta: { content: "recovered" } }] };
+      },
+    };
+    mockCreateStream
+      .mockRejectedValueOnce(new Error("temperature is unsupported for this model"))
+      .mockResolvedValueOnce(fallbackStream);
+
+    const chunks: string[] = [];
+    for await (const chunk of gateway.chatStream(
+      [{ role: "user", content: "continue" }],
+      { modelRole: "planner", temperature: 0.1 },
+    )) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks).toEqual(["recovered"]);
+    expect(mockCreateStream).toHaveBeenCalledTimes(2);
+    expect(mockCreateStream.mock.calls[1][0]).not.toHaveProperty("temperature");
   });
 
   it("should skip empty real stream chunks", async () => {
