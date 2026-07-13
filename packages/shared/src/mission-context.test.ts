@@ -75,6 +75,19 @@ describe("buildAgentBrief", () => {
     expect(brief).toContain("agent-workspaces/a/handOff.md");
   });
 
+  it("requires an exit checklist before the agent stops", () => {
+    const brief = buildAgentBrief({
+      ...base,
+      proofOfWorkPath: "agent-workspaces/a/proofOfWork.md",
+      handOffPath: "agent-workspaces/a/handOff.md",
+    });
+    expect(brief).toContain("## Exit checklist");
+    expect(brief).toContain("deliverable exists as a concrete file/artifact");
+    expect(brief).toContain("Do not exit immediately after web.search");
+    expect(brief).toContain("agent-workspaces/a/proofOfWork.md");
+    expect(brief).toContain("agent-workspaces/a/handOff.md");
+  });
+
   it("states there are no dependencies yet for early steps", () => {
     const brief = buildAgentBrief(base);
     expect(brief).toContain("None yet — this is an early step");

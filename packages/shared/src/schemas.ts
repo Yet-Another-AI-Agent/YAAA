@@ -52,7 +52,7 @@ export const SubtaskSchema = z.object({
   agentTemplate: z.enum([
     "FilesAgent", "VerifierAgent", "PrincipalSweAgent", "UiArchitectAgent",
     "GraphicsEngineerAgent", "ResearcherAgent", "AdStrategistAgent",
-    "DesignerAgent", "DevOpsAgent", "QaTesterAgent", "CvTesterAgent",
+    "DesignerAgent", "DocumentAgent", "DevOpsAgent", "QaTesterAgent", "CvTesterAgent",
   ]).optional(),
   routingReason: z.string().min(1).optional(),
   model: z.string().optional(),

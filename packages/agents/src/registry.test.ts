@@ -24,6 +24,11 @@ describe("AGENT_REGISTRY", () => {
     expect(template.modelRole.length).toBeGreaterThan(0);
   });
 
+  it.each(entries)("%s requires concrete handoff evidence", (_key, template) => {
+    expect(template.systemPrompt).toMatch(/evidence/i);
+    expect(template.systemPrompt).toMatch(/Never (?:claim|report)/i);
+  });
+
   describe("FilesAgent", () => {
     const agent = AGENT_REGISTRY["FilesAgent"];
 
@@ -56,6 +61,7 @@ describe("AGENT_REGISTRY", () => {
       "@researcher",
       "@ad-strategist",
       "@designer",
+      "@document-specialist",
       "@devops",
       "@qa-tester",
       "@cv-tester",
@@ -75,8 +81,16 @@ describe("AGENT_REGISTRY", () => {
       expect(AGENT_REGISTRY.CvTesterAgent.modelRole).toBe("verifier");
     });
 
-    it("enforces the 95% coverage mandate in the QA prompt", () => {
-      expect(AGENT_REGISTRY.QaTesterAgent.systemPrompt).toContain("95%");
+    it("keeps QA focused on verification instead of implementation", () => {
+      expect(AGENT_REGISTRY.QaTesterAgent.systemPrompt).toContain("do not create the primary deliverable");
+      expect(AGENT_REGISTRY.QaTesterAgent.systemPrompt).toContain("do not write implementation code");
+      expect(AGENT_REGISTRY.QaTesterAgent.systemPrompt).not.toContain("When you write a file");
+    });
+
+    it("tells the document specialist to generate real PowerPoint files with pptxgenjs", () => {
+      expect(AGENT_REGISTRY.DocumentAgent.systemPrompt).toContain("pptxgenjs");
+      expect(AGENT_REGISTRY.DocumentAgent.systemPrompt).toContain("real .pptx file");
+      expect(AGENT_REGISTRY.DocumentAgent.systemPrompt).toContain("speaker notes");
     });
   });
 
@@ -100,12 +114,16 @@ describe("AGENT_REGISTRY", () => {
       ).toBe("CvTesterAgent");
     });
 
+    it("routes docs subtasks to the document specialist", () => {
+      expect(selectAgentTemplate({ capability: "docs", title: "Create a PPT deck" })).toBe("DocumentAgent");
+    });
+
     it("does not infer a specialist from title keywords", () => {
       expect(selectAgentTemplate({ capability: "files", title: "Docker React research database" })).toBe("FilesAgent");
     });
 
     it("accepts every valid planner-selected specialist", () => {
-      for (const agentTemplate of ["PrincipalSweAgent", "UiArchitectAgent", "GraphicsEngineerAgent", "ResearcherAgent", "AdStrategistAgent", "DesignerAgent", "DevOpsAgent"]) {
+      for (const agentTemplate of ["PrincipalSweAgent", "UiArchitectAgent", "GraphicsEngineerAgent", "ResearcherAgent", "AdStrategistAgent", "DesignerAgent", "DocumentAgent", "DevOpsAgent"]) {
         expect(selectAgentTemplate({ capability: "files", agentTemplate })).toBe(agentTemplate);
       }
     });

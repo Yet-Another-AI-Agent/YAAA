@@ -72,11 +72,12 @@ export class MeshGateway implements IMeshGateway {
       maxRetries,
     });
 
-    // Default Mesh API routing mapping for various agent roles. The planner is
-    // the orchestrator's brain, so it always runs on the best available model.
+    // Default Mesh API routing mapping for various agent roles. Keep defaults
+    // cost-aware; the planner can still explicitly assign Sonnet to complex
+    // subtasks that need it.
     this.modelMapping = {
-      planner: "anthropic/claude-sonnet-5",
-      worker: "anthropic/claude-sonnet-5",
+      planner: "google/gemini-2.5-flash",
+      worker: "google/gemini-2.5-flash",
       verifier: "anthropic/claude-haiku-4.5",
       utility: "anthropic/claude-haiku-4.5",
       ...config.modelMapping,
@@ -219,7 +220,9 @@ export class MeshGateway implements IMeshGateway {
     if (this.isMockMode) {
       return "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
     }
-    const model = options.model || "google/imagen-3";
+    // Image model is operator-configurable so a deployment can point at whatever
+    // image endpoint Mesh exposes without a code change; defaults to imagen-3.
+    const model = options.model || process.env.YAAA_IMAGE_MODEL?.trim() || "google/imagen-3";
     try {
       const response = await this.openai.images.generate({
         model,

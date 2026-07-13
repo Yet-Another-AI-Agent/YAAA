@@ -48,6 +48,12 @@ to boot the app. It runs `scripts/start-ui.sh`, which:
    (`npm run rebuild:electron`), then
 4. runs `npm run dev:ui`.
 
+**Never launch the app with `sudo`.** Agents write their deliverables through the
+file provider under the current process user. If the app is elevated, every
+agent-written file (task workspaces, generated PPTX, `agent-workspaces/…`) ends up
+owned by `root`, which then blocks later non-root writes and produces spurious
+"permission" failures. Run `npm start` as your normal user.
+
 ### Why: the recurring "NODE_MODULE_VERSION mismatch" crash
 
 `better-sqlite3` is a native module. `npm rebuild`/`npm install` compile it

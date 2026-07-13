@@ -2,7 +2,7 @@ import type { UIArtifact } from "../models/TaskModel";
 
 export type ArtifactGroupId = "plans" | "handoffs" | "media" | "files";
 export type ArtifactMediaKind = "image" | "video" | "audio";
-export type ArtifactHandoffKind = "hands-on" | "hands-off";
+export type ArtifactHandoffKind = "hands-on" | "hands-off" | "proof-of-work";
 
 export interface ArtifactExplorerEntry extends UIArtifact {
   normalizedPath: string;
@@ -12,6 +12,8 @@ export interface ArtifactExplorerEntry extends UIArtifact {
   groupId: ArtifactGroupId;
   mediaKind?: ArtifactMediaKind;
   handoffKind?: ArtifactHandoffKind;
+  /** The owning agent id when this lives under agent-workspaces/<id>/. */
+  agentId?: string;
   typeLabel: string;
 }
 
@@ -23,7 +25,7 @@ export interface ArtifactExplorerGroup {
 
 const GROUP_LABELS: Record<ArtifactGroupId, string> = {
   plans: "Plans",
-  handoffs: "Agent handoffs",
+  handoffs: "Agent artifacts",
   media: "Generated media",
   files: "Documents & files",
 };
@@ -67,7 +69,14 @@ function getHandoffKind(name: string): ArtifactHandoffKind | undefined {
   if (stem === "HANDS_ON") return "hands-on";
   if (stem === "HANDS_OFF") return "hands-off";
   if (stem === "HAND_OFF") return "hands-off";
+  if (stem === "PROOF_OF_WORK") return "proof-of-work";
   return undefined;
+}
+
+/** Extract the owning agent id from an `agent-workspaces/<id>/…` path. */
+function getAgentId(segments: string[]): string | undefined {
+  const idx = segments.indexOf("agent-workspaces");
+  return idx >= 0 && segments[idx + 1] ? segments[idx + 1] : undefined;
 }
 
 function isPlanArtifact(name: string, description: string): boolean {
@@ -85,6 +94,7 @@ function getTypeLabel(
 ): string {
   if (handoffKind === "hands-on") return "HANDS ON";
   if (handoffKind === "hands-off") return "HANDS OFF";
+  if (handoffKind === "proof-of-work") return "PROOF";
   if (groupId === "plans") return "Plan";
   if (mediaKind) return mediaKind[0].toUpperCase() + mediaKind.slice(1);
   return extension ? extension.toUpperCase() : "File";
@@ -102,6 +112,7 @@ export function buildArtifactExplorer(artifacts: UIArtifact[]): ArtifactExplorer
     const mimeType = String(artifact.mimeType || "application/octet-stream");
     const description = String(artifact.description || "");
     const handoffKind = getHandoffKind(name);
+    const agentId = getAgentId(segments);
     const mediaKind = getMediaKind(mimeType, extension);
     const groupId: ArtifactGroupId = handoffKind
       ? "handoffs"
@@ -125,6 +136,7 @@ export function buildArtifactExplorer(artifacts: UIArtifact[]): ArtifactExplorer
       groupId,
       mediaKind,
       handoffKind,
+      agentId,
       typeLabel: getTypeLabel(extension, groupId, mediaKind, handoffKind),
     });
   });
@@ -139,4 +151,25 @@ export function buildArtifactExplorer(artifacts: UIArtifact[]): ArtifactExplorer
       entries: entries.filter((entry) => entry.groupId === id),
     }))
     .filter((group) => group.entries.length > 0);
+}
+
+/**
+ * Bucket a group's entries by owning agent (preserving first-seen order), so the
+ * UI can show one agent's handsOn / handOff / proofOfWork docs together under a
+ * single per-agent heading instead of interleaving every agent's docs.
+ */
+export function groupEntriesByAgent(
+  entries: ArtifactExplorerEntry[],
+): Array<{ agentId?: string; entries: ArtifactExplorerEntry[] }> {
+  const byAgent = new Map<string, ArtifactExplorerEntry[]>();
+  const order: string[] = [];
+  for (const entry of entries) {
+    const key = entry.agentId || "";
+    if (!byAgent.has(key)) {
+      byAgent.set(key, []);
+      order.push(key);
+    }
+    byAgent.get(key)!.push(entry);
+  }
+  return order.map((key) => ({ agentId: key || undefined, entries: byAgent.get(key)! }));
 }

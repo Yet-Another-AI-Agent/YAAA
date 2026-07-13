@@ -55,6 +55,28 @@ export function parseViewerEmbeds(message: string): MessagePart[] {
   return parts.length ? parts : [{ kind: "text", text: message }];
 }
 
+/**
+ * A chat message body longer than this (or with this many lines) is treated as a
+ * document rather than prose: instead of dumping it inline it renders as a small
+ * "Open document" button that pops the full markdown viewer.
+ */
+const INLINE_MARKDOWN_MAX_CHARS = 1500;
+const INLINE_MARKDOWN_MAX_LINES = 24;
+
+export function isLargeMarkdown(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  return trimmed.length > INLINE_MARKDOWN_MAX_CHARS || trimmed.split("\n").length > INLINE_MARKDOWN_MAX_LINES;
+}
+
+/** Best-effort title for a markdown blob: first heading, else first non-empty line. */
+export function markdownTitle(text: string): string {
+  const lines = text.split("\n").map((line) => line.trim());
+  const heading = lines.find((line) => /^#{1,6}\s+/.test(line));
+  const base = heading ? heading.replace(/^#{1,6}\s+/, "") : lines.find(Boolean) || "Document";
+  return base.length > 80 ? `${base.slice(0, 80)}…` : base;
+}
+
 export function inferViewerKind(path: string): ViewerKind | null {
   if (/\.(md|markdown)$/i.test(path)) return "markdown";
   if (/\.pdf$/i.test(path)) return "pdf";
@@ -192,7 +214,9 @@ function AnnotatedMarkdownView({
                     onChange={(e) => setDraft(e.target.value)}
                     placeholder="What should change in this section?"
                     onKeyDown={(e) => {
-                      if (e.key === "Escape") { setActiveBlock(null); setDraft(""); }
+                      // Esc cancels this inline annotation edit only; stop it from
+                      // bubbling to the window handler that would close the viewer.
+                      if (e.key === "Escape") { e.stopPropagation(); setActiveBlock(null); setDraft(""); }
                       if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) addComment(block.id, blockMd.slice(0, 120));
                     }}
                   />
@@ -338,7 +362,17 @@ export function UniversalViewer({ spec, taskId, compact = false, onCommentsSaved
 
 export function RichMessageContent({ content, taskId, onOpen }: { content: string; taskId?: string; onOpen: (spec: ViewerSpec) => void }) {
   return <>{parseViewerEmbeds(content).map((part, index) => part.kind === "text"
-    ? <MarkdownView key={index} content={part.text || ""} />
+    ? (isLargeMarkdown(part.text || "")
+        ? <button
+            type="button"
+            className="viewer-attachment-card"
+            key={index}
+            onClick={() => onOpen({ type: "markdown", source: { content: part.text || "" }, display: "popup", title: markdownTitle(part.text || "") })}
+          >
+            <span>Open document · {markdownTitle(part.text || "")}</span>
+            <small>markdown · {(part.text || "").trim().length.toLocaleString()} chars</small>
+          </button>
+        : <MarkdownView key={index} content={part.text || ""} />)
     : part.spec && (shouldOpenViewerInline(part.spec)
       ? <div className="inline-viewer-card" key={index}><div className="inline-viewer-header"><strong>{part.spec.title || part.spec.source.path?.split("/").pop() || `${part.spec.type} viewer`}</strong><button onClick={() => onOpen(part.spec!)}>Expand</button></div><UniversalViewer spec={part.spec} taskId={taskId} compact /></div>
       : <button type="button" className="viewer-attachment-card" key={index} onClick={() => onOpen(part.spec!)}><span>Open {part.spec.title || part.spec.source.path?.split("/").pop() || part.spec.type}</span><small>{part.spec.type} viewer</small></button>))}</>;

@@ -129,6 +129,10 @@ export function buildAgentBrief(input: AgentBriefInput): string {
     sections.push(`## Handoff contract\n${lines.join("\n")}`);
   }
 
+  sections.push(
+    `## Exit checklist\nBefore you stop, verify every item below:\n- The requested deliverable exists as a concrete file/artifact, not only as search results, notes in chat, or a tool observation.\n- The deliverable satisfies the success criteria above; if it does not, keep working or write a clear blocker handoff.\n- You used available tools to check the deliverable exists and, when possible, reopened/read/rendered/tested it.\n${proofOfWorkPath ? `- You wrote proof of work to \`${proofOfWorkPath}\` with the evidence from that check.` : "- You recorded proof of work with concrete evidence from that check."}\n${handOffPath ? `- You wrote the final handoff to \`${handOffPath}\` with work done, observations, suggestions, asset metadata, residual risks, and continuation instructions.` : "- You wrote a final handoff with work done, observations, suggestions, asset metadata, residual risks, and continuation instructions."}\n- Do not exit immediately after web.search, list_files, read_file, or browser inspection unless you have also created/found the deliverable artifact and completed the proof/handoff.`,
+  );
+
   if (dependencyOutputs.length > 0) {
     const lines = dependencyOutputs.map(
       (d) => {
@@ -148,7 +152,7 @@ export function buildAgentBrief(input: AgentBriefInput): string {
   }
 
   sections.push(
-    `Work toward the mission goal above. Use tools as needed, and emit your final result payload once the success criteria are met.`,
+    `Work toward the mission goal above. Use tools as needed. Only emit your final result after the exit checklist is satisfied, or after you have written a blocker handoff explaining exactly why it cannot be satisfied.`,
   );
 
   return sections.join("\n\n");

@@ -12,7 +12,7 @@ import { Container, MessageBus, PermissionEngine } from "@yaaa/platform";
 import { SqliteStore, FilesFs, MeshGateway, CmdTool, WebSearchTool, ChromiumTool } from "@yaaa/providers";
 import { ChatOpenAI } from "@langchain/openai";
 import { BaseChatModel } from "@langchain/core/language_models/chat_models";
-import { AIMessage } from "@langchain/core/messages";
+import { AIMessage, type BaseMessage } from "@langchain/core/messages";
 import type { ChatResult as LcChatResult } from "@langchain/core/outputs";
 
 /**
@@ -28,11 +28,22 @@ class MockWorkerChatModel extends BaseChatModel {
   _llmType() {
     return "yaaa-mock-worker";
   }
-  async _generate(): Promise<LcChatResult> {
-    const text =
-      this.roleOrModel === "verifier"
-        ? JSON.stringify({ status: "passed", summary: "Mock verification: all stated criteria appear satisfied.", findings: [], evidence: ["Deterministic mock-mode verification"] })
-        : "Mock mode: subtask completed (no live model configured).";
+  async _generate(messages: BaseMessage[]): Promise<LcChatResult> {
+    // A verifier subtask is usually created with an explicit model id (e.g.
+    // "anthropic/claude-haiku-4.5") rather than the bare "verifier" role, so the
+    // role name alone isn't enough to know this is a verification turn. Detect
+    // the verifier contract from the prompt too — the verifier system prompts all
+    // require the {"status":"passed"|"failed"} JSON shape — so mock mode always
+    // returns a well-formed verifier verdict instead of prose that fails parsing.
+    const joined = messages
+      .map((m) => (typeof m.content === "string" ? m.content : ""))
+      .join("\n");
+    const isVerifier =
+      this.roleOrModel === "verifier" ||
+      /"status"\s*:\s*"passed"\s*\|\s*"failed"/i.test(joined);
+    const text = isVerifier
+      ? JSON.stringify({ status: "passed", summary: "Mock verification: all stated criteria appear satisfied.", findings: [], evidence: ["Deterministic mock-mode verification"] })
+      : "Mock mode: subtask completed (no live model configured).";
     const message = new AIMessage({ content: text });
     return { generations: [{ text, message }] };
   }
@@ -251,14 +262,19 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   scope.register("IBus", bus);
   scope.register("PermissionEngine", permissions);
   scope.register("IMeshGateway", gateway);
+  // The agent's file-permission scope must be anchored to the SAME directory the
+  // file provider writes to (config.workingDir), not process.cwd() — the Electron
+  // process cwd is a different directory from the per-task workspace, and that
+  // mismatch previously denied legitimate task-relative writes.
+  scope.register("workingDir", config.workingDir);
 
   // Chat-model factory for worker/verifier ReAct agents. LangGraph's
   // createReactAgent needs a LangChain chat model; Mesh is OpenAI-compatible, so
   // ChatOpenAI is pointed at the Mesh base URL. (The planner/synthesizer/intent
   // paths keep using MeshGateway above; only the inner worker loop uses this.)
   const WORKER_MODEL_DEFAULTS: Record<ModelRole, string> = {
-    planner: "anthropic/claude-sonnet-5",
-    worker: "anthropic/claude-sonnet-5",
+    planner: "google/gemini-2.5-flash",
+    worker: "google/gemini-2.5-flash",
     verifier: "anthropic/claude-haiku-4.5",
     utility: "anthropic/claude-haiku-4.5",
   };

@@ -404,7 +404,7 @@ describe("DashboardView", () => {
 
     expect(screen.getByRole("tree", { name: "Mission artifacts" })).toBeTruthy();
     expect(screen.getByRole("group", { name: "Plans" })).toBeTruthy();
-    expect(screen.getByRole("group", { name: "Agent handoffs" })).toBeTruthy();
+    expect(screen.getByRole("group", { name: "Agent artifacts" })).toBeTruthy();
     expect(screen.getByRole("group", { name: "Generated media" })).toBeTruthy();
     expect(screen.getByRole("group", { name: "Documents & files" })).toBeTruthy();
     expect(
@@ -416,6 +416,29 @@ describe("DashboardView", () => {
     expect(screen.getByText("HANDS OFF")).toBeTruthy();
     expect(screen.getByText("Video")).toBeTruthy();
     expect(screen.getAllByText("agents / builder")).toHaveLength(2);
+  });
+
+  it("collapses agent artifact subgroups by default and expands them independently", () => {
+    render(<DashboardView viewModel={makeViewModel({
+      taskId: "task-1",
+      artifacts: [
+        { path: "agents/builder/HANDS_ON.md", mimeType: "text/markdown", description: "Agent boundaries" },
+        { path: "agents/builder/HANDS_OFF.md", mimeType: "text/markdown", description: "Completed changes" },
+      ],
+    })} />);
+
+    expect(screen.getByRole("group", { name: "Agent artifacts" })).toBeTruthy();
+    const toggle = screen.getByRole("button", { name: /builder/i });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText("HANDS ON")).toBeNull();
+
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText("HANDS ON")).toBeTruthy();
+
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText("HANDS ON")).toBeNull();
   });
 
   it("lists registered MCP servers in Active Integrations with their consent state", async () => {

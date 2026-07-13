@@ -241,14 +241,41 @@ export class PermissionEngine {
     return scope.capabilities.includes(call.capability);
   }
 
+  /**
+   * Every file-tool argument that names a path. Older code only inspected
+   * `path`/`dirPath`, so calls that route their target through `source`,
+   * `destination`, or `outputPath` (move/copy/screenshot/generate_image)
+   * escaped the workspace-boundary check entirely.
+   */
+  private static readonly FILE_PATH_ARG_KEYS = [
+    "path",
+    "dirPath",
+    "source",
+    "destination",
+    "outputPath",
+  ] as const;
+
   private isResourceAllowed(scope: AgentScope, call: ToolCall): boolean {
     if (call.capability !== "files") return true;
-    const targetPath = call.args.path || call.args.dirPath;
-    if (typeof targetPath !== "string") return true;
+    const targetPaths = PermissionEngine.FILE_PATH_ARG_KEYS
+      .map((key) => call.args[key])
+      .filter((value): value is string => typeof value === "string");
+    if (targetPaths.length === 0) return true;
 
-    const absoluteTargetPath = path.resolve(targetPath);
-    return scope.allowedPaths.some((allowedPath) =>
-      this.isWithinPath(absoluteTargetPath, path.resolve(allowedPath)),
+    // Every path-bearing argument must resolve inside one of the granted roots.
+    // Relative paths are anchored to each allowed root — the task workspace base
+    // — mirroring how the file provider resolves task-relative paths. Resolving
+    // against `process.cwd()` (the old behaviour) is wrong: the Electron process
+    // cwd is a different directory from the per-task workspace, so legitimate
+    // task-relative writes were being denied.
+    return targetPaths.every((targetPath) =>
+      scope.allowedPaths.some((allowedPath) => {
+        const root = path.resolve(allowedPath);
+        const resolved = path.isAbsolute(targetPath)
+          ? path.resolve(targetPath)
+          : path.resolve(root, targetPath);
+        return this.isWithinPath(resolved, root);
+      }),
     );
   }
 
@@ -300,6 +327,12 @@ export class PermissionEngine {
     scope: AgentScope,
     call: ToolCall,
   ): PermissionDecision {
+    // File operations inside the agent's granted workspace never prompt. The
+    // workspace boundary is already enforced by isResourceAllowed/allowedPaths
+    // (a denied scope short-circuits before this runs in checkCall), so a
+    // path-scoped file write is safe to auto-run. An explicit user policy can
+    // still override this to "confirm"/"deny" per capability+method.
+    if (call.capability === "files") return "auto";
     if (this.isRiskyShellCall(call)) return "confirm";
     if (scope.riskCeiling === "low" && call.capability === "shell")
       return "confirm";

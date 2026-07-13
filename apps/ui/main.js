@@ -96,7 +96,7 @@ function forwardRuntimeEvent(taskId, event) {
     case "tool-requested":
       sendToRenderer("task-event", {
         topic: `task.${taskId}.agent.${event.from}.tool_requested`,
-        data: { content: event.content },
+        data: { content: event.content, metadata: event.metadata },
       });
       break;
     case "agent-status":

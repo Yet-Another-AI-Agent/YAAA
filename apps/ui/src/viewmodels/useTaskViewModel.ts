@@ -89,7 +89,7 @@ export function useTaskViewModel() {
             setSubtasks(data.subtasks);
             const producedArtifacts: UIArtifact[] = [];
             data.subtasks.forEach((st: any) => {
-              if (st.state === "completed" && st.artifacts) {
+              if (st.artifacts) {
                 producedArtifacts.push(...st.artifacts);
               }
             });
@@ -125,7 +125,7 @@ export function useTaskViewModel() {
 
         else if (topic.endsWith(".tool_requested")) {
           const agentName = topic.split(".").find((p) => p.includes("agent-")) || "agent";
-          addLog("agent", `🛠️ ${agentName}: ${data.content}`, "activity");
+          addLog("agent", `🛠️ ${agentName}: ${data.content}`, "activity", data.metadata);
         }
 
         else if (topic.includes("topic_updated")) {

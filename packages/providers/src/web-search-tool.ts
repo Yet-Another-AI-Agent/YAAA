@@ -1,4 +1,7 @@
 import * as cheerio from "cheerio";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { chromium } from "playwright";
 import { renderTextScreenshot } from "./screenshot.js";
 
@@ -21,6 +24,14 @@ interface UiSearchOptions extends Required<Pick<SearchOptions, "limit">> {
 }
 
 type UiSearcher = (query: string, options: UiSearchOptions) => Promise<SearchResult[]>;
+
+function attachScreenshotPath(results: SearchResult[], screenshotPath: string): SearchResult[] {
+  Object.defineProperty(results, "screenshotPath", {
+    value: screenshotPath,
+    enumerable: false,
+  });
+  return results;
+}
 
 function normalizeResults(results: SearchResult[], limit: number): SearchResult[] {
   const seen = new Set<string>();
@@ -78,7 +89,15 @@ async function searchBingBrowser(query: string, options: UiSearchOptions): Promi
         };
       }),
     ) as SearchResult[];
-    return normalizeResults(results, options.limit);
+    const normalized = normalizeResults(results, options.limit);
+    try {
+      const screenshotPath = path.join(os.tmpdir(), "yaaa-tool-previews", `web-search-${crypto.randomUUID()}.png`);
+      await fs.mkdir(path.dirname(screenshotPath), { recursive: true });
+      await page.screenshot({ path: screenshotPath, fullPage: false });
+      return attachScreenshotPath(normalized, screenshotPath);
+    } catch {
+      return normalized;
+    }
   } finally {
     await browser.close();
   }

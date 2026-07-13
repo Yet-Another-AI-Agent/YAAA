@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildArtifactExplorer } from "./artifactExplorer";
+import { buildArtifactExplorer, groupEntriesByAgent } from "./artifactExplorer";
 
 describe("buildArtifactExplorer", () => {
   it("groups plan, lifecycle, media, and general artifacts with tree metadata", () => {
@@ -34,5 +34,37 @@ describe("buildArtifactExplorer", () => {
     expect(groups[0].entries).toEqual([
       expect.objectContaining({ normalizedPath: "reports/summary.md", description: "Latest" }),
     ]);
+  });
+
+  it("classifies proofOfWork as an agent artifact, tags the owner, and keeps deliverables in files", () => {
+    const groups = buildArtifactExplorer([
+      { path: "agent-workspaces/qa-7/handsOn.md", mimeType: "text/markdown", description: "Assignment" },
+      { path: "agent-workspaces/qa-7/proofOfWork.md", mimeType: "text/markdown", description: "Proof" },
+      { path: "solarSystemCurriculum.md", mimeType: "text/markdown", description: "Deliverable" },
+    ]);
+
+    const handoffs = groups.find((group) => group.id === "handoffs")!;
+    const proof = handoffs.entries.find((entry) => entry.name === "proofOfWork.md")!;
+    expect(proof.handoffKind).toBe("proof-of-work");
+    expect(proof.typeLabel).toBe("PROOF");
+    expect(proof.agentId).toBe("qa-7");
+
+    // A real deliverable stays under Documents & files, not agent artifacts.
+    const files = groups.find((group) => group.id === "files")!;
+    expect(files.entries.map((entry) => entry.name)).toContain("solarSystemCurriculum.md");
+  });
+
+  it("buckets agent artifacts by owning agent, preserving first-seen order", () => {
+    const groups = buildArtifactExplorer([
+      { path: "agent-workspaces/a1/handsOn.md", mimeType: "text/markdown", description: "" },
+      { path: "agent-workspaces/a2/handsOn.md", mimeType: "text/markdown", description: "" },
+      { path: "agent-workspaces/a1/proofOfWork.md", mimeType: "text/markdown", description: "" },
+    ]);
+
+    const handoffs = groups.find((group) => group.id === "handoffs")!;
+    const byAgent = groupEntriesByAgent(handoffs.entries);
+    expect(byAgent.map((bucket) => bucket.agentId).sort()).toEqual(["a1", "a2"]);
+    const a1 = byAgent.find((bucket) => bucket.agentId === "a1")!;
+    expect(a1.entries.map((entry) => entry.name).sort()).toEqual(["handsOn.md", "proofOfWork.md"]);
   });
 });

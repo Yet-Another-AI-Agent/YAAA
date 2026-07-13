@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { container } from "@yaaa/platform";
 import type { IMeshGateway, IBus } from "@yaaa/interfaces";
-import { Planner, getRequestedAgentCount } from "./planner.js";
+import { Planner, getRequestedAgentCount, defaultModelForSubtask, MODEL_TIERS } from "./planner.js";
 
 describe("Planner", () => {
   let mockGateway: IMeshGateway;
@@ -37,7 +37,7 @@ describe("Planner", () => {
       "successCriteria": "facts.txt exists",
       "agentTemplate": "ResearcherAgent",
       "routingReason": "The work requires gathering and synthesizing facts.",
-      "model": "google/gemini-3.5-flash"
+      "model": "google/gemini-2.5-flash"
     }
   ]
 }
@@ -113,6 +113,21 @@ describe("Planner", () => {
     expect(userMsg).toContain('Create a task plan for this goal: "Write report"');
   });
 
+  it("instructs PPT plans to produce real decks with pptxgenjs", async () => {
+    let sentMessages: any[] = [];
+    (mockGateway.chat as any).mockImplementation(async (msgs: any[]) => {
+      sentMessages = msgs;
+      return { content: '```json\n{ "goal": "g", "subtasks": [] }\n```' };
+    });
+
+    await planner.plan("Create a 5 slide solar system PPT");
+
+    const systemMsg = sentMessages.find((m) => m.role === "system")?.content ?? "";
+    expect(systemMsg).toContain("real .pptx artifact generated with pptxgenjs");
+    expect(systemMsg).toContain("split slide research/content");
+    expect(systemMsg).toContain("stitches the final deck with pptxgenjs");
+  });
+
   it("does not publish reasoning when no taskId is given", async () => {
     (mockGateway.chat as any).mockImplementation(async (_msgs: any, opts: any) => {
       opts.onReasoning?.("thinking without a task");
@@ -161,5 +176,23 @@ describe("Planner", () => {
     expect(retryMessages.at(-1).content).toContain(
       "Each subtask spawns one agent",
     );
+  });
+});
+
+describe("defaultModelForSubtask", () => {
+  it("routes simple file/verify work to the cheapest tier", () => {
+    expect(defaultModelForSubtask({ capability: "files", riskLevel: "low" })).toBe(MODEL_TIERS.simple);
+    expect(defaultModelForSubtask({ capability: "verify", riskLevel: "low" })).toBe(MODEL_TIERS.simple);
+  });
+
+  it("routes docs/browser work to the mid tier", () => {
+    expect(defaultModelForSubtask({ capability: "docs", riskLevel: "low" })).toBe(MODEL_TIERS.medium);
+    expect(defaultModelForSubtask({ capability: "browser", riskLevel: "medium" })).toBe(MODEL_TIERS.medium);
+  });
+
+  it("routes engineering templates and high-risk work to the strongest tier", () => {
+    expect(defaultModelForSubtask({ capability: "files", agentTemplate: "PrincipalSweAgent" })).toBe(MODEL_TIERS.complex);
+    expect(defaultModelForSubtask({ capability: "docs", riskLevel: "high" })).toBe(MODEL_TIERS.complex);
+    expect(defaultModelForSubtask({ capability: "files", agentTemplate: "GraphicsEngineerAgent" })).toBe(MODEL_TIERS.complex);
   });
 });

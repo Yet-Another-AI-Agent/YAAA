@@ -1,60 +1,103 @@
 # YAAA
 
-Yet Another AI Agent is a desktop mission-control app for running teams of AI agents. You describe the outcome you want, YAAA plans the work, chooses the right agent and model for each part, watches execution, collects proof, and decides what should happen next.
+YAAA means **Yet Another AI Agent**.
 
-Most AI products still make the user act as the orchestrator. You ask one model for research, move to another for code, open a browser for sources, paste notes into a document tool, then manually remember what each step proved. YAAA moves that coordination into the system. It is designed to make working with agents feel less like managing a pile of tabs and more like directing a capable team.
+It is a desktop mission-control app for running teams of AI agents. You tell it what you want done. YAAA plans the work, chooses suitable agents and models, gives each agent instructions, watches progress, collects proof, and keeps the output in a task workspace.
 
-## Hackathon Pitch
+Think of it less like chatting with one bot and more like directing a small project team.
 
-**Project title:** YAAA (Yet Another AI Agent)
+## Start Here
 
-**Track:** Agents & Automation
+**To start YAAA on macOS or Linux, run:**
 
-**One-paragraph pitch:** YAAA is an autonomous multi-agent orchestration platform that changes how people interact with agents. Just as AiFiesta made many AI APIs easier to use through one subscription, YAAA gives users one place to launch, route, supervise, and continue complex agent work. Based on the task, YAAA decides which specialized agent and which model is the best fit, splits the mission into focused subtasks, gives each worker detailed instructions, then reviews each handoff before continuing. It can coordinate research agents, Codex-style coding agents, Claude Cowork-style document/workflow agents, browser agents, QA agents, and custom workers through a single mission layer powered by Mesh routing.
+```bash
+sh scripts/start-ui.sh
+```
 
-**Repo:** https://github.com/Yet-Another-AI-Agent/YAAA
+**To start YAAA on Windows, double-click or run:**
 
-**Mesh usage:** Mesh is used through the model gateway in `packages/providers/src/mesh-gateway.ts`, then wired into planning and execution through `packages/core/src/runtime.ts`, `packages/orchestrator/src/planner.ts`, and `packages/agents/src/runtime/inner-loop.ts`.
+```bat
+scripts\start-windows.bat
+```
 
-## What YAAA Does
+These startup files check for Node.js/npm, try to install missing prerequisites where possible, run `npm install`, rebuild Electron native modules, and launch the desktop app.
 
-YAAA turns one user goal into a supervised multi-agent workflow:
+If startup fails after installing Node.js, close and reopen your terminal so your PATH refreshes, then run the same command again.
 
-1. The user enters a mission.
-2. The orchestrator creates a structured plan.
-3. Each subtask is assigned to a specialized agent template and model.
-4. The orchestrator writes `handsOn.md` for the worker with detailed instructions.
-5. The worker executes using allowed tools such as files, shell, browser, docs, and verification.
-6. The worker creates proof of work and a final `handOff.md`.
-7. The orchestrator reads the handoff and decides whether to finish, revise, retry, or spin up another agent.
+## What You Can Do With It
 
-This means YAAA can course-correct mid-mission instead of blindly running a static plan.
+Use YAAA when a task needs more than one simple answer:
+
+- Research something and produce a verified report.
+- Create or inspect documents, slides, spreadsheets, images, and PDFs.
+- Ask agents to work in files, run commands, browse the web, and verify results.
+- Let one agent create work and another inspect it.
+- Keep handoff notes, proof, and artifacts organized automatically.
+
+YAAA stores task outputs under `~/.yaaa/tasks/<taskId>/working/`, so generated files are not meant to appear randomly in the code directory.
+
+## How It Feels In Use
+
+1. You enter a mission.
+2. YAAA proposes a plan.
+3. You accept or revise the plan.
+4. Specialist agents start working.
+5. The UI shows agent activity, browser/search evidence, generated artifacts, and proof of work.
+6. The orchestrator decides whether the work is done, needs revision, or should continue with another agent.
 
 ```mermaid
 flowchart LR
-    User["User goal"] --> Orchestrator["YAAA orchestrator"]
-    Orchestrator --> Plan["Mission plan"]
-    Plan --> HandsOn["handsOn.md"]
-    HandsOn --> Agent["Specialized worker agent"]
+    User["You describe a goal"] --> Orchestrator["YAAA orchestrator"]
+    Orchestrator --> Plan["Plan"]
+    Plan --> Agent["Specialized agents"]
+    Agent --> Artifacts["Files, screenshots, reports, decks"]
     Agent --> Proof["Proof of work"]
-    Proof --> HandOff["handOff.md"]
-    HandOff --> Orchestrator
-    Orchestrator --> Decision["Finish, revise, retry, or spawn next agent"]
+    Proof --> Orchestrator
+    Artifacts --> You["You inspect the result"]
 ```
 
-## Why It Matters
+## Why It Exists
 
-AI agents are powerful, but using them together is still awkward. The user has to know which tool to use, when to switch models, what context to copy, and how to verify the result. YAAA treats orchestration as the product.
+Most AI tools make the user act as the project manager. You decide which model to use, copy context between tools, open browser tabs, run commands, check output, and remember what has already been proven.
 
-- A planning agent breaks down the mission.
-- Mesh-backed model routing chooses suitable models for subtasks.
-- Specialized agents handle research, code, UI, documents, verification, operations, and browser tasks.
-- Handoffs preserve context so another agent can continue without starting from zero.
-- The Electron dashboard shows live status, artifacts, todos, working folders, and agent progress.
+YAAA moves that coordination into the system:
+
+- A planner breaks down the mission.
+- Mesh-backed routing picks models for the kind of work.
+- Agents get written instructions in `handsOn.md`.
+- Agents produce proof and handoff notes.
+- The app keeps task state, artifacts, and continuation context together.
+
+## Architecture
+
+YAAA is a TypeScript monorepo with an Electron dashboard on top of a local agent runtime.
+
+```mermaid
+graph TD
+    UI["apps/ui - Electron dashboard"] --> Core["packages/core - runtime API"]
+    Core --> Orchestrator["packages/orchestrator - planner, supervisor, synthesizer"]
+    Core --> Agents["packages/agents - worker execution loops"]
+    Agents --> Platform["packages/platform - DI, bus, permissions, pause"]
+    Platform --> Interfaces["packages/interfaces - contracts"]
+    Core --> Providers["packages/providers - Mesh, files, sqlite, browser, shell"]
+    Providers --> Mesh["Mesh API / model router"]
+    Providers --> TaskState["~/.yaaa/tasks/<taskId>"]
+```
+
+### Packages
+
+- `apps/ui`: Electron and React dashboard.
+- `packages/core`: runtime composition, task lifecycle, event API, workspace management.
+- `packages/orchestrator`: planning, supervision, synthesis, and routing decisions.
+- `packages/agents`: worker loops, agent registry, tool execution, verification flow.
+- `packages/platform`: dependency injection, permissions, message bus, pause/cancel support.
+- `packages/interfaces`: contracts for gateways, stores, files, buses, and capabilities.
+- `packages/providers`: Mesh, SQLite, filesystem, browser/search, shell, and screenshot providers.
+- `packages/shared`: shared schemas, events, types, errors, and mission context.
 
 ## Agent Workflow
 
-YAAA uses explicit handoff files so work is inspectable and resumable.
+YAAA uses explicit files so agent work is inspectable and resumable.
 
 ### `handsOn.md`
 
@@ -99,6 +142,7 @@ The planner can route subtasks to these agent templates:
 
 - `ResearcherAgent` for web research and factual synthesis.
 - `FilesAgent` for general file and document work.
+- `DocumentAgent` for reports, Markdown documents, PowerPoint/PPTX, slide outlines, speaker notes, spreadsheets, and non-code content artifacts.
 - `PrincipalSweAgent` for backend and complex software engineering.
 - `UiArchitectAgent` for frontend and interface engineering.
 - `GraphicsEngineerAgent` for rendering, geometry, graphics, and WebGL.
@@ -108,18 +152,16 @@ The planner can route subtasks to these agent templates:
 - `QaTesterAgent` for functional and automated verification.
 - `CvTesterAgent` for visual, screenshot, and GUI verification.
 
-YAAA is built so this roster can grow to include Claude Cowork-style agents, Codex-style coding workers, browser automation workers, document workers, and project-specific custom agents.
-
 ## Mesh Integration
 
 Mesh is the model routing layer. YAAA uses it to make task-specific model choices instead of sending every step to the same model.
 
 Current routing intent:
 
-- Planning and complex coding: stronger reasoning models such as Claude Sonnet-class models.
-- Research and general generation: Gemini-class models.
+- Default planning and worker execution: Gemini Flash-class models to keep routine agent turns fast and cost-effective.
+- Complex coding, architecture, hard debugging, and high-stakes product/layout decisions: Claude Sonnet-class models when explicitly assigned.
+- Research, browser/search tasks, document generation, and PPT/content creation: Gemini Flash-class models.
 - Verification and simple file QA: faster lightweight models.
-- Future routing: dynamically select between Claude, Codex-style workers, Cowork-style workers, and other model providers based on task type, cost, latency, and confidence.
 
 Important files:
 
@@ -132,7 +174,7 @@ When no API key is configured, YAAA includes deterministic mock behavior so loca
 
 ## Web Research
 
-YAAA uses browser UI search instead of the DuckDuckGo API path. This avoids the repeated anomaly/rate-limit failure pattern from API scraping. The current `web.search` implementation opens a browser-backed search page and extracts visible search results from the UI.
+YAAA uses browser UI search instead of a direct scraping API path. This avoids repeated anomaly/rate-limit failure patterns from API scraping. The current `web.search` implementation opens a browser-backed search page and extracts visible search results from the UI.
 
 Relevant file:
 
@@ -153,33 +195,6 @@ YAAA ships as an Electron dashboard. The app shows:
 
 The runtime runs in-process behind typed APIs. The UI does not scrape stdout from a CLI subprocess.
 
-## Architecture
-
-YAAA is a TypeScript monorepo with packages split by responsibility.
-
-```mermaid
-graph TD
-    UI["apps/ui - Electron dashboard"] --> Core["packages/core - runtime API"]
-    Core --> Orchestrator["packages/orchestrator - planner, supervisor, synthesizer"]
-    Core --> Agents["packages/agents - worker execution loops"]
-    Agents --> Platform["packages/platform - DI, bus, permissions, pause"]
-    Platform --> Interfaces["packages/interfaces - contracts"]
-    Core --> Providers["packages/providers - Mesh, files, sqlite, browser, shell"]
-    Providers --> Mesh["Mesh API / model router"]
-    Providers --> TaskState["~/.yaaa/tasks/<taskId>"]
-```
-
-### Packages
-
-- `apps/ui`: Electron and React dashboard.
-- `packages/core`: runtime composition, task lifecycle, event API, workspace management.
-- `packages/orchestrator`: planning, supervision, synthesis, and routing decisions.
-- `packages/agents`: worker loops, agent registry, tool execution, verification flow.
-- `packages/platform`: dependency injection, permissions, message bus, pause/cancel support.
-- `packages/interfaces`: contracts for gateways, stores, files, buses, and capabilities.
-- `packages/providers`: concrete integrations for Mesh, SQLite, filesystem, browser/search, shell, and screenshots.
-- `packages/shared`: shared schemas, events, types, errors, and mission context.
-
 ## Local State
 
 YAAA stores user and task data under `~/.yaaa`.
@@ -189,21 +204,22 @@ YAAA stores user and task data under `~/.yaaa`.
 - `~/.yaaa/tasks/<taskId>/`: per-task database and working folder.
 - `~/.yaaa/tasks/<taskId>/working/agent-workspaces/<agentId>/`: agent-specific workspace files such as `handsOn.md`, proof of work, and `handOff.md`.
 
-## Getting Started
+## Technical Setup
 
 ### Requirements
 
-- Node.js 20.x is recommended.
-- npm 10.x is recommended.
-- macOS is the primary development target right now because the product is an Electron desktop app.
+- Node.js from `.nvmrc` is recommended.
+- npm is required.
+- macOS and Linux use `scripts/start-ui.sh`.
+- Windows uses `scripts/start-windows.cmd`.
 
-### Install
+Manual install:
 
 ```bash
 npm install
 ```
 
-### Run the app
+Manual run:
 
 ```bash
 npm start
@@ -227,26 +243,34 @@ npm run build
 npm test
 ```
 
-### Lint and format
+### Lint and Format
 
 ```bash
 npm run lint
 npm run format
 ```
 
-### End-to-end tests
+### End-to-End Tests
 
 ```bash
 npm run e2e
 ```
 
-### Electron native module rebuild
+### Electron Native Module Rebuild
 
 If `better-sqlite3` reports an Electron ABI mismatch:
 
 ```bash
 npm run rebuild:electron
 ```
+
+If tests report a `better-sqlite3` Node ABI mismatch after running the Electron app:
+
+```bash
+npm rebuild better-sqlite3
+```
+
+Electron and your system Node may require different native builds of the same module.
 
 ## Configuration
 
@@ -256,6 +280,7 @@ Useful runtime environment variables:
 
 - `YAAA_MAX_TURNS`: maximum worker loop turns before the agent is stopped.
 - `YAAA_AGENT_INVOKE_TIMEOUT_MS`: wall-clock timeout for one worker invocation.
+- `YAAA_AGENT_FIRST_PROGRESS_TIMEOUT_MS`: max wait for a worker model to produce its first tool progress before retrying.
 - `YAAA_TIMEOUT` or `MESH_TIMEOUT`: fallback timeout values for model calls.
 - `YAAA_MAX_TOOL_OUTPUT`: max characters from a tool observation fed back to a model.
 
@@ -266,6 +291,18 @@ Useful runtime environment variables:
 - E2E tests run with Playwright.
 - Formatting and linting use Biome at the root, with the UI also using oxlint.
 - The codebase is configured for `code-review-graph` to help agents navigate architecture and review changes.
+
+## Hackathon Pitch
+
+**Project title:** YAAA (Yet Another AI Agent)
+
+**Track:** Agents & Automation
+
+**One-paragraph pitch:** YAAA is an autonomous multi-agent orchestration platform that changes how people interact with agents. Just as AiFiesta made many AI APIs easier to use through one subscription, YAAA gives users one place to launch, route, supervise, and continue complex agent work. Based on the task, YAAA decides which specialized agent and which model is the best fit, splits the mission into focused subtasks, gives each worker detailed instructions, then reviews each handoff before continuing.
+
+**Repo:** https://github.com/Yet-Another-AI-Agent/YAAA
+
+**Mesh usage:** Mesh is used through the model gateway in `packages/providers/src/mesh-gateway.ts`, then wired into planning and execution through `packages/core/src/runtime.ts`, `packages/orchestrator/src/planner.ts`, and `packages/agents/src/runtime/inner-loop.ts`.
 
 ## Current Status
 
@@ -289,16 +326,6 @@ In progress:
 - Richer artifact indexing and preview.
 - More precise model routing heuristics.
 - Hosted demo and final hackathon video.
-
-## Submission Checklist
-
-- Registered Mesh email: add in the hackathon form.
-- Teammate emails: add if applicable.
-- GitHub repo URL: https://github.com/Yet-Another-AI-Agent/YAAA
-- Demo video URL: add Loom or YouTube link.
-- Pitch deck URL: optional.
-- Live demo URL: optional.
-- Mesh integration file: `packages/providers/src/mesh-gateway.ts`
 
 ## Vision
 

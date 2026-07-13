@@ -54,6 +54,60 @@ class HangingChatModel extends BaseChatModel {
   }
 }
 
+class ToolThenHangThenCheckpointChatModel extends BaseChatModel {
+  private turn = 0;
+  readonly seenTurns: BaseMessage[][] = [];
+  constructor() {
+    super({});
+  }
+  _llmType() {
+    return "tool-hang-checkpoint-test-model";
+  }
+  async _generate(messages: BaseMessage[]): Promise<ChatResult> {
+    this.seenTurns.push(messages);
+    this.turn++;
+    if (this.turn === 1) {
+      const message = toolCall("read_file", { path: "notes.md" });
+      return { generations: [{ text: "", message }] };
+    }
+    if (this.turn === 2) {
+      return new Promise(() => {});
+    }
+    const message = new AIMessage({
+      content: "Status: partial. Completed reading notes.md. Next agent should continue with a fresh timer.",
+    });
+    return { generations: [{ text: String(message.content), message }] };
+  }
+  override bindTools() {
+    return this;
+  }
+}
+
+class FailingThenScriptedChatModel extends BaseChatModel {
+  private turn = 0;
+  readonly seenTurns: BaseMessage[][] = [];
+  constructor(private readonly script: AIMessage[], private readonly error = new Error("temporary model failure")) {
+    super({});
+  }
+  _llmType() {
+    return "failing-then-scripted-test-model";
+  }
+  async _generate(messages: BaseMessage[]): Promise<ChatResult> {
+    this.seenTurns.push(messages);
+    if (this.turn === 0) {
+      this.turn++;
+      throw this.error;
+    }
+    const message = this.script[Math.min(this.turn - 1, this.script.length - 1)];
+    this.turn++;
+    const text = typeof message.content === "string" ? message.content : "";
+    return { generations: [{ text, message }] };
+  }
+  override bindTools() {
+    return this;
+  }
+}
+
 function toolCall(name: string, args: Record<string, unknown>, id = "call_1") {
   return new AIMessage({ content: "", tool_calls: [{ name, args, id, type: "tool_call" }] });
 }
@@ -160,6 +214,196 @@ describe("InnerLoop Worker Loop (ReAct)", () => {
         maxTurns: 2,
       }),
     ).rejects.toThrow("exceeded max turns of 2");
+  });
+
+  it("fails closed when the model returns only a synthetic tool transcript", async () => {
+    install([
+      new AIMessage({
+        content:
+          '[Assistant called tool list_files with arguments {"path":"agent-workspaces/browser-agent"}](no text content)',
+      }),
+    ]);
+
+    await expect(
+      innerLoop.run({
+        agentId: "tool-summary-agent",
+        taskId: "task-123",
+        templateName: "FilesAgent",
+        instruction: "produce the requested deliverable",
+      }),
+    ).rejects.toThrow("produced no deliverable artifacts");
+    expect(mockFilesProvider.writeFile).toHaveBeenCalledWith(
+      "agent-workspaces/tool-summary-agent/proofOfWork.md",
+      expect.stringContaining("Status: FAILED"),
+    );
+    expect(mockBus.publish).toHaveBeenCalledWith(
+      "task.task-123.agent_message",
+      expect.objectContaining({
+        kind: "result",
+        from: "tool-summary-agent",
+        summary: expect.stringContaining("produced no deliverable artifacts"),
+      }),
+    );
+  });
+
+  it("completes with incomplete work evidence when inspection work produces no deliverable artifacts", async () => {
+    install([
+      toolCall("list_files", { path: "." }, "call_list"),
+      new AIMessage({
+        content:
+          '[Assistant called tool list_files with arguments {"path":"."}](no text content)',
+      }),
+      new AIMessage({
+        content:
+          '[Assistant called tool list_files with arguments {"path":"."}](no text content)',
+      }),
+    ]);
+
+    const result = await innerLoop.run({
+      agentId: "inspection-agent",
+      taskId: "task-123",
+      templateName: "FilesAgent",
+      instruction: "produce the requested deliverable",
+    });
+
+    expect(result.summary).toContain("Subtask completed with produced artifacts");
+    expect(result.artifacts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: "agent-workspaces/inspection-agent/incompleteWork.md" }),
+        expect.objectContaining({ path: "agent-workspaces/inspection-agent/proofOfWork.md" }),
+        expect.objectContaining({ path: "agent-workspaces/inspection-agent/handOff.md" }),
+      ]),
+    );
+    expect(mockFilesProvider.writeFile).toHaveBeenCalledWith(
+      "agent-workspaces/inspection-agent/incompleteWork.md",
+      expect.stringContaining("files.listFiles (path: .): ok"),
+    );
+  });
+
+  it("promotes an existing deliverable read by the agent when final text is synthetic", async () => {
+    mockFilesProvider.readFile.mockResolvedValue("# Solar System Outline\n\nA High School Exploration Course");
+    install([
+      toolCall("read_file", { path: "solar_system_outline.md" }, "call_read_outline"),
+      new AIMessage({
+        content:
+          '[Assistant called tool read_file with arguments {"path":"solar_system_outline.md"}](no text content)',
+      }),
+    ]);
+
+    const result = await innerLoop.run({
+      agentId: "reader-agent",
+      taskId: "task-123",
+      templateName: "FilesAgent",
+      instruction: "verify or continue the requested deliverable",
+    });
+
+    expect(result.summary).toContain("Subtask completed with produced artifacts");
+    expect(result.artifacts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: "solar_system_outline.md",
+          description: expect.stringContaining("Existing deliverable inspected"),
+        }),
+      ]),
+    );
+  });
+
+  it("completes from produced artifacts when the final text is only a synthetic tool transcript", async () => {
+    install([
+      toolCall("write_file", { path: "solar_system_outline.md", content: "# Outline" }),
+      new AIMessage({
+        content:
+          '[Assistant called tool write_file with arguments {"path":"solar_system_outline.md"}](no text content)',
+      }),
+    ]);
+
+    const result = await innerLoop.run({
+      agentId: "artifact-agent",
+      taskId: "task-123",
+      templateName: "FilesAgent",
+      instruction: "produce the requested deliverable",
+    });
+
+    expect(result.summary).toContain("Subtask completed with produced artifacts");
+    expect(result.artifacts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: "solar_system_outline.md" }),
+        expect.objectContaining({ path: "agent-workspaces/artifact-agent/proofOfWork.md" }),
+        expect.objectContaining({ path: "agent-workspaces/artifact-agent/handOff.md" }),
+      ]),
+    );
+    expect(mockBus.publish).toHaveBeenCalledWith(
+      "task.task-123.agent_message",
+      expect.objectContaining({
+        kind: "result",
+        from: "artifact-agent",
+        summary: expect.stringContaining("solar_system_outline.md"),
+      }),
+    );
+  });
+
+  it("asks for one continuation when a synthetic tool transcript produced no artifacts", async () => {
+    install([
+      new AIMessage({
+        content:
+          '[Assistant called tool list_files with arguments {"path":"agent-workspaces"}](no text content)',
+      }),
+      toolCall("write_file", { path: "solar_system_outline.md", content: "# Outline" }, "call_after_nudge"),
+      new AIMessage({ content: "Created and verified solar_system_outline.md." }),
+    ]);
+
+    const result = await innerLoop.run({
+      agentId: "continue-agent",
+      taskId: "task-123",
+      templateName: "FilesAgent",
+      instruction: "produce the requested deliverable",
+    });
+
+    expect(result.summary).toContain("Created and verified");
+    expect(result.artifacts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: "solar_system_outline.md" }),
+        expect.objectContaining({ path: "agent-workspaces/continue-agent/proofOfWork.md" }),
+        expect.objectContaining({ path: "agent-workspaces/continue-agent/handOff.md" }),
+      ]),
+    );
+    expect(mockBus.publish).toHaveBeenCalledWith(
+      "task.task-123.agent.continue-agent.thought",
+      expect.objectContaining({
+        content: expect.stringContaining("self-introspection"),
+      }),
+    );
+  });
+
+  it("self-introspects and recovers from a recoverable model failure", async () => {
+    const recovering = new FailingThenScriptedChatModel([
+      toolCall("write_file", { path: "recovered.md", content: "# Recovered" }, "call_recover"),
+      new AIMessage({ content: "Recovered by changing approach and wrote recovered.md." }),
+    ]);
+    container.register("ChatModelFactory", () => recovering);
+    innerLoop = new InnerLoop();
+
+    const result = await innerLoop.run({
+      agentId: "recover-agent",
+      taskId: "task-123",
+      templateName: "FilesAgent",
+      instruction: "produce the requested deliverable",
+    });
+
+    expect(result.summary).toContain("Recovered by changing approach");
+    expect(result.artifacts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: "recovered.md" }),
+        expect.objectContaining({ path: "agent-workspaces/recover-agent/proofOfWork.md" }),
+        expect.objectContaining({ path: "agent-workspaces/recover-agent/handOff.md" }),
+      ]),
+    );
+    expect(mockBus.publish).toHaveBeenCalledWith(
+      "task.task-123.agent.recover-agent.thought",
+      expect.objectContaining({
+        content: expect.stringContaining("self-introspection"),
+      }),
+    );
   });
 
   it("returns a tool error to the model so it can recover, not crashing the run", async () => {
@@ -278,8 +522,67 @@ describe("InnerLoop Worker Loop (ReAct)", () => {
         "task.task-123.agent.hung-agent.thought",
         expect.objectContaining({ content: expect.stringContaining("Waiting for FilesAgent model response") }),
       );
+      expect(mockBus.publish).toHaveBeenCalledWith(
+        "task.task-123.agent.hung-agent.tool_requested",
+        expect.objectContaining({ content: expect.stringContaining("hung-agent: model.invoke") }),
+      );
+      expect(mockFilesProvider.writeFile).toHaveBeenCalledWith(
+        "agent-workspaces/hung-agent/proofOfWork.md",
+        expect.stringContaining("Status: FAILED"),
+      );
+      expect(mockFilesProvider.writeFile).toHaveBeenCalledWith(
+        "agent-workspaces/hung-agent/handOff.md",
+        expect.stringContaining("Tool progress observed before failure: No"),
+      );
+      expect(mockBus.publish).toHaveBeenCalledWith(
+        "task.task-123.agent_message",
+        expect.objectContaining({
+          kind: "result",
+          from: "hung-agent",
+          artifacts: expect.arrayContaining([
+            expect.objectContaining({ path: "agent-workspaces/hung-agent/proofOfWork.md" }),
+            expect.objectContaining({ path: "agent-workspaces/hung-agent/handOff.md" }),
+          ]),
+        }),
+      );
     } finally {
       delete process.env.YAAA_AGENT_INVOKE_TIMEOUT_MS;
+    }
+  });
+
+  it("asks for a checkpoint after timing out with tool progress", async () => {
+    process.env.YAAA_AGENT_INVOKE_TIMEOUT_MS = "20";
+    process.env.YAAA_AGENT_CHECKPOINT_TIMEOUT_MS = "50";
+    const model = new ToolThenHangThenCheckpointChatModel();
+    container.register("ChatModelFactory", () => model);
+    innerLoop = new InnerLoop();
+
+    try {
+      const result = await innerLoop.run({
+        agentId: "checkpoint-agent",
+        taskId: "task-123",
+        templateName: "FilesAgent",
+        instruction: "read notes and produce output",
+      });
+
+      expect(result.incomplete).toBe(true);
+      expect(result.summary).toContain("Checkpoint");
+      expect(result.summary).toContain("Completed reading notes.md");
+      expect(mockFilesProvider.writeFile).toHaveBeenCalledWith(
+        "agent-workspaces/checkpoint-agent/incompleteWork.md",
+        expect.stringContaining("Agent Checkpoint"),
+      );
+      expect(mockFilesProvider.writeFile).toHaveBeenCalledWith(
+        "agent-workspaces/checkpoint-agent/handOff.md",
+        expect.stringContaining("- Status: INCOMPLETE"),
+      );
+      expect(mockBus.publish).toHaveBeenCalledWith(
+        "task.task-123.agent.checkpoint-agent.thought",
+        expect.objectContaining({ content: expect.stringContaining("Asking agent for a checkpoint") }),
+      );
+    } finally {
+      delete process.env.YAAA_AGENT_INVOKE_TIMEOUT_MS;
+      delete process.env.YAAA_AGENT_CHECKPOINT_TIMEOUT_MS;
     }
   });
 

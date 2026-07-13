@@ -63,6 +63,60 @@ describe("PermissionEngine", () => {
     expect(await engine.checkCall("agent-1", outsideCall)).toBe("deny");
   });
 
+  it("anchors task-relative paths to the granted workspace root, not process.cwd()", async () => {
+    // The workspace lives somewhere other than the current process cwd.
+    const workspaceRoot = path.join(process.cwd(), "tasks", "abc123", "working");
+    engine.grantScope("agent-1", {
+      ...defaultScope,
+      allowedPaths: [workspaceRoot],
+    });
+
+    // A task-relative path is valid: it resolves inside the workspace root even
+    // though it would resolve elsewhere against process.cwd().
+    await expect(
+      engine.checkCall("agent-1", {
+        id: "c-rel",
+        capability: "files",
+        method: "writeFile",
+        args: { path: "agent-workspaces/w1/handOff.md" },
+      }),
+    ).resolves.toBe("auto");
+
+    // An absolute path outside the workspace is still denied.
+    await expect(
+      engine.checkCall("agent-1", {
+        id: "c-abs",
+        capability: "files",
+        method: "writeFile",
+        args: { path: path.join(process.cwd(), "escape.md") },
+      }),
+    ).resolves.toBe("deny");
+  });
+
+  it("checks source/destination/outputPath args, not just path/dirPath", async () => {
+    engine.grantScope("agent-1", defaultScope);
+
+    // move_path escaping the workspace via `destination` must be denied.
+    await expect(
+      engine.checkCall("agent-1", {
+        id: "c-mv",
+        capability: "files",
+        method: "move",
+        args: { source: "deck.pptx", destination: "../../../tmp/deck.pptx" },
+      }),
+    ).resolves.toBe("deny");
+
+    // generate_image writing via `outputPath` inside the workspace is allowed.
+    await expect(
+      engine.checkCall("agent-1", {
+        id: "c-img",
+        capability: "files",
+        method: "generateImage",
+        args: { prompt: "a plant cell", outputPath: "images/cell.png" },
+      }),
+    ).resolves.toBe("auto");
+  });
+
   it("should return confirm for risky shell commands", async () => {
     engine.grantScope("agent-1", defaultScope);
 

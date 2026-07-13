@@ -1,7 +1,7 @@
 import { useRef, useEffect, useState, useMemo } from "react";
 import logoImg from "../assets/logo.jpg";
 import type { TaskViewModel } from "../viewmodels/useTaskViewModel";
-import { TaskModel } from "../models/TaskModel";
+import { TaskModel, type UIAgent } from "../models/TaskModel";
 import { AnnotationOverlay } from "../components/AnnotationOverlay";
 import { ArchitectureViewer, getMediaKind } from "../components/ArchitectureViewer";
 import { ApiKeyModal } from "../components/ApiKeyModal";
@@ -11,6 +11,7 @@ import {
   RichMessageContent,
   UniversalViewer,
   inferViewerKind,
+  isLargeMarkdown,
   type ViewerSpec,
 } from "../components/UniversalViewer";
 import {
@@ -19,8 +20,9 @@ import {
   isActiveAgent,
   isAgentLifecycleLog,
 } from "../utils/agentWorkspace";
+import type { UILog } from "../viewmodels/useLogState";
 import { renderMarkdown } from "../utils/simpleMarkdown";
-import { buildArtifactExplorer } from "../utils/artifactExplorer";
+import { buildArtifactExplorer, groupEntriesByAgent, type ArtifactExplorerEntry } from "../utils/artifactExplorer";
 import {
   ORCHESTRATOR_DISPLAY,
   agentIdentity,
@@ -81,6 +83,131 @@ const SUGGESTION_CHIPS = [
   "Draft a project summary doc",
   "Search the web for latest AI news",
 ];
+
+function metadataText(metadata: Record<string, unknown> | undefined, key: string): string | null {
+  const value = metadata?.[key];
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function previewImageSrc(path: string): string {
+  if (/^(?:https?:|file:|data:)/.test(path)) return path;
+  return `file://${encodeURI(path)}`;
+}
+
+function toolLabel(metadata: Record<string, unknown> | undefined): string | null {
+  const capability = metadataText(metadata, "capability");
+  const method = metadataText(metadata, "method");
+  if (!capability || !method) return null;
+  return `${capability}.${method}`;
+}
+
+function formatElapsed(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainingSeconds = seconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m ${remainingSeconds}s`;
+  if (minutes > 0) return `${minutes}m ${remainingSeconds}s`;
+  return `${remainingSeconds}s`;
+}
+
+function AgentWorkingStatus({ agent, activity }: { agent: UIAgent; activity: UILog[] }) {
+  const active = ["planned", "working", "blocked"].includes(agent.status);
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    if (!active) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [active]);
+
+  if (!active) return null;
+
+  const startedAt = agent.startedAt ? Date.parse(agent.startedAt) : NaN;
+  const startedMs = Number.isFinite(startedAt) ? startedAt : activity[0]?.createdAt ?? now;
+  const latest = [...activity].reverse().find((log) => log.kind === "activity") ?? activity.at(-1);
+  const latestMs = latest?.createdAt;
+  const latestText = latest?.content.replace(/^🛠️\s*/, "") || "Waiting for first activity update.";
+  const latestLabel = latest
+    ? `Last update ${latestMs ? `${formatElapsed(now - latestMs)} ago` : "just now"}`
+    : "Waiting for first update";
+
+  return (
+    <div className="thread-live-status" role="status" aria-live="polite">
+      <span className="thread-live-dot" aria-hidden="true" />
+      <span>Working for {formatElapsed(now - startedMs)}</span>
+      <span className="thread-live-muted">{latestLabel}</span>
+      <span className="thread-live-action">{latestText}</span>
+    </div>
+  );
+}
+
+function ActivityPreview({ log }: { log: UILog }) {
+  const metadata = log.metadata;
+  const screenshotPath = metadataText(metadata, "screenshotPath");
+  const screenshotDataUrl = metadataText(metadata, "screenshotDataUrl");
+  const command = metadataText(metadata, "command");
+  const query = metadataText(metadata, "query");
+  const url = metadataText(metadata, "url");
+  const path = metadataText(metadata, "path");
+  const stdout = metadataText(metadata, "stdout");
+  const stderr = metadataText(metadata, "stderr");
+  const title = metadataText(metadata, "title");
+  const label = toolLabel(metadata);
+  const results = Array.isArray(metadata?.results) ? metadata.results.slice(0, 3) : [];
+  const hasPreviewMedia = Boolean(screenshotPath || screenshotDataUrl);
+  const hasCommandTranscript = Boolean(command && (stdout || stderr));
+  const hasResultDetails = results.length > 0 || Boolean(stdout || stderr);
+  const showDetails = hasPreviewMedia || hasCommandTranscript || hasResultDetails;
+
+  return (
+    <div className={`agent-space-action-row ${showDetails ? "with-details" : ""}`}>
+      <div className="agent-space-action-body">
+        <div className="agent-space-action-main">
+          {label && <span className="agent-space-tool-pill">{label}</span>}
+          <span className="agent-space-action-text">{log.content}</span>
+        </div>
+        {showDetails && (
+          <div className={`agent-space-action-details ${screenshotDataUrl || screenshotPath ? "" : "no-thumbnail"}`}>
+            {(screenshotDataUrl || screenshotPath) && (
+              <img
+                className="agent-space-action-thumbnail"
+                src={screenshotDataUrl || previewImageSrc(screenshotPath || "")}
+                alt={title || query || url || "Tool preview"}
+              />
+            )}
+            <div className="agent-space-action-meta">
+              {title && <div className="agent-space-action-title">{title}</div>}
+              {query && results.length > 0 && <div className="agent-space-action-line"><span>Query</span>{query}</div>}
+              {url && hasPreviewMedia && <div className="agent-space-action-line"><span>URL</span>{url}</div>}
+              {path && hasPreviewMedia && <div className="agent-space-action-line"><span>Path</span>{path}</div>}
+              {command && <pre className="agent-space-command"><code>$ {command}</code></pre>}
+              {stdout && <pre className="agent-space-output"><code>{stdout}</code></pre>}
+              {stderr && <pre className="agent-space-output error"><code>{stderr}</code></pre>}
+              {results.length > 0 && (
+                <div className="agent-space-results">
+                  {results.map((result, index) => {
+                    const item = result && typeof result === "object" ? result as Record<string, unknown> : {};
+                    const resultTitle = typeof item.title === "string" ? item.title : `Result ${index + 1}`;
+                    const resultUrl = typeof item.url === "string" ? item.url : "";
+                    const description = typeof item.description === "string" ? item.description : "";
+                    return (
+                      <div className="agent-space-result" key={`${resultTitle}-${index}`}>
+                        <div className="agent-space-result-title">{resultTitle}</div>
+                        {resultUrl && <div className="agent-space-result-url">{resultUrl}</div>}
+                        {description && <div className="agent-space-result-description">{description}</div>}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 interface ParsedOrchestrator {
   taskId: string;
@@ -343,6 +470,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   const [artifactPreviewError, setArtifactPreviewError] = useState<string | null>(null);
   const [annotating, setAnnotating] = useState(false);
   const [viewerModal, setViewerModal] = useState<ViewerSpec | null>(null);
+  const [expandedAgentArtifactGroups, setExpandedAgentArtifactGroups] = useState<Set<string>>(new Set());
   const activeArtifactRequestRef = useRef(0);
 
   // Plan review modal: view the proposed orchestrator.md, comment on it, then
@@ -651,6 +779,37 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     setRejecting(false);
   };
 
+  // Esc closes the top-most open popup, peeling nested popups off one at a time
+  // (e.g. a document viewer opened over the agent thread closes first, revealing
+  // the thread; a second Esc closes the thread). Repeated Esc therefore closes
+  // every popup. The API-key gate is intentionally excluded — it is a required
+  // step, not a dismissible popup.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      // When focus is in an editable field, Esc belongs to that field (e.g.
+      // cancelling an inline annotation edit), not to closing the popup.
+      const target = event.target as HTMLElement | null;
+      if (target && (target.tagName === "TEXTAREA" || target.tagName === "INPUT" || target.isContentEditable)) {
+        return;
+      }
+      if (viewerModal) {
+        setViewerModal(null);
+      } else if (planReviewOpen) {
+        handleClosePlanReview();
+      } else if (artifactPreview) {
+        handleClosePreview();
+      } else if (openThreadAgentId) {
+        setOpenThreadAgentId(null);
+      } else {
+        return;
+      }
+      event.stopPropagation();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [viewerModal, planReviewOpen, artifactPreview, openThreadAgentId]);
+
   const handleAcceptPlan = () => {
     const comment = planComment;
     const { targetTaskId, wasSelected } = activateSelectedPlan();
@@ -925,13 +1084,20 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
         assignmentParts.push(`Success criteria: ${(subtask as any).successCriteria}`);
       }
       const assignment = assignmentParts.join("\n\n") || "Assignment briefing pending.";
-      const artifacts = ((subtask as any)?.artifacts || []) as Array<{ path?: string; description?: string }>;
+      const subtaskArtifacts = ((subtask as any)?.artifacts || []) as Array<{ path?: string; description?: string; mimeType?: string }>;
+      const agentWorkspacePrefix = `agent-workspaces/${agent.id}/`;
+      const artifacts = [...subtaskArtifacts, ...displayArtifacts].filter((artifact, index, all) => {
+        const path = String(artifact.path || "");
+        return path.startsWith(agentWorkspacePrefix) && all.findIndex((candidate) => candidate.path === artifact.path) === index;
+      });
+      const handsOnArtifact = artifacts.find((artifact) => /(?:^|\/)handsOn\.md$/i.test(String(artifact.path || "")));
       const handOffArtifact = artifacts.find((artifact) => /(?:^|\/)handOff\.md$/i.test(String(artifact.path || "")));
+      const proofArtifact = artifacts.find((artifact) => /(?:^|\/)proofOfWork\.md$/i.test(String(artifact.path || "")));
       const handoffReady = ["completed", "failed", "exited"].includes(agent.status) && Boolean(agent.summary || handOffArtifact);
       const handoff = agent.summary || (handOffArtifact ? `${handOffArtifact.path}\n\n${handOffArtifact.description || "Agent handoff artifact ready."}` : "");
-      return { agent, subtask, activity, assignment, handoff, handoffReady, handOffArtifact };
+      return { agent, subtask, activity, assignment, handoff, handoffReady, handsOnArtifact, handOffArtifact, proofArtifact };
     });
-  }, [agents, displaySubtasks, logs]);
+  }, [agents, displaySubtasks, displayArtifacts, logs]);
 
   const openThread = openThreadAgentId
     ? missionThreads.find((t) => t.agent.id === openThreadAgentId) || null
@@ -966,15 +1132,70 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     [agentCardByMessageId],
   );
 
+  // One row in the artifact explorer. Extracted so both the flat groups and the
+  // per-agent sub-groups (agent artifacts) render identically.
+  const renderArtifactItem = (art: ArtifactExplorerEntry, groupLabel: string) => (
+    <div
+      key={art.normalizedPath}
+      className="artifact-item"
+      role="treeitem"
+      aria-label={`${groupLabel}: ${art.name}`}
+      data-artifact-kind={art.groupId}
+      aria-level={Math.max(1, art.depth + 1)}
+    >
+      <div className="artifact-tree-branch" aria-hidden="true" />
+      <div className="artifact-item-copy">
+        {art.directorySegments.length > 0 && (
+          <div className="artifact-path">{art.directorySegments.join(" / ")}</div>
+        )}
+        <div className="artifact-name-row">
+          <span className="artifact-name">{art.name}</span>
+          <span className={`artifact-type-badge ${art.mediaKind || art.handoffKind || art.groupId}`}>
+            {art.typeLabel}
+          </span>
+        </div>
+        <div className="artifact-desc">{art.description}</div>
+      </div>
+      <div className="artifact-actions">
+        {isPreviewableArtifact(art.path) ? (
+          <button
+            type="button"
+            className="artifact-link"
+            onClick={() => handlePreviewArtifact(art.path)}
+          >
+            Open
+          </button>
+        ) : (
+          <span
+            className="artifact-link disabled"
+            title="Preview not supported for this file type yet"
+          >
+            Open
+          </span>
+        )}
+      </div>
+    </div>
+  );
+
+  const toggleAgentArtifactGroup = (agentId: string) => {
+    setExpandedAgentArtifactGroups((current) => {
+      const next = new Set(current);
+      if (next.has(agentId)) next.delete(agentId);
+      else next.add(agentId);
+      return next;
+    });
+  };
+
   // One collapsed card per spawned sub-agent: the assignment/handoff document
   // opens in the viewer, and "View channel" opens that agent's full sub-channel.
-  const renderMissionThreadCard = ({ agent, activity, assignment, handoff, handoffReady }: (typeof missionThreads)[number]) => {
+  const renderMissionThreadCard = ({ agent, activity, assignment, handoff, handoffReady, handsOnArtifact, handOffArtifact }: (typeof missionThreads)[number]) => {
     const identity = labelForSender(agent.id);
     const documentTitle = handoffReady ? "Handoff document" : "handsOn assignment";
     const documentHeading = handoffReady
       ? `${identity} → ${ORCHESTRATOR_DISPLAY} · Handoff`
       : `${ORCHESTRATOR_DISPLAY} → ${identity} · handsOn`;
     const documentBody = handoffReady ? handoff : assignment;
+    const documentArtifact = handoffReady ? handOffArtifact : handsOnArtifact;
     return (
       <div className="mission-thread-card" key={`card-${agent.id}`}>
         <div
@@ -995,7 +1216,9 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
             onClick={() =>
               setViewerModal({
                 type: "markdown",
-                source: { content: `# ${documentHeading}\n\n${documentBody}` },
+                source: documentArtifact?.path
+                  ? { path: documentArtifact.path }
+                  : { content: `# ${documentHeading}\n\n${documentBody}` },
                 display: "popup",
                 title: documentTitle,
               })
@@ -1373,7 +1596,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                       </div>
                       <div className={`slack-message-bubble ${senderLabel === 'User' ? 'slack-message-sender-user' : ''} ${msg.kind === 'response' ? 'slack-message-response' : ''} ${msg.kind === 'activity' ? 'slack-message-activity' : ''}`}>
                         <div className="slack-message-text">
-                          {(msg.id === displayMessages.filter(m => m.sender !== 'User' && m.kind === 'response').pop()?.id && !selectedTaskId && !msg.isHistorical && !typedMessageIds.has(msg.id) && !msg.content.includes("```yaaa-viewer")) ? (
+                          {(msg.id === displayMessages.filter(m => m.sender !== 'User' && m.kind === 'response').pop()?.id && !selectedTaskId && !msg.isHistorical && !typedMessageIds.has(msg.id) && !msg.content.includes("```yaaa-viewer") && !isLargeMarkdown(msg.content)) ? (
                             <TypingText text={msg.content} onComplete={() => handleTypeComplete(msg.id)} />
                           ) : (
                             <RichMessageContent
@@ -1585,48 +1808,38 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                             <span>{group.label}</span>
                             <span className="artifact-group-count">{group.entries.length}</span>
                           </div>
-                          {group.entries.map((art) => (
-                            <div
-                              key={art.normalizedPath}
-                              className="artifact-item"
-                              role="treeitem"
-                              aria-label={`${group.label}: ${art.name}`}
-                              data-artifact-kind={art.groupId}
-                              aria-level={Math.max(1, art.depth + 1)}
-                            >
-                              <div className="artifact-tree-branch" aria-hidden="true" />
-                              <div className="artifact-item-copy">
-                                {art.directorySegments.length > 0 && (
-                                  <div className="artifact-path">{art.directorySegments.join(" / ")}</div>
-                                )}
-                                <div className="artifact-name-row">
-                                  <span className="artifact-name">{art.name}</span>
-                                  <span className={`artifact-type-badge ${art.mediaKind || art.handoffKind || art.groupId}`}>
-                                    {art.typeLabel}
-                                  </span>
-                                </div>
-                                <div className="artifact-desc">{art.description}</div>
-                              </div>
-                              <div className="artifact-actions">
-                                {isPreviewableArtifact(art.path) ? (
+                          {group.id === "handoffs"
+                            ? (
+                              <div className="artifact-group-contents">
+                                {groupEntriesByAgent(group.entries).map(({ agentId, entries }) => {
+                                  const groupKey = agentId || "unassigned";
+                                  const expanded = expandedAgentArtifactGroups.has(groupKey);
+                                  return (
+                                <div className="artifact-agent-group" key={groupKey}>
                                   <button
                                     type="button"
-                                    className="artifact-link"
-                                    onClick={() => handlePreviewArtifact(art.path)}
+                                    className="artifact-agent-group-title artifact-agent-group-toggle"
+                                    aria-expanded={expanded}
+                                    aria-controls={`agent-artifacts-${groupKey}`}
+                                    onClick={() => toggleAgentArtifactGroup(groupKey)}
                                   >
-                                    Open
+                                    <span className="artifact-agent-toggle-label">
+                                      <span className={`artifact-group-chevron ${expanded ? "" : "collapsed"}`} aria-hidden="true">v</span>
+                                      <span>{agentId ? labelForSender(agentId) : "Unassigned"}</span>
+                                    </span>
+                                    <span className="artifact-agent-count">{entries.length}</span>
                                   </button>
-                                ) : (
-                                  <span
-                                    className="artifact-link disabled"
-                                    title="Preview not supported for this file type yet"
-                                  >
-                                    Open
-                                  </span>
-                                )}
+                                  {expanded && (
+                                    <div id={`agent-artifacts-${groupKey}`} className="artifact-agent-contents">
+                                      {entries.map((art) => renderArtifactItem(art, group.label))}
+                                    </div>
+                                  )}
+                                </div>
+                                  );
+                                })}
                               </div>
-                            </div>
-                          ))}
+                            )
+                            : group.entries.map((art) => renderArtifactItem(art, group.label))}
                         </section>
                       ))}
                     </div>
@@ -1831,7 +2044,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
       )}
 
       {viewerModal && (
-        <div className="artifact-preview-overlay" onClick={() => setViewerModal(null)} data-testid="universal-viewer-modal">
+        <div className="artifact-preview-overlay viewer-modal-overlay" onClick={() => setViewerModal(null)} data-testid="universal-viewer-modal">
           <div className="artifact-preview-panel universal-viewer-panel" onClick={(event) => event.stopPropagation()}>
             <div className="artifact-preview-header">
               <span className="artifact-preview-title">{viewerModal.title || viewerModal.source.path?.split("/").pop() || `${viewerModal.type} viewer`}</span>
@@ -1970,9 +2183,11 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   onClick={() =>
                     setViewerModal({
                       type: "markdown",
-                      source: {
-                        content: `# ${ORCHESTRATOR_DISPLAY} → ${labelForSender(openThread.agent.id)} · handsOn\n\n${openThread.assignment}`,
-                      },
+                      source: openThread.handsOnArtifact?.path
+                        ? { path: openThread.handsOnArtifact.path }
+                        : {
+                            content: `# ${ORCHESTRATOR_DISPLAY} → ${labelForSender(openThread.agent.id)} · handsOn\n\n${openThread.assignment}`,
+                          },
                       display: "popup",
                       title: "handsOn assignment",
                     })
@@ -1994,9 +2209,11 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                     onClick={() =>
                       setViewerModal({
                         type: "markdown",
-                        source: {
-                          content: `# ${labelForSender(openThread.agent.id)} → ${ORCHESTRATOR_DISPLAY} · Handoff\n\n${openThread.handoff}`,
-                        },
+                        source: openThread.handOffArtifact?.path
+                          ? { path: openThread.handOffArtifact.path }
+                          : {
+                              content: `# ${labelForSender(openThread.agent.id)} → ${ORCHESTRATOR_DISPLAY} · Handoff\n\n${openThread.handoff}`,
+                            },
                         display: "popup",
                         title: "Handoff document",
                       })
@@ -2013,10 +2230,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   <div className="agent-space-block-text">No activity reported yet.</div>
                 ) : (
                   openThread.activity.map((log) => (
-                    <div className="agent-space-action-row" key={log.id}>
-                      <span className="agent-space-action-icon" aria-hidden="true">💭</span>
-                      <span className="agent-space-action-text">{log.content}</span>
-                    </div>
+                    <ActivityPreview log={log} key={log.id} />
                   ))
                 )}
               </div>
@@ -2025,7 +2239,8 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                 <div className="agent-space-block-text">
                   Status: <span className={`detail-status-pill ${openThread.agent.status}`}>{openThread.agent.status}</span>
                 </div>
-                {openThread.agent.summary ? (
+                <AgentWorkingStatus agent={openThread.agent} activity={openThread.activity} />
+                {openThread.agent.summary || openThread.proofArtifact ? (
                   <button
                     type="button"
                     className="thread-handoff-doc thread-doc-open"
@@ -2033,15 +2248,19 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                     onClick={() =>
                       setViewerModal({
                         type: "markdown",
-                        source: {
-                          content: `# ${labelForSender(openThread.agent.id)} → ${ORCHESTRATOR_DISPLAY} · Proof of work\n\n${openThread.agent.summary}`,
-                        },
+                        source: openThread.proofArtifact?.path
+                          ? { path: openThread.proofArtifact.path }
+                          : {
+                              content: `# ${labelForSender(openThread.agent.id)} → ${ORCHESTRATOR_DISPLAY} · Proof of work\n\n${openThread.agent.summary}`,
+                            },
                         display: "popup",
                         title: "Proof of work",
                       })
                     }
                   >
-                    {openThread.agent.summary}
+                    {openThread.proofArtifact
+                      ? `${openThread.proofArtifact.path}\n\n${openThread.proofArtifact.description || "Proof of work artifact ready."}`
+                      : openThread.agent.summary}
                     <span className="thread-doc-open-hint">Open document →</span>
                   </button>
                 ) : (
