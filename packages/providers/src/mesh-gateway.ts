@@ -47,6 +47,8 @@ export interface MeshGatewayConfig {
   apiKey?: string;
   baseURL?: string;
   modelMapping?: Record<ModelRole, string>;
+  timeout?: number;
+  maxRetries?: number;
 }
 
 export class MeshGateway implements IMeshGateway {
@@ -60,18 +62,24 @@ export class MeshGateway implements IMeshGateway {
     if (this.isMockMode) {
       console.log("ℹ️  [MeshGateway] MESH_API_KEY is not set. Running in MOCK Mode for testing.");
     }
+    const timeout = config.timeout ?? (process.env.YAAA_TIMEOUT ? Number(process.env.YAAA_TIMEOUT) : (process.env.MESH_TIMEOUT ? Number(process.env.MESH_TIMEOUT) : 60000));
+    const maxRetries = config.maxRetries ?? (process.env.YAAA_MAX_RETRIES ? Number(process.env.YAAA_MAX_RETRIES) : (process.env.MESH_MAX_RETRIES ? Number(process.env.MESH_MAX_RETRIES) : 3));
+
     this.openai = new OpenAI({
       apiKey: apiKey || "dummy-key",
       baseURL: config.baseURL || "https://api.meshapi.ai/v1",
+      timeout,
+      maxRetries,
     });
 
-    // Default Mesh API routing mapping for various agent roles. The planner is
-    // the orchestrator's brain, so it always runs on the best available model.
+    // Default Mesh API routing mapping for various agent roles. Keep defaults
+    // cost-aware; the planner can still explicitly assign Sonnet to complex
+    // subtasks that need it.
     this.modelMapping = {
-      planner: "anthropic/claude-sonnet-5",
-      worker: "openai/gpt-4o",
-      verifier: "google/gemini-3.1-pro", // genuine diversity to catch shared blindspots
-      utility: "openai/gpt-4o-mini",
+      planner: "google/gemini-2.5-flash",
+      worker: "google/gemini-2.5-flash",
+      verifier: "anthropic/claude-haiku-4.5",
+      utility: "anthropic/claude-haiku-4.5",
       ...config.modelMapping,
     };
   }
@@ -208,6 +216,37 @@ export class MeshGateway implements IMeshGateway {
     }
   }
 
+  async generateImage(prompt: string, options: { model?: string } = {}): Promise<string> {
+    if (this.isMockMode) {
+      return "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    }
+    // Image model is operator-configurable so a deployment can point at whatever
+    // image endpoint Mesh exposes without a code change; defaults to imagen-3.
+    const model = options.model || process.env.YAAA_IMAGE_MODEL?.trim() || "google/imagen-3";
+    try {
+      const response = await this.openai.images.generate({
+        model,
+        prompt,
+        n: 1,
+        size: "1024x1024",
+      });
+      const item = response.data?.[0];
+      if (!item) {
+        throw new Error("No image data returned from Mesh API.");
+      }
+      const url = item.url || "";
+      if (url.startsWith("data:image/png;base64,")) {
+        return url.split(",")[1];
+      }
+      const res = await fetch(url);
+      const buf = await res.arrayBuffer();
+      return Buffer.from(buf).toString("base64");
+    } catch (err) {
+      console.error(`Mesh API image generation failed using model ${model}:`, err);
+      rethrowGatewayError(err);
+    }
+  }
+
   /**
    * Sample reasoning text for MOCK mode so the UI "thinking" stream is
    * demoable without a real reasoning-capable model / API key.
@@ -237,7 +276,9 @@ export class MeshGateway implements IMeshGateway {
       "capability": "files",
       "dependsOn": [],
       "riskLevel": "low",
-      "successCriteria": "summary.txt contains three facts about solid-state batteries"
+      "successCriteria": "summary.txt contains three facts about solid-state batteries",
+      "agentTemplate": "ResearcherAgent",
+      "routingReason": "This work requires factual research and synthesis."
     },
     {
       "id": "task-2",
@@ -245,7 +286,9 @@ export class MeshGateway implements IMeshGateway {
       "capability": "verify",
       "dependsOn": ["task-1"],
       "riskLevel": "low",
-      "successCriteria": "Verification pass completed"
+      "successCriteria": "Verification pass completed",
+      "agentTemplate": "QaTesterAgent",
+      "routingReason": "This work independently verifies factual and formatting requirements."
     }
   ]
 }
@@ -288,11 +331,19 @@ export class MeshGateway implements IMeshGateway {
     if (role === "utility") {
       const systemMsg = messages.find((m) => m.role === "system")?.content || "";
       if (systemMsg.includes("intent classifier")) {
-        // Mock mode has no real NLP — report "task" and let the caller's
-        // deterministic heuristics own the conversational path.
+        const userMsg = messages.find((m) => m.role === "user")?.content || "";
+        const isGreeting = /^(hi+|hii+|hello+|hey+|heya|yo|sup|howdy|hola|namaste)\b[\s!.,?]*$/i.test(userMsg.trim());
+        if (isGreeting) {
+          return `{"intent": "conversation", "reply": "Hello!"}`;
+        }
         return `{"intent": "task", "reply": ""}`;
       }
       if (systemMsg.includes("Team Lead")) {
+        console.log("Mock Gateway Team Lead messages: ", JSON.stringify(messages, null, 2));
+        const hasNotes = messages.some((m) => m.content && m.content.includes("notes.txt"));
+        if (hasNotes) {
+          return "I created notes.txt with your note earlier. Anything else?";
+        }
         return "Hello! I'm the YAAA orchestrator. What are we building or working on today?";
       }
       if (systemMsg.includes("channel topic")) {

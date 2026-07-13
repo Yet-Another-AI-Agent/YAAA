@@ -55,4 +55,21 @@ describe("FilesFs", () => {
       "Directory traversal violation"
     );
   });
+
+  it("does not confuse a sibling with a shared path prefix for the workspace", async () => {
+    await expect(filesFs.readFile(`../${path.basename(testDir)}-evil/file.txt`)).rejects.toThrow("Directory traversal violation");
+  });
+
+  it("reads, replaces, and deletes inclusive line ranges", async () => {
+    await filesFs.writeFile("lines.txt", "one\ntwo\nthree\nfour");
+    expect((await filesFs.readLines("lines.txt", 2, 3)).content).toBe("two\nthree");
+    await filesFs.writeLines("lines.txt", 2, 3, "TWO\nTHREE");
+    await filesFs.deleteLines("lines.txt", 3, 3);
+    expect(await filesFs.readFile("lines.txt")).toBe("one\nTWO\nfour");
+  });
+
+  it("supports wildcard search and file metadata", async () => {
+    expect(await filesFs.searchFiles("**/*.txt", ".")).toContain("lines.txt");
+    expect(await filesFs.stat("lines.txt")).toMatchObject({ isFile: true, isDirectory: false });
+  });
 });

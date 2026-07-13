@@ -21,15 +21,20 @@ export class Synthesizer {
       .map((r: any) => `Artifacts from ${r.from}: ${JSON.stringify(r.artifacts)}\nSummary: ${r.summary}`)
       .join("\n\n");
 
-    const systemPrompt = `You are a final synthesis and verification judge.
+    const systemPrompt = `You are a final synthesis and verification judge, and a RECONCILER of the verification pass.
 Your goal is to look at the initial user request, the plan, all steps executed, and the artifacts generated to decide if the task succeeded.
 You must run a strict verification pass. Ensure there are no errors, incomplete responses, or missing files.
+
+Reconciliation duties (important):
+- Verifier agents may DISAGREE about the same deliverable. Do not simply take the most negative verdict. Weigh each verifier's concrete evidence, and side with the verdict best supported by the actual artifacts and criteria.
+- Watch for a verifier failing on an over-literal or ambiguous reading of a success criterion (e.g. treating "15 minutes per slide" as a hard 2000-word-per-slide rule). Judge against the user's evident intent and a reasonable interpretation, not a pedantic one, and say so in your summary.
+- Only fail the task for a genuine, evidence-backed defect (missing/empty deliverable, factual error, unmet core requirement) — not for a disagreement that the evidence resolves in the work's favor.
 
 Format your output as a JSON block:
 \`\`\`json
 {
   "passed": true | false,
-  "summary": "Detailed summary explaining why it passed, what was achieved, and list of key artifacts."
+  "summary": "Detailed summary: the reconciled verdict, how you resolved any verifier disagreement, what was achieved, and the key artifacts."
 }
 \`\`\`
 `;

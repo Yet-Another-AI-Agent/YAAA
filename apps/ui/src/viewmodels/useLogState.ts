@@ -12,9 +12,11 @@ export type UILogKind = "thinking" | "activity" | "response" | "system";
 export interface UILog {
   id: string;
   time: string;
+  createdAt?: number;
   source: "orchestrator" | "agent" | "system" | "user";
   content: string;
   kind: UILogKind;
+  metadata?: Record<string, unknown>;
 }
 
 export function useLogState() {
@@ -24,15 +26,18 @@ export function useLogState() {
     source: UILog["source"],
     content: string,
     kind: UILogKind = "system",
+    metadata?: Record<string, unknown>,
   ) => {
     setLogs((prev) => [
       ...prev,
       {
         id: Math.random().toString(),
+        createdAt: Date.now(),
         time: new Date().toLocaleTimeString(),
         source,
         content,
         kind,
+        metadata,
       },
     ]);
   };

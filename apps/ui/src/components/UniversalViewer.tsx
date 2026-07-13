@@ -55,6 +55,28 @@ export function parseViewerEmbeds(message: string): MessagePart[] {
   return parts.length ? parts : [{ kind: "text", text: message }];
 }
 
+/**
+ * A chat message body longer than this (or with this many lines) is treated as a
+ * document rather than prose: instead of dumping it inline it renders as a small
+ * "Open document" button that pops the full markdown viewer.
+ */
+const INLINE_MARKDOWN_MAX_CHARS = 1500;
+const INLINE_MARKDOWN_MAX_LINES = 24;
+
+export function isLargeMarkdown(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  return trimmed.length > INLINE_MARKDOWN_MAX_CHARS || trimmed.split("\n").length > INLINE_MARKDOWN_MAX_LINES;
+}
+
+/** Best-effort title for a markdown blob: first heading, else first non-empty line. */
+export function markdownTitle(text: string): string {
+  const lines = text.split("\n").map((line) => line.trim());
+  const heading = lines.find((line) => /^#{1,6}\s+/.test(line));
+  const base = heading ? heading.replace(/^#{1,6}\s+/, "") : lines.find(Boolean) || "Document";
+  return base.length > 80 ? `${base.slice(0, 80)}…` : base;
+}
+
 export function inferViewerKind(path: string): ViewerKind | null {
   if (/\.(md|markdown)$/i.test(path)) return "markdown";
   if (/\.pdf$/i.test(path)) return "pdf";
@@ -82,47 +104,150 @@ function MarkdownView({ content }: { content: string }) {
 }
 
 interface LineComment { line: number; quote: string; comment: string }
-function AnnotatedMarkdownView({ taskId, path, content }: { taskId?: string; path?: string; content: string }) {
-  const lines = content.split("\n");
-  const documentTitle = lines.find((line) => /^#{1,6}\s+/.test(line))?.replace(/^#{1,6}\s+/, "") || "Document review";
+function AnnotatedMarkdownView({
+  taskId,
+  path,
+  content,
+  onCommentsSaved,
+}: {
+  taskId?: string;
+  path?: string;
+  content: string;
+  onCommentsSaved?: (comments: LineComment[]) => void;
+}) {
+  // Split content into "blocks" — paragraphs or line groups — so we can render
+  // each block with ReactMarkdown while still tracking per-line comment anchors.
+  const blocks = useMemo(() => {
+    const raw = content.split("\n");
+    const result: { id: number; lines: string[]; startLine: number }[] = [];
+    let buf: string[] = [];
+    let startLine = 1;
+    raw.forEach((line, i) => {
+      buf.push(line);
+      const next = raw[i + 1];
+      // Flush on blank lines, heading starts, or end of file
+      const isBlank = !line.trim();
+      const nextIsHeading = next != null && /^#{1,6}\s/.test(next);
+      const isLast = i === raw.length - 1;
+      if (isBlank || nextIsHeading || isLast) {
+        if (buf.some((l) => l.trim())) {
+          result.push({ id: startLine, lines: [...buf], startLine });
+        }
+        startLine = i + 2;
+        buf = [];
+      }
+    });
+    return result;
+  }, [content]);
+
   const [comments, setComments] = useState<LineComment[]>([]);
-  const [activeLine, setActiveLine] = useState<number | null>(null);
+  const [activeBlock, setActiveBlock] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
   const [status, setStatus] = useState<"idle" | "sending" | "sent" | "error">("idle");
-  const add = () => {
-    if (!activeLine || !draft.trim()) return;
-    setComments((current) => [...current.filter((item) => item.line !== activeLine), { line: activeLine, quote: lines[activeLine - 1] || "", comment: draft.trim() }]);
-    setActiveLine(null); setDraft(""); setStatus("idle");
+
+  const addComment = (blockId: number, quote: string) => {
+    if (!draft.trim()) return;
+    setComments((prev) => [
+      ...prev.filter((c) => c.line !== blockId),
+      { line: blockId, quote, comment: draft.trim() },
+    ]);
+    setActiveBlock(null);
+    setDraft("");
   };
+
   const send = async () => {
     if (!taskId || !path || comments.length === 0) return;
     setStatus("sending");
-    try { await TaskModel.saveLineComments(taskId, path, comments); setStatus("sent"); }
-    catch { setStatus("error"); }
+    try {
+      await TaskModel.saveLineComments(taskId, path, comments);
+      setStatus("sent");
+      onCommentsSaved?.(comments);
+    } catch {
+      setStatus("error");
+    }
   };
-  return <div className="line-comment-viewer" data-testid="line-comment-viewer">
-    <h2 className="line-comment-title">{documentTitle}</h2>
-    <div className="line-comment-document">
-      {lines.map((line, index) => {
-        const lineNo = index + 1;
-        const existing = comments.find((item) => item.line === lineNo);
-        return <div className={`line-comment-row ${existing ? "has-comment" : ""}`} key={lineNo}>
-          <button type="button" className="line-comment-number" title={`Comment on line ${lineNo}`} onClick={() => { setActiveLine(lineNo); setDraft(existing?.comment || ""); }}>{lineNo}</button>
-          <span className="line-comment-source">{line || " "}</span>
-          {existing && <span className="line-comment-marker" title={existing.comment}>💬</span>}
-        </div>;
-      })}
+
+  const documentTitle =
+    content
+      .split("\n")
+      .find((l) => /^#{1,6}\s+/.test(l))
+      ?.replace(/^#{1,6}\s+/, "") || "Document review";
+
+  return (
+    <div className="line-comment-viewer" data-testid="line-comment-viewer">
+      <h2 className="line-comment-title">{documentTitle}</h2>
+      <div className="line-comment-document">
+        {blocks.map((block) => {
+          const blockMd = block.lines.join("\n");
+          const existing = comments.find((c) => c.line === block.id);
+          const isActive = activeBlock === block.id;
+          return (
+            <div key={block.id} className={`line-comment-block ${existing ? "has-comment" : ""}`}>
+              {/* Rendered markdown block with comment affordance */}
+              <div
+                className="line-comment-block-body"
+                title="Click to add a comment"
+                onClick={() => {
+                  setActiveBlock(isActive ? null : block.id);
+                  setDraft(existing?.comment || "");
+                }}
+              >
+                <div className="line-comment-md">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeSanitize]}>
+                    {blockMd}
+                  </ReactMarkdown>
+                </div>
+                {existing && (
+                  <span className="line-comment-marker" title={existing.comment}>
+                    💬 {existing.comment}
+                  </span>
+                )}
+              </div>
+
+              {/* Inline comment composer — appears directly below the block */}
+              {isActive && (
+                <div className="line-comment-composer line-comment-composer--inline">
+                  <textarea
+                    autoFocus
+                    aria-label="Comment for this section"
+                    value={draft}
+                    onChange={(e) => setDraft(e.target.value)}
+                    placeholder="What should change in this section?"
+                    onKeyDown={(e) => {
+                      // Esc cancels this inline annotation edit only; stop it from
+                      // bubbling to the window handler that would close the viewer.
+                      if (e.key === "Escape") { e.stopPropagation(); setActiveBlock(null); setDraft(""); }
+                      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) addComment(block.id, blockMd.slice(0, 120));
+                    }}
+                  />
+                  <div className="line-comment-composer-actions">
+                    <button type="button" className="btn-approve" onClick={() => addComment(block.id, blockMd.slice(0, 120))} disabled={!draft.trim()}>
+                      Add comment
+                    </button>
+                    <button type="button" className="btn-reject" onClick={() => { setActiveBlock(null); setDraft(""); }}>
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      <div className="line-comment-footer">
+        <span>{comments.length} comment{comments.length === 1 ? "" : "s"}</span>
+        <button
+          type="button"
+          className="btn-approve"
+          onClick={send}
+          disabled={!taskId || !path || comments.length === 0 || status === "sending" || status === "sent"}
+        >
+          {status === "sending" ? "Sending…" : status === "sent" ? "Sent ✓" : "Send comments to agent"}
+        </button>
+        {status === "error" && <span role="alert">Could not save comments.</span>}
+      </div>
     </div>
-    {activeLine && <div className="line-comment-composer">
-      <strong>Line {activeLine}</strong><textarea aria-label={`Comment for line ${activeLine}`} value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="What should change on this line?" />
-      <button type="button" className="btn-approve" onClick={add} disabled={!draft.trim()}>Add comment</button>
-      <button type="button" className="btn-reject" onClick={() => setActiveLine(null)}>Cancel</button>
-    </div>}
-    <div className="line-comment-footer"><span>{comments.length} line comment{comments.length === 1 ? "" : "s"}</span>
-      <button type="button" className="btn-approve" onClick={send} disabled={!taskId || !path || comments.length === 0 || status === "sending" || status === "sent"}>{status === "sending" ? "Sending…" : status === "sent" ? "Sent to agent ✓" : "Send comments to agent"}</button>
-      {status === "error" && <span role="alert">Could not save comments.</span>}
-    </div>
-  </div>;
+  );
 }
 
 function PdfView({ dataUrl }: { dataUrl: string }) {
@@ -175,10 +300,11 @@ function SpreadsheetView({ dataUrl, data }: { dataUrl?: string; data?: unknown }
   return <div className="spreadsheet-viewer"><div className="viewer-toolbar">{workbook.SheetNames.map((name) => <button className={name === sheetName ? "active" : ""} key={name} onClick={() => setSheetName(name)}>{name}</button>)}</div><DataGrid columns={columns} rows={rows} rowHeight={28} /></div>;
 }
 
-export function UniversalViewer({ spec, taskId, compact = false }: { spec: ViewerSpec; taskId?: string; compact?: boolean }) {
+export function UniversalViewer({ spec, taskId, compact = false, onCommentsSaved }: { spec: ViewerSpec; taskId?: string; compact?: boolean; onCommentsSaved?: (comments: { line: number; quote: string; comment: string }[]) => void }) {
   const [content, setContent] = useState(spec.source.content || "");
   const [dataUrl, setDataUrl] = useState<string>();
   const [error, setError] = useState<string>();
+  const [viewerType, setViewerType] = useState<ViewerKind>(spec.type);
   const [loading, setLoading] = useState(Boolean(spec.source.path && spec.source.content === undefined && spec.source.data === undefined));
   useEffect(() => {
     let active = true;
@@ -186,26 +312,67 @@ export function UniversalViewer({ spec, taskId, compact = false }: { spec: Viewe
     if (!taskId) { setError("This file viewer needs an active task."); setLoading(false); return; }
     const binary = ["pdf", "pptx", "spreadsheet"].includes(spec.type);
     (binary ? TaskModel.readArtifactBinary(taskId, spec.source.path) : TaskModel.readArtifact(taskId, spec.source.path))
-      .then((value) => { if (!active) return; if (!value) setError("Could not read this artifact."); else if (typeof value === "string") setContent(value); else setDataUrl(value.dataUrl); })
+      .then((value) => {
+        if (!active) return;
+        if (!value) {
+          setError("Could not read this artifact.");
+        } else if (typeof value === "string") {
+          setContent(value);
+        } else {
+          // Check if the binary content starts with ZIP magic bytes 'PK'
+          const base64Str = value.dataUrl.split(",")[1] || "";
+          let bytes: Uint8Array;
+          try {
+            const decoded = atob(base64Str);
+            bytes = Uint8Array.from(decoded, (char) => char.charCodeAt(0));
+          } catch {
+            bytes = new Uint8Array(0);
+          }
+          const isZip = bytes.length >= 2 && bytes[0] === 0x50 && bytes[1] === 0x4b;
+          
+          if (["pptx", "spreadsheet"].includes(spec.type) && !isZip) {
+            // Not a zip file (often text/markdown written by agents), decode and display as markdown
+            try {
+              const text = new TextDecoder("utf-8").decode(bytes);
+              setContent(text);
+              setViewerType("markdown");
+            } catch {
+              setDataUrl(value.dataUrl);
+            }
+          } else {
+            setDataUrl(value.dataUrl);
+          }
+        }
+      })
       .catch((reason) => active && setError(reason?.message || "Could not load this artifact."))
       .finally(() => active && setLoading(false));
     return () => { active = false; };
   }, [spec.source.path, spec.type, taskId]);
   if (loading) return <div className="viewer-state">Loading viewer…</div>;
   if (error) return <div className="viewer-state viewer-error" role="alert">{error}</div>;
-  return <div className={`universal-viewer ${compact ? "compact" : ""}`} data-viewer-kind={spec.type}>
-    {spec.type === "markdown" && <MarkdownView content={content} />}
-    {spec.type === "markdown-annotated" && <AnnotatedMarkdownView taskId={taskId} path={spec.source.path} content={content} />}
-    {spec.type === "code" && <Editor height={compact ? "320px" : "70vh"} language={languageFor(spec.source.path, spec.language)} value={content} theme="vs-dark" options={{ readOnly: true, minimap: { enabled: !compact }, wordWrap: "on", automaticLayout: true, folding: true, lineNumbers: "on", renderWhitespace: "selection" }} />}
-    {spec.type === "pdf" && dataUrl && <PdfView dataUrl={dataUrl} />}
-    {spec.type === "pptx" && dataUrl && <PptxView dataUrl={dataUrl} />}
-    {spec.type === "spreadsheet" && <SpreadsheetView dataUrl={dataUrl} data={spec.source.data} />}
+  return <div className={`universal-viewer ${compact ? "compact" : ""}`} data-viewer-kind={viewerType}>
+    {viewerType === "markdown" && <MarkdownView content={content} />}
+    {viewerType === "markdown-annotated" && <AnnotatedMarkdownView taskId={taskId} path={spec.source.path} content={content} onCommentsSaved={onCommentsSaved} />}
+    {viewerType === "code" && <Editor height={compact ? "320px" : "70vh"} language={languageFor(spec.source.path, spec.language)} value={content} theme="vs-dark" options={{ readOnly: true, minimap: { enabled: !compact }, wordWrap: "on", automaticLayout: true, folding: true, lineNumbers: "on", renderWhitespace: "selection" }} />}
+    {viewerType === "pdf" && dataUrl && <PdfView dataUrl={dataUrl} />}
+    {viewerType === "pptx" && dataUrl && <PptxView dataUrl={dataUrl} />}
+    {viewerType === "spreadsheet" && <SpreadsheetView dataUrl={dataUrl} data={spec.source.data} />}
   </div>;
 }
 
 export function RichMessageContent({ content, taskId, onOpen }: { content: string; taskId?: string; onOpen: (spec: ViewerSpec) => void }) {
   return <>{parseViewerEmbeds(content).map((part, index) => part.kind === "text"
-    ? <MarkdownView key={index} content={part.text || ""} />
+    ? (isLargeMarkdown(part.text || "")
+        ? <button
+            type="button"
+            className="viewer-attachment-card"
+            key={index}
+            onClick={() => onOpen({ type: "markdown", source: { content: part.text || "" }, display: "popup", title: markdownTitle(part.text || "") })}
+          >
+            <span>Open document · {markdownTitle(part.text || "")}</span>
+            <small>markdown · {(part.text || "").trim().length.toLocaleString()} chars</small>
+          </button>
+        : <MarkdownView key={index} content={part.text || ""} />)
     : part.spec && (shouldOpenViewerInline(part.spec)
       ? <div className="inline-viewer-card" key={index}><div className="inline-viewer-header"><strong>{part.spec.title || part.spec.source.path?.split("/").pop() || `${part.spec.type} viewer`}</strong><button onClick={() => onOpen(part.spec!)}>Expand</button></div><UniversalViewer spec={part.spec} taskId={taskId} compact /></div>
       : <button type="button" className="viewer-attachment-card" key={index} onClick={() => onOpen(part.spec!)}><span>Open {part.spec.title || part.spec.source.path?.split("/").pop() || part.spec.type}</span><small>{part.spec.type} viewer</small></button>))}</>;

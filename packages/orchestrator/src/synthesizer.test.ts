@@ -43,12 +43,12 @@ describe("Synthesizer", () => {
       subtasks: [],
     };
 
-    (mockGateway.chat as any).mockResolvedValue(`\`\`\`json
+    (mockGateway.chat as any).mockResolvedValue({ content: `\`\`\`json
 {
   "passed": true,
   "summary": "Completed verified summary description."
 }
-\`\`\``);
+\`\`\`` });
 
     const result = await synthesizer.synthesize("task-123", plan);
     expect(result.passed).toBe(true);
@@ -61,7 +61,7 @@ describe("Synthesizer", () => {
       subtasks: [],
     };
 
-    (mockGateway.chat as any).mockResolvedValue("completely-invalid-json-output");
+    (mockGateway.chat as any).mockResolvedValue({ content: "completely-invalid-json-output" });
 
     const result = await synthesizer.synthesize("task-123", plan);
     expect(result.passed).toBe(false);

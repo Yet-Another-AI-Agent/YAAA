@@ -148,7 +148,7 @@ export function SplashView({ onAnimationEnd }: SplashViewProps) {
           <div className="splash-loader-bar">
             <div className="splash-loader-progress" />
           </div>
-          <div className="splash-status">Initializing CLI Native Runner...</div>
+          <div className="splash-status">Initializing agent runtime...</div>
         </div>
       </div>
     );
@@ -212,7 +212,7 @@ export function SplashView({ onAnimationEnd }: SplashViewProps) {
             />
             <div className="file-upload-text">
               {isParsing
-                ? "Parsing Resume via CLI..."
+                ? "Parsing resume via Mesh Gateway..."
                 : "Drag & Drop or Click to Upload Resume (.txt)"}
             </div>
             <div className="file-upload-hint">

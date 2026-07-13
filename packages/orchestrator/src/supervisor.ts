@@ -52,17 +52,38 @@ export class Supervisor {
       console.log("[Orchestrator] Executed all tasks. Running final verification pass...");
       const result = await this.synthesizer.synthesize(activeTaskId, plan);
       
+      const messages = await this.store.getMessages(activeTaskId);
+      const resultMessages = messages.filter((m) => m.kind === "result");
+      const allArtifacts = resultMessages.flatMap((m: any) => m.artifacts || []);
+
+      let viewerBlocks = "";
+      const seen = new Set<string>();
+      for (const art of allArtifacts) {
+        if (!art.path || seen.has(art.path)) continue;
+        seen.add(art.path);
+        const type = inferViewerKind(art.path);
+        if (type) {
+          const spec = {
+            type,
+            source: { path: art.path },
+            display: "auto",
+            title: art.path.split("/").pop() || art.path,
+          };
+          viewerBlocks += `\n\n\`\`\`yaaa-viewer\n${JSON.stringify(spec)}\n\`\`\``;
+        }
+      }
+
       await this.bus.publish(`task.${activeTaskId}.completed`, {
         kind: "status",
         from: "orchestrator",
         taskId: activeTaskId,
         state: "done",
-        note: `Goal achieved. Summary: ${result.summary}`
+        note: `Goal achieved. Summary: ${result.summary}${viewerBlocks}`
       });
 
       return {
         success: result.passed,
-        summary: result.summary,
+        summary: `${result.summary}${viewerBlocks}`,
         plan,
       };
     } catch (err: any) {
@@ -89,4 +110,14 @@ export class Supervisor {
     const plan = await this.createPlan(goal, taskId);
     return this.runPlan(plan, taskId);
   }
+}
+
+/** Infer the viewer kind based on file extension. */
+function inferViewerKind(filePath: string): string | null {
+  if (/\.(md|markdown)$/i.test(filePath)) return "markdown";
+  if (/\.pdf$/i.test(filePath)) return "pdf";
+  if (/\.pptx$/i.test(filePath)) return "pptx";
+  if (/\.(xlsx|xls|xlsm|csv|tsv)$/i.test(filePath)) return "spreadsheet";
+  if (/\.(txt|py|js|jsx|ts|tsx|json|ya?ml|toml|html?|css|scss|sh|bash|c|cc|cpp|h|hpp|java|go|rs|rb|php|sql|xml|env|ini|cfg|log)$/i.test(filePath)) return "code";
+  return null;
 }

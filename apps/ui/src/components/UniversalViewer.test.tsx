@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { inferViewerKind, parseViewerEmbeds, shouldOpenViewerInline } from "./UniversalViewer";
+import { inferViewerKind, isLargeMarkdown, markdownTitle, parseViewerEmbeds, shouldOpenViewerInline } from "./UniversalViewer";
 
 describe("viewer protocol", () => {
   it("extracts a valid viewer block while preserving surrounding markdown", () => {
@@ -34,5 +34,17 @@ describe("viewer protocol", () => {
     expect(inferViewerKind("model.xlsx")).toBe("spreadsheet");
     expect(shouldOpenViewerInline({ type: "pdf", source: { path: "report.pdf" } })).toBe(false);
     expect(shouldOpenViewerInline({ type: "markdown", source: { content: "# Short" } })).toBe(true);
+  });
+
+  it("treats short prose as inline but flags big markdown as a document", () => {
+    expect(isLargeMarkdown("Sure, here's a quick answer.")).toBe(false);
+    expect(isLargeMarkdown("x".repeat(2000))).toBe(true);
+    expect(isLargeMarkdown(Array.from({ length: 40 }, (_, i) => `line ${i}`).join("\n"))).toBe(true);
+    expect(isLargeMarkdown("")).toBe(false);
+  });
+
+  it("derives a document title from the first heading or line", () => {
+    expect(markdownTitle("# Solar System Curriculum\n\nBody...")).toBe("Solar System Curriculum");
+    expect(markdownTitle("Just some text\nmore")).toBe("Just some text");
   });
 });

@@ -122,9 +122,25 @@ describe("createRuntime", () => {
         path.join(agentDir, "HANDS_OFF.md"),
         "utf-8",
       );
+      const workingHandsOn = fs.readFileSync(
+        path.join(root, "working", "agent-workspaces", agentId, "handsOn.md"),
+        "utf-8",
+      );
+      const proofOfWork = fs.readFileSync(
+        path.join(root, "working", "agent-workspaces", agentId, "proofOfWork.md"),
+        "utf-8",
+      );
+      const handOff = fs.readFileSync(
+        path.join(root, "working", "agent-workspaces", agentId, "handOff.md"),
+        "utf-8",
+      );
 
       expect(handsOn).toContain("Write the reviewed report");
       expect(handsOn).toContain("A report is written");
+      expect(workingHandsOn).toContain("proofOfWork.md");
+      expect(workingHandsOn).toContain("handOff.md");
+      expect(proofOfWork).toContain("Mock mode: subtask completed");
+      expect(handOff).toContain("## Continuation Instructions");
       expect(handsOff).toContain("## Changed Files");
       expect(handsOff).toContain("## Tests");
       expect(handsOff).toContain("## Risks");

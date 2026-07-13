@@ -14,16 +14,16 @@ import { OuterLoop } from "./outer-loop.js";
  * `responder` decides, per model turn, whether the agent finishes (returns an
  * AIMessage), fails (throws), or parks (returns a pending promise).
  */
-type Responder = (role: ModelRole, messages: BaseMessage[]) => Promise<AIMessage>;
+type Responder = (role: string, messages: BaseMessage[]) => Promise<AIMessage>;
 
 interface CapturedCall {
-  role: ModelRole;
+  role: string;
   messages: BaseMessage[];
 }
 
 class ProgrammableChatModel extends BaseChatModel {
   constructor(
-    private readonly role: ModelRole,
+    private readonly roleOrModel: string,
     private readonly responder: () => Responder,
     private readonly captured: CapturedCall[],
   ) {
@@ -33,8 +33,8 @@ class ProgrammableChatModel extends BaseChatModel {
     return "programmable-test-model";
   }
   async _generate(messages: BaseMessage[]): Promise<ChatResult> {
-    this.captured.push({ role: this.role, messages });
-    const message = await this.responder()(this.role, messages);
+    this.captured.push({ role: this.roleOrModel, messages });
+    const message = await this.responder()(this.roleOrModel, messages);
     const text = typeof message.content === "string" ? message.content : "";
     return { generations: [{ text, message }] };
   }
@@ -44,6 +44,8 @@ class ProgrammableChatModel extends BaseChatModel {
 }
 
 const finalMessage = (text: string) => new AIMessage({ content: text });
+const toolCall = (name: string, args: Record<string, unknown>, id = "call_1") =>
+  new AIMessage({ content: "", tool_calls: [{ name, args, id, type: "tool_call" }] });
 
 describe("OuterLoop Manager", () => {
   let mockBus: IBus;
@@ -51,15 +53,16 @@ describe("OuterLoop Manager", () => {
   let permissions: PermissionEngine;
   let outerLoop: OuterLoop;
   let captured: CapturedCall[];
+  let supervisorGateway: { chat: ReturnType<typeof vi.fn> } & Record<string, unknown>;
   // Default: every agent finishes immediately with a generic summary.
   let responder: Responder = async (role) =>
-    role === "verifier" ? finalMessage("Looks good.\nVERDICT: PASSED") : finalMessage("Subtask completed.");
+    role === "verifier" ? finalMessage(JSON.stringify({ status: "passed", summary: "Meets criteria.", findings: [], evidence: ["deliverable exists in workspace"] })) : finalMessage("Subtask completed.");
 
   beforeEach(() => {
     container.clear();
     captured = [];
     responder = async (role) =>
-      role === "verifier" ? finalMessage("Looks good.\nVERDICT: PASSED") : finalMessage("Subtask completed.");
+      role === "verifier" ? finalMessage(JSON.stringify({ status: "passed", summary: "Meets criteria.", findings: [], evidence: ["deliverable exists in workspace"] })) : finalMessage("Subtask completed.");
 
     mockBus = { publish: vi.fn(), subscribe: vi.fn() } as any;
     mockStore = {
@@ -80,6 +83,14 @@ describe("OuterLoop Manager", () => {
     container.register("IBus", mockBus);
     container.register("IStore", mockStore);
     container.register("PermissionEngine", permissions);
+    // Supervisor assessor's model gateway. Defaults to "continue" so timebox
+    // checkpoints renew; individual tests can override this mock per-decision.
+    supervisorGateway = {
+      chat: vi.fn().mockResolvedValue({ content: '{"action":"continue","reason":"progressing"}' }),
+      chatStream: vi.fn(),
+      generateImage: vi.fn(),
+    } as any;
+    container.register("IMeshGateway", supervisorGateway);
     container.register("capability:files", {
       readFile: vi.fn().mockResolvedValue(""),
       writeFile: vi.fn().mockResolvedValue(undefined),
@@ -88,7 +99,7 @@ describe("OuterLoop Manager", () => {
     });
     container.register(
       "ChatModelFactory",
-      (role: ModelRole) => new ProgrammableChatModel(role, () => responder, captured),
+      (roleOrModel: string) => new ProgrammableChatModel(roleOrModel, () => responder, captured),
     );
 
     outerLoop = new OuterLoop();
@@ -115,6 +126,73 @@ describe("OuterLoop Manager", () => {
       "task-123",
       expect.objectContaining({ handle: "@sage-1", status: "working" }),
     );
+    expect(plan.subtasks[0].artifacts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: expect.stringMatching(/agent-workspaces\/.+\/handsOn\.md/) }),
+        expect.objectContaining({ path: expect.stringMatching(/agent-workspaces\/.+\/handOff\.md/) }),
+      ]),
+    );
+    const dependentBrief = captured.at(-1)?.messages.map((m) => String(m.content)).join("\n") ?? "";
+    expect(dependentBrief).toContain("handOff.md");
+  });
+
+  it("negotiates a failed verification: sends the deliverable back to a worker, then re-verifies to pass", async () => {
+    process.env.YAAA_MAX_VERIFICATION_ROUNDS = "2";
+    const plan: TaskPlan = {
+      goal: "Run test task",
+      subtasks: [
+        { id: "task-1", title: "Write file facts", capability: "files", dependsOn: [], riskLevel: "low", successCriteria: "file exists", state: "pending" },
+        { id: "task-2", title: "Verify facts", capability: "verify", dependsOn: ["task-1"], riskLevel: "low", successCriteria: "facts verified", state: "pending" },
+      ],
+    };
+
+    // The verifier fails the first time, then passes after the fix round.
+    let verifierCalls = 0;
+    responder = async (role) => {
+      if (role === "verifier") {
+        verifierCalls++;
+        return verifierCalls === 1
+          ? finalMessage(JSON.stringify({ status: "failed", summary: "missing a fact", findings: ["only 2 of 3 facts present"], evidence: ["facts.txt"] }))
+          : finalMessage(JSON.stringify({ status: "passed", summary: "all facts present now", findings: [], evidence: ["facts.txt has 3 facts"] }));
+      }
+      return finalMessage("Worker finished.");
+    };
+
+    try {
+      await expect(outerLoop.run("task-negotiate", plan)).resolves.not.toThrow();
+      // A fix→re-verify round happened, and the mission did not abort.
+      expect(verifierCalls).toBeGreaterThanOrEqual(2);
+      expect(mockBus.publish).toHaveBeenCalledWith(
+        "task.task-negotiate.started",
+        expect.objectContaining({ note: expect.stringMatching(/sending it back to a worker to fix/i) }),
+      );
+    } finally {
+      delete process.env.YAAA_MAX_VERIFICATION_ROUNDS;
+    }
+  });
+
+  it("fails the subtask when verification never passes after the fix rounds", async () => {
+    process.env.YAAA_MAX_VERIFICATION_ROUNDS = "1";
+    const plan: TaskPlan = {
+      goal: "Run test task",
+      subtasks: [
+        { id: "task-1", title: "Write file facts", capability: "files", dependsOn: [], riskLevel: "low", successCriteria: "file exists", state: "pending" },
+        { id: "task-2", title: "Verify facts", capability: "verify", dependsOn: ["task-1"], riskLevel: "low", successCriteria: "facts verified", state: "pending" },
+      ],
+    };
+
+    responder = async (role) =>
+      role === "verifier"
+        ? finalMessage(JSON.stringify({ status: "failed", summary: "still wrong", findings: ["fact missing"], evidence: ["facts.txt"] }))
+        : finalMessage("Worker finished.");
+
+    try {
+      await expect(outerLoop.run("task-negotiate-fail", plan)).rejects.toThrow(
+        "Task execution failed due to subtask failure.",
+      );
+    } finally {
+      delete process.env.YAAA_MAX_VERIFICATION_ROUNDS;
+    }
   });
 
   it("should throw an error if a subtask dependency loop or deadlock is detected", async () => {
@@ -230,5 +308,188 @@ describe("OuterLoop Manager", () => {
       (call: any[]) => typeof call[1]?.note === "string" && call[1].note.includes("Kill switch"),
     );
     expect(killSwitchNotes).toHaveLength(0);
+  });
+
+  it("renews the timer from an incomplete timebox handoff instead of blocking the subtask", async () => {
+    process.env.YAAA_AGENT_INVOKE_TIMEOUT_MS = "20";
+    process.env.YAAA_AGENT_CHECKPOINT_TIMEOUT_MS = "50";
+    let turn = 0;
+    responder = async (_role, messages) => {
+      const text = messages.map((m) => String(m.content)).join("\n");
+      if (text.includes("reached its timebox after making tool progress")) {
+        return finalMessage("Checkpoint says notes.md was inspected; continue with a fresh timer.");
+      }
+      turn++;
+      if (turn === 1) return toolCall("read_file", { path: "notes.md" });
+      if (turn === 2) return new Promise<AIMessage>(() => {});
+      expect(text).toContain("Previous agent reached its timebox");
+      expect(text).toContain("handOff.md");
+      return finalMessage("Continued from checkpoint and finished.");
+    };
+
+    try {
+      await expect(outerLoop.run("task-timebox", singleSubtaskPlan())).resolves.not.toThrow();
+
+      const savedAgents = (mockStore.saveAgent as any).mock.calls.map((c: any[]) => c[1]);
+      expect(savedAgents.some((agent: any) => agent.status === "blocked")).toBe(false);
+      expect(savedAgents.some((agent: any) => agent.status === "exited")).toBe(true);
+      expect(savedAgents.some((agent: any) => agent.status === "completed")).toBe(true);
+      // The supervisor reviewed the checkpoint and chose to continue (renew).
+      expect(supervisorGateway.chat).toHaveBeenCalled();
+      expect(mockBus.publish).toHaveBeenCalledWith(
+        "task.task-timebox.started",
+        expect.objectContaining({ note: expect.stringMatching(/supervisor reviewed/i) }),
+      );
+    } finally {
+      delete process.env.YAAA_AGENT_INVOKE_TIMEOUT_MS;
+      delete process.env.YAAA_AGENT_CHECKPOINT_TIMEOUT_MS;
+    }
+  });
+
+  it("keeps renewing incomplete timeboxes even when the error budget is 1 (continuations are not errors)", async () => {
+    // With the error budget at a single attempt, the OLD code failed the subtask
+    // on its first incomplete checkpoint because timeboxes counted toward it.
+    // Continuations now have their own budget, so an incomplete-then-finish still
+    // succeeds.
+    process.env.YAAA_MAX_SUBTASK_ATTEMPTS = "1";
+    process.env.YAAA_AGENT_INVOKE_TIMEOUT_MS = "20";
+    process.env.YAAA_AGENT_CHECKPOINT_TIMEOUT_MS = "50";
+    let turn = 0;
+    responder = async (_role, messages) => {
+      const text = messages.map((m) => String(m.content)).join("\n");
+      if (text.includes("reached its timebox after making tool progress")) {
+        return finalMessage("Checkpoint: notes.md inspected; continue with a fresh timer.");
+      }
+      turn++;
+      if (turn === 1) return toolCall("read_file", { path: "notes.md" });
+      if (turn === 2) return new Promise<AIMessage>(() => {});
+      return finalMessage("Continued from checkpoint and finished.");
+    };
+
+    try {
+      await expect(outerLoop.run("task-continue-budget", singleSubtaskPlan())).resolves.not.toThrow();
+      const savedAgents = (mockStore.saveAgent as any).mock.calls.map((c: any[]) => c[1]);
+      expect(savedAgents.some((agent: any) => agent.status === "completed")).toBe(true);
+      expect(savedAgents.some((agent: any) => agent.status === "failed")).toBe(false);
+    } finally {
+      delete process.env.YAAA_MAX_SUBTASK_ATTEMPTS;
+      delete process.env.YAAA_AGENT_INVOKE_TIMEOUT_MS;
+      delete process.env.YAAA_AGENT_CHECKPOINT_TIMEOUT_MS;
+    }
+  });
+
+  it("accepts a checkpoint when the supervisor judges the criteria already met", async () => {
+    process.env.YAAA_AGENT_INVOKE_TIMEOUT_MS = "20";
+    process.env.YAAA_AGENT_CHECKPOINT_TIMEOUT_MS = "50";
+    supervisorGateway.chat.mockResolvedValue({
+      content: '{"action":"accept","reason":"report.md already satisfies the criteria"}',
+    });
+    let turn = 0;
+    responder = async (_role, messages) => {
+      const text = messages.map((m) => String(m.content)).join("\n");
+      if (text.includes("reached its timebox after making tool progress")) {
+        return finalMessage("Checkpoint: report.md written and complete.");
+      }
+      turn++;
+      if (turn === 1) return toolCall("write_file", { path: "report.md", content: "done" });
+      return new Promise<AIMessage>(() => {}); // never resolves → timebox → checkpoint
+    };
+
+    try {
+      await expect(outerLoop.run("task-accept", singleSubtaskPlan())).resolves.not.toThrow();
+      expect(supervisorGateway.chat).toHaveBeenCalled();
+      expect(mockBus.publish).toHaveBeenCalledWith(
+        "task.task-accept.started",
+        expect.objectContaining({ note: expect.stringMatching(/accept/i) }),
+      );
+    } finally {
+      delete process.env.YAAA_AGENT_INVOKE_TIMEOUT_MS;
+      delete process.env.YAAA_AGENT_CHECKPOINT_TIMEOUT_MS;
+    }
+  });
+
+  it("fails a subtask when the supervisor judges there is no viable path", async () => {
+    process.env.YAAA_AGENT_INVOKE_TIMEOUT_MS = "20";
+    process.env.YAAA_AGENT_CHECKPOINT_TIMEOUT_MS = "50";
+    supervisorGateway.chat.mockResolvedValue({
+      content: '{"action":"fail","reason":"the requirement is self-contradictory"}',
+    });
+    let turn = 0;
+    responder = async (_role, messages) => {
+      const text = messages.map((m) => String(m.content)).join("\n");
+      if (text.includes("reached its timebox after making tool progress")) {
+        return finalMessage("Checkpoint: stuck, cannot proceed.");
+      }
+      turn++;
+      if (turn === 1) return toolCall("read_file", { path: "spec.md" });
+      return new Promise<AIMessage>(() => {});
+    };
+
+    try {
+      await expect(outerLoop.run("task-superfail", singleSubtaskPlan())).rejects.toThrow(
+        "Task execution failed due to subtask failure.",
+      );
+      expect(mockBus.publish).toHaveBeenCalledWith(
+        "task.task-superfail.started",
+        expect.objectContaining({ note: expect.stringMatching(/fail/i) }),
+      );
+    } finally {
+      delete process.env.YAAA_AGENT_INVOKE_TIMEOUT_MS;
+      delete process.env.YAAA_AGENT_CHECKPOINT_TIMEOUT_MS;
+    }
+  });
+
+  it("does not add its own backoff sleep on a transient error (the model client handles that)", async () => {
+    const setTimeoutSpy = vi.spyOn(global, "setTimeout");
+    let attempt = 0;
+    responder = async () => {
+      attempt++;
+      if (attempt === 1) throw new Error("Rate limit exceeded");
+      return finalMessage("Recovered without an outer-loop sleep.");
+    };
+
+    await expect(outerLoop.run("task-backoff", singleSubtaskPlan())).resolves.not.toThrow();
+
+    // The outer loop no longer schedules its own exponential-backoff wait, so it
+    // never asks setTimeout for a multi-second delay between attempts.
+    const backoffWaits = setTimeoutSpy.mock.calls.filter(([, delay]) => typeof delay === "number" && delay >= 1000);
+    expect(backoffWaits).toHaveLength(0);
+    setTimeoutSpy.mockRestore();
+  });
+
+  it("reuses the agent's configured model across retries when no backup model is set", async () => {
+    delete process.env.YAAA_BACKUP_MODEL;
+    let attempt = 0;
+    responder = async () => {
+      attempt++;
+      if (attempt === 1) throw new Error("Rate limit exceeded");
+      return finalMessage("Succeeded on the same model.");
+    };
+
+    await expect(outerLoop.run("task-model-reuse", singleSubtaskPlan())).resolves.not.toThrow();
+
+    // Both attempts resolve through the files agent's own role ("worker"), never
+    // a hardcoded, possibly-unavailable fallback model id.
+    const workerCalls = captured.filter((c) => c.role === "worker");
+    expect(workerCalls).toHaveLength(2);
+  });
+
+  it("switches to the operator-configured backup model on retries", async () => {
+    process.env.YAAA_BACKUP_MODEL = "anthropic/claude-sonnet-5";
+    let attempt = 0;
+    responder = async () => {
+      attempt++;
+      if (attempt <= 2) throw new Error("Rate limit exceeded");
+      return finalMessage("Succeeded on the backup model.");
+    };
+
+    try {
+      await expect(outerLoop.run("task-model-backup", singleSubtaskPlan())).resolves.not.toThrow();
+      const roles = captured.map((c) => c.role);
+      expect(roles[0]).toBe("worker");
+      expect(roles[2]).toBe("anthropic/claude-sonnet-5");
+    } finally {
+      delete process.env.YAAA_BACKUP_MODEL;
+    }
   });
 });

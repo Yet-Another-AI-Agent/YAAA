@@ -1,7 +1,7 @@
 import { useRef, useEffect, useState, useMemo } from "react";
 import logoImg from "../assets/logo.jpg";
 import type { TaskViewModel } from "../viewmodels/useTaskViewModel";
-import { TaskModel } from "../models/TaskModel";
+import { TaskModel, type UIAgent } from "../models/TaskModel";
 import { AnnotationOverlay } from "../components/AnnotationOverlay";
 import { ArchitectureViewer, getMediaKind } from "../components/ArchitectureViewer";
 import { ApiKeyModal } from "../components/ApiKeyModal";
@@ -11,6 +11,7 @@ import {
   RichMessageContent,
   UniversalViewer,
   inferViewerKind,
+  isLargeMarkdown,
   type ViewerSpec,
 } from "../components/UniversalViewer";
 import {
@@ -19,8 +20,9 @@ import {
   isActiveAgent,
   isAgentLifecycleLog,
 } from "../utils/agentWorkspace";
+import type { UILog } from "../viewmodels/useLogState";
 import { renderMarkdown } from "../utils/simpleMarkdown";
-import { buildArtifactExplorer } from "../utils/artifactExplorer";
+import { buildArtifactExplorer, groupEntriesByAgent, type ArtifactExplorerEntry } from "../utils/artifactExplorer";
 import {
   ORCHESTRATOR_DISPLAY,
   agentIdentity,
@@ -81,6 +83,131 @@ const SUGGESTION_CHIPS = [
   "Draft a project summary doc",
   "Search the web for latest AI news",
 ];
+
+function metadataText(metadata: Record<string, unknown> | undefined, key: string): string | null {
+  const value = metadata?.[key];
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function previewImageSrc(path: string): string {
+  if (/^(?:https?:|file:|data:)/.test(path)) return path;
+  return `file://${encodeURI(path)}`;
+}
+
+function toolLabel(metadata: Record<string, unknown> | undefined): string | null {
+  const capability = metadataText(metadata, "capability");
+  const method = metadataText(metadata, "method");
+  if (!capability || !method) return null;
+  return `${capability}.${method}`;
+}
+
+function formatElapsed(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainingSeconds = seconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m ${remainingSeconds}s`;
+  if (minutes > 0) return `${minutes}m ${remainingSeconds}s`;
+  return `${remainingSeconds}s`;
+}
+
+function AgentWorkingStatus({ agent, activity }: { agent: UIAgent; activity: UILog[] }) {
+  const active = ["planned", "working", "blocked"].includes(agent.status);
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    if (!active) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [active]);
+
+  if (!active) return null;
+
+  const startedAt = agent.startedAt ? Date.parse(agent.startedAt) : NaN;
+  const startedMs = Number.isFinite(startedAt) ? startedAt : activity[0]?.createdAt ?? now;
+  const latest = [...activity].reverse().find((log) => log.kind === "activity") ?? activity.at(-1);
+  const latestMs = latest?.createdAt;
+  const latestText = latest?.content.replace(/^🛠️\s*/, "") || "Waiting for first activity update.";
+  const latestLabel = latest
+    ? `Last update ${latestMs ? `${formatElapsed(now - latestMs)} ago` : "just now"}`
+    : "Waiting for first update";
+
+  return (
+    <div className="thread-live-status" role="status" aria-live="polite">
+      <span className="thread-live-dot" aria-hidden="true" />
+      <span>Working for {formatElapsed(now - startedMs)}</span>
+      <span className="thread-live-muted">{latestLabel}</span>
+      <span className="thread-live-action">{latestText}</span>
+    </div>
+  );
+}
+
+function ActivityPreview({ log }: { log: UILog }) {
+  const metadata = log.metadata;
+  const screenshotPath = metadataText(metadata, "screenshotPath");
+  const screenshotDataUrl = metadataText(metadata, "screenshotDataUrl");
+  const command = metadataText(metadata, "command");
+  const query = metadataText(metadata, "query");
+  const url = metadataText(metadata, "url");
+  const path = metadataText(metadata, "path");
+  const stdout = metadataText(metadata, "stdout");
+  const stderr = metadataText(metadata, "stderr");
+  const title = metadataText(metadata, "title");
+  const label = toolLabel(metadata);
+  const results = Array.isArray(metadata?.results) ? metadata.results.slice(0, 3) : [];
+  const hasPreviewMedia = Boolean(screenshotPath || screenshotDataUrl);
+  const hasCommandTranscript = Boolean(command && (stdout || stderr));
+  const hasResultDetails = results.length > 0 || Boolean(stdout || stderr);
+  const showDetails = hasPreviewMedia || hasCommandTranscript || hasResultDetails;
+
+  return (
+    <div className={`agent-space-action-row ${showDetails ? "with-details" : ""}`}>
+      <div className="agent-space-action-body">
+        <div className="agent-space-action-main">
+          {label && <span className="agent-space-tool-pill">{label}</span>}
+          <span className="agent-space-action-text">{log.content}</span>
+        </div>
+        {showDetails && (
+          <div className={`agent-space-action-details ${screenshotDataUrl || screenshotPath ? "" : "no-thumbnail"}`}>
+            {(screenshotDataUrl || screenshotPath) && (
+              <img
+                className="agent-space-action-thumbnail"
+                src={screenshotDataUrl || previewImageSrc(screenshotPath || "")}
+                alt={title || query || url || "Tool preview"}
+              />
+            )}
+            <div className="agent-space-action-meta">
+              {title && <div className="agent-space-action-title">{title}</div>}
+              {query && results.length > 0 && <div className="agent-space-action-line"><span>Query</span>{query}</div>}
+              {url && hasPreviewMedia && <div className="agent-space-action-line"><span>URL</span>{url}</div>}
+              {path && hasPreviewMedia && <div className="agent-space-action-line"><span>Path</span>{path}</div>}
+              {command && <pre className="agent-space-command"><code>$ {command}</code></pre>}
+              {stdout && <pre className="agent-space-output"><code>{stdout}</code></pre>}
+              {stderr && <pre className="agent-space-output error"><code>{stderr}</code></pre>}
+              {results.length > 0 && (
+                <div className="agent-space-results">
+                  {results.map((result, index) => {
+                    const item = result && typeof result === "object" ? result as Record<string, unknown> : {};
+                    const resultTitle = typeof item.title === "string" ? item.title : `Result ${index + 1}`;
+                    const resultUrl = typeof item.url === "string" ? item.url : "";
+                    const description = typeof item.description === "string" ? item.description : "";
+                    return (
+                      <div className="agent-space-result" key={`${resultTitle}-${index}`}>
+                        <div className="agent-space-result-title">{resultTitle}</div>
+                        {resultUrl && <div className="agent-space-result-url">{resultUrl}</div>}
+                        {description && <div className="agent-space-result-description">{description}</div>}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 interface ParsedOrchestrator {
   taskId: string;
@@ -343,6 +470,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   const [artifactPreviewError, setArtifactPreviewError] = useState<string | null>(null);
   const [annotating, setAnnotating] = useState(false);
   const [viewerModal, setViewerModal] = useState<ViewerSpec | null>(null);
+  const [expandedAgentArtifactGroups, setExpandedAgentArtifactGroups] = useState<Set<string>>(new Set());
   const activeArtifactRequestRef = useRef(0);
 
   // Plan review modal: view the proposed orchestrator.md, comment on it, then
@@ -359,6 +487,20 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
 
   // User's name from onboarding profile
   const [userName, setUserName] = useState("");
+  const [yaaaDir, setYaaaDir] = useState("");
+
+  useEffect(() => {
+    TaskModel.getYaaaDir()
+      .then(setYaaaDir)
+      .catch(() => {});
+  }, []);
+
+  const handleOpenWorkingFolder = () => {
+    const activeId = selectedTaskId || taskId;
+    if (activeId) {
+      TaskModel.openWorkingFolder(activeId);
+    }
+  };
 
   // Registered MCP servers for the Active Integrations panel.
   const [mcpIntegrations, setMcpIntegrations] = useState<
@@ -637,6 +779,37 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     setRejecting(false);
   };
 
+  // Esc closes the top-most open popup, peeling nested popups off one at a time
+  // (e.g. a document viewer opened over the agent thread closes first, revealing
+  // the thread; a second Esc closes the thread). Repeated Esc therefore closes
+  // every popup. The API-key gate is intentionally excluded — it is a required
+  // step, not a dismissible popup.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      // When focus is in an editable field, Esc belongs to that field (e.g.
+      // cancelling an inline annotation edit), not to closing the popup.
+      const target = event.target as HTMLElement | null;
+      if (target && (target.tagName === "TEXTAREA" || target.tagName === "INPUT" || target.isContentEditable)) {
+        return;
+      }
+      if (viewerModal) {
+        setViewerModal(null);
+      } else if (planReviewOpen) {
+        handleClosePlanReview();
+      } else if (artifactPreview) {
+        handleClosePreview();
+      } else if (openThreadAgentId) {
+        setOpenThreadAgentId(null);
+      } else {
+        return;
+      }
+      event.stopPropagation();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [viewerModal, planReviewOpen, artifactPreview, openThreadAgentId]);
+
   const handleAcceptPlan = () => {
     const comment = planComment;
     const { targetTaskId, wasSelected } = activateSelectedPlan();
@@ -764,6 +937,12 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
         // Add live logs. System status logs are rendered inline
         // and cleared upon completion.
         logs.forEach((log) => {
+          // Sub-agent execution activity belongs to that agent's channel, not
+          // the main mission chat. It still reaches the thread view through
+          // getAgentActivity(agent, logs), so dropping it here only stops it
+          // from pinning to the bottom of the main conversation.
+          if (log.source === "agent") return;
+
           let sender = "Agent";
           if (log.source === "system") sender = "System";
           else if (log.source === "orchestrator") sender = "Orchestrator";
@@ -824,6 +1003,35 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
         }, [])
       : artifacts;
 
+    const contextChips = [];
+    const prjName = yaaaDir ? yaaaDir.split(/[/\\]/).pop() : "yaaa";
+    contextChips.push(`Project: ${prjName}`);
+
+    const extensions = new Set(
+      displayArtifacts
+        .map((a) => {
+          const ext = a.path.split(".").pop()?.toLowerCase();
+          return ext;
+        })
+        .filter(Boolean)
+    );
+
+    if (extensions.has("py")) contextChips.push("Language: Python");
+    if (extensions.has("ts") || extensions.has("tsx")) contextChips.push("Language: TypeScript");
+    if (extensions.has("js") || extensions.has("jsx")) contextChips.push("Language: JavaScript");
+    if (extensions.has("html")) contextChips.push("Language: HTML");
+    if (extensions.has("css")) contextChips.push("Language: CSS");
+    if (extensions.has("pptx")) contextChips.push("Format: PowerPoint (PPTX)");
+    if (extensions.has("png") || extensions.has("jpg") || extensions.has("jpeg")) contextChips.push("Media: Images");
+
+    if (userName) {
+      contextChips.push(`User: ${userName}`);
+    }
+
+    if (contextChips.length === 1) {
+      contextChips.push("Language: TypeScript", "Runtime: Electron");
+    }
+
     const currentStatus = selectedTaskId 
       ? (selectedTask?.status || parsedOrchestrator.status) 
       : (liveTask?.status || (awaitingConfirmation ? "awaiting_confirmation" : (running ? "running" : (success ? "success" : (success === false ? "failed" : "pending")))));
@@ -832,6 +1040,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
       displayMessages,
       displaySubtasks,
       displayArtifacts,
+      contextChips,
       currentStatus
     };
   }, [
@@ -850,36 +1059,187 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     awaitingConfirmation,
     success,
     inConversationView,
-    chatMessages
+    chatMessages,
+    yaaaDir,
+    userName
   ]);
 
-  const { displayMessages, displaySubtasks, displayArtifacts, currentStatus } = memoizedData;
+  const { displayMessages, displaySubtasks, displayArtifacts, contextChips, currentStatus } = memoizedData;
   const artifactGroups = useMemo(() => buildArtifactExplorer(displayArtifacts), [displayArtifacts]);
   const activeAgentCount = agents.filter(isActiveAgent).length;
   // Real capabilities this plan actually uses, replacing what used to be a
   // hardcoded fake Slack/GitHub/Web-Search "connected" list.
   const activeCapabilities = Array.from(new Set(displaySubtasks.map((st) => st.capability).filter(Boolean)));
 
-  // Each spawned agent runs in its own sub-thread. In the main channel we show
-  // a compact card (YAAA's handoff + a "Show thread" affordance); the full
-  // agent conversation and proof of work live behind the thread overlay.
+  // Each spawned agent runs in its own sub-thread. While the agent is running
+  // the main card shows YAAA's hands-on assignment; the agent-authored handoff
+  // only appears after the agent has produced completion evidence.
   const missionThreads = useMemo(() => {
     return agents.map((agent) => {
       const subtask = displaySubtasks.find((s: any) => s.id === agent.subtaskId);
       const activity = getAgentActivity(agent, logs);
-      const handoffParts: string[] = [];
-      if (subtask?.title) handoffParts.push(subtask.title);
+      const assignmentParts: string[] = [];
+      if (subtask?.title) assignmentParts.push(subtask.title);
       if ((subtask as any)?.successCriteria) {
-        handoffParts.push(`Success criteria: ${(subtask as any).successCriteria}`);
+        assignmentParts.push(`Success criteria: ${(subtask as any).successCriteria}`);
       }
-      const handoff = handoffParts.join("\n\n") || agent.summary || "Assignment briefing pending.";
-      return { agent, subtask, activity, handoff };
+      const assignment = assignmentParts.join("\n\n") || "Assignment briefing pending.";
+      const subtaskArtifacts = ((subtask as any)?.artifacts || []) as Array<{ path?: string; description?: string; mimeType?: string }>;
+      const agentWorkspacePrefix = `agent-workspaces/${agent.id}/`;
+      const artifacts = [...subtaskArtifacts, ...displayArtifacts].filter((artifact, index, all) => {
+        const path = String(artifact.path || "");
+        return path.startsWith(agentWorkspacePrefix) && all.findIndex((candidate) => candidate.path === artifact.path) === index;
+      });
+      const handsOnArtifact = artifacts.find((artifact) => /(?:^|\/)handsOn\.md$/i.test(String(artifact.path || "")));
+      const handOffArtifact = artifacts.find((artifact) => /(?:^|\/)handOff\.md$/i.test(String(artifact.path || "")));
+      const proofArtifact = artifacts.find((artifact) => /(?:^|\/)proofOfWork\.md$/i.test(String(artifact.path || "")));
+      const handoffReady = ["completed", "failed", "exited"].includes(agent.status) && Boolean(agent.summary || handOffArtifact);
+      const handoff = agent.summary || (handOffArtifact ? `${handOffArtifact.path}\n\n${handOffArtifact.description || "Agent handoff artifact ready."}` : "");
+      return { agent, subtask, activity, assignment, handoff, handoffReady, handsOnArtifact, handOffArtifact, proofArtifact };
     });
-  }, [agents, displaySubtasks, logs]);
+  }, [agents, displaySubtasks, displayArtifacts, logs]);
 
   const openThread = openThreadAgentId
     ? missionThreads.find((t) => t.agent.id === openThreadAgentId) || null
     : null;
+
+  // Anchor each agent's inline "View channel" card to the first lifecycle
+  // notice that announced it, so the card appears in the stream where the
+  // agent spun up rather than in a block pinned to the bottom of the chat.
+  const agentCardByMessageId = useMemo(() => {
+    const map = new Map<string, (typeof missionThreads)[number]>();
+    const claimed = new Set<string>();
+    for (const thread of missionThreads) {
+      const needles = [thread.agent.id, thread.agent.handle?.replace(/^@/, ""), thread.agent.displayName]
+        .filter(Boolean)
+        .map((n) => String(n).toLowerCase());
+      const anchor = displayMessages.find(
+        (m: any) =>
+          m.kind === "lifecycle" &&
+          !claimed.has(m.id) &&
+          needles.some((n) => m.content.toLowerCase().includes(n)),
+      );
+      if (anchor) {
+        claimed.add(anchor.id);
+        map.set(anchor.id, thread);
+      }
+    }
+    return map;
+  }, [missionThreads, displayMessages]);
+
+  const anchoredAgentIds = useMemo(
+    () => new Set(Array.from(agentCardByMessageId.values()).map((t) => t.agent.id)),
+    [agentCardByMessageId],
+  );
+
+  // One row in the artifact explorer. Extracted so both the flat groups and the
+  // per-agent sub-groups (agent artifacts) render identically.
+  const renderArtifactItem = (art: ArtifactExplorerEntry, groupLabel: string) => (
+    <div
+      key={art.normalizedPath}
+      className="artifact-item"
+      role="treeitem"
+      aria-label={`${groupLabel}: ${art.name}`}
+      data-artifact-kind={art.groupId}
+      aria-level={Math.max(1, art.depth + 1)}
+    >
+      <div className="artifact-tree-branch" aria-hidden="true" />
+      <div className="artifact-item-copy">
+        {art.directorySegments.length > 0 && (
+          <div className="artifact-path">{art.directorySegments.join(" / ")}</div>
+        )}
+        <div className="artifact-name-row">
+          <span className="artifact-name">{art.name}</span>
+          <span className={`artifact-type-badge ${art.mediaKind || art.handoffKind || art.groupId}`}>
+            {art.typeLabel}
+          </span>
+        </div>
+        <div className="artifact-desc">{art.description}</div>
+      </div>
+      <div className="artifact-actions">
+        {isPreviewableArtifact(art.path) ? (
+          <button
+            type="button"
+            className="artifact-link"
+            onClick={() => handlePreviewArtifact(art.path)}
+          >
+            Open
+          </button>
+        ) : (
+          <span
+            className="artifact-link disabled"
+            title="Preview not supported for this file type yet"
+          >
+            Open
+          </span>
+        )}
+      </div>
+    </div>
+  );
+
+  const toggleAgentArtifactGroup = (agentId: string) => {
+    setExpandedAgentArtifactGroups((current) => {
+      const next = new Set(current);
+      if (next.has(agentId)) next.delete(agentId);
+      else next.add(agentId);
+      return next;
+    });
+  };
+
+  // One collapsed card per spawned sub-agent: the assignment/handoff document
+  // opens in the viewer, and "View channel" opens that agent's full sub-channel.
+  const renderMissionThreadCard = ({ agent, activity, assignment, handoff, handoffReady, handsOnArtifact, handOffArtifact }: (typeof missionThreads)[number]) => {
+    const identity = labelForSender(agent.id);
+    const documentTitle = handoffReady ? "Handoff document" : "handsOn assignment";
+    const documentHeading = handoffReady
+      ? `${identity} → ${ORCHESTRATOR_DISPLAY} · Handoff`
+      : `${ORCHESTRATOR_DISPLAY} → ${identity} · handsOn`;
+    const documentBody = handoffReady ? handoff : assignment;
+    const documentArtifact = handoffReady ? handOffArtifact : handsOnArtifact;
+    return (
+      <div className="mission-thread-card" key={`card-${agent.id}`}>
+        <div
+          className="slack-message-avatar mission-thread-avatar"
+          style={{ backgroundColor: getAvatarColor(identity) }}
+        >
+          {identity.charAt(0).toUpperCase()}
+        </div>
+        <div className="mission-thread-body">
+          <div className="mission-thread-header">
+            <span className="mission-thread-name">{identity}</span>
+            <span className={`detail-status-pill ${agent.status}`}>{agent.status}</span>
+          </div>
+          <button
+            type="button"
+            className="mission-thread-handoff mission-thread-handoff-open"
+            title={`Open ${documentTitle}`}
+            onClick={() =>
+              setViewerModal({
+                type: "markdown",
+                source: documentArtifact?.path
+                  ? { path: documentArtifact.path }
+                  : { content: `# ${documentHeading}\n\n${documentBody}` },
+                display: "popup",
+                title: documentTitle,
+              })
+            }
+          >
+            <span className="mission-thread-handoff-label">
+              {handoffReady ? `${identity} handoff · open →` : `${ORCHESTRATOR_DISPLAY} handsOn · open →`}
+            </span>
+            <div className="mission-thread-handoff-text">{documentBody}</div>
+          </button>
+        </div>
+        <button
+          type="button"
+          className="mission-thread-show-btn"
+          onClick={() => setOpenThreadAgentId(agent.id)}
+        >
+          View channel{activity.length > 0 ? ` · ${activity.length}` : ""} →
+        </button>
+      </div>
+    );
+  };
 
   // Collapse runs of consecutive "thinking" messages into a single dropdown
   // panel; everything else renders as an individual chat bubble.
@@ -1159,11 +1519,14 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                     );
                   }
                   const msg = group.msg;
-                  // Agent-spawn lifecycle notices are represented by the thread
-                  // cards below, so suppress them from the inline stream once a
-                  // thread exists for that work.
-                  if (msg.kind === "lifecycle" && missionThreads.length > 0 && !selectedTaskId) {
-                    return null;
+                  // An agent-spawn lifecycle notice becomes that agent's inline
+                  // "View channel" card, placed where the agent joined. Any
+                  // other lifecycle chatter is folded into the card, so suppress
+                  // it from the main stream once a thread exists for the work.
+                  if (msg.kind === "lifecycle") {
+                    const cardThread = agentCardByMessageId.get(msg.id);
+                    if (cardThread) return renderMissionThreadCard(cardThread);
+                    if (missionThreads.length > 0 && !selectedTaskId) return null;
                   }
                   const senderLabel = labelForSender(msg.sender);
                   if (msg.kind === "plan_proposal") {
@@ -1233,7 +1596,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                       </div>
                       <div className={`slack-message-bubble ${senderLabel === 'User' ? 'slack-message-sender-user' : ''} ${msg.kind === 'response' ? 'slack-message-response' : ''} ${msg.kind === 'activity' ? 'slack-message-activity' : ''}`}>
                         <div className="slack-message-text">
-                          {(msg.id === displayMessages.filter(m => m.sender !== 'User' && m.kind === 'response').pop()?.id && !selectedTaskId && !msg.isHistorical && !typedMessageIds.has(msg.id) && !msg.content.includes("```yaaa-viewer")) ? (
+                          {(msg.id === displayMessages.filter(m => m.sender !== 'User' && m.kind === 'response').pop()?.id && !selectedTaskId && !msg.isHistorical && !typedMessageIds.has(msg.id) && !msg.content.includes("```yaaa-viewer") && !isLargeMarkdown(msg.content)) ? (
                             <TypingText text={msg.content} onComplete={() => handleTypeComplete(msg.id)} />
                           ) : (
                             <RichMessageContent
@@ -1280,42 +1643,15 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   );
                 })}
 
-                {/* Mission threads — one collapsed card per spawned sub-agent.
-                    YAAA's handoff shows inline; the full agent thread and proof
-                    of work open in a dedicated thread view. */}
-                {showTaskView && !selectedTaskId && missionThreads.length > 0 && (
+                {/* Fallback: any agent whose spawn notice hasn't arrived yet has
+                    no inline anchor, so surface its card here so no sub-channel
+                    is ever hidden. Anchored agents render inline above. */}
+                {showTaskView && !selectedTaskId &&
+                  missionThreads.some((t) => !anchoredAgentIds.has(t.agent.id)) && (
                   <div className="mission-threads" aria-label="Agent threads">
-                    <div className="mission-threads-title">Agent threads</div>
-                    {missionThreads.map(({ agent, activity, handoff }) => {
-                      const identity = labelForSender(agent.id);
-                      return (
-                        <div className="mission-thread-card" key={agent.id}>
-                          <div
-                            className="slack-message-avatar mission-thread-avatar"
-                            style={{ backgroundColor: getAvatarColor(identity) }}
-                          >
-                            {identity.charAt(0).toUpperCase()}
-                          </div>
-                          <div className="mission-thread-body">
-                            <div className="mission-thread-header">
-                              <span className="mission-thread-name">{identity}</span>
-                              <span className={`detail-status-pill ${agent.status}`}>{agent.status}</span>
-                            </div>
-                            <div className="mission-thread-handoff">
-                              <span className="mission-thread-handoff-label">{ORCHESTRATOR_DISPLAY} handoff</span>
-                              <div className="mission-thread-handoff-text">{handoff}</div>
-                            </div>
-                          </div>
-                          <button
-                            type="button"
-                            className="mission-thread-show-btn"
-                            onClick={() => setOpenThreadAgentId(agent.id)}
-                          >
-                            Show thread{activity.length > 0 ? ` · ${activity.length}` : ""} →
-                          </button>
-                        </div>
-                      );
-                    })}
+                    {missionThreads
+                      .filter((t) => !anchoredAgentIds.has(t.agent.id))
+                      .map((thread) => renderMissionThreadCard(thread))}
                   </div>
                 )}
 
@@ -1472,75 +1808,60 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                             <span>{group.label}</span>
                             <span className="artifact-group-count">{group.entries.length}</span>
                           </div>
-                          {group.entries.map((art) => (
-                            <div
-                              key={art.normalizedPath}
-                              className="artifact-item"
-                              role="treeitem"
-                              aria-label={`${group.label}: ${art.name}`}
-                              data-artifact-kind={art.groupId}
-                              aria-level={Math.max(1, art.depth + 1)}
-                            >
-                              <div className="artifact-tree-branch" aria-hidden="true" />
-                              <div className="artifact-item-copy">
-                                {art.directorySegments.length > 0 && (
-                                  <div className="artifact-path">{art.directorySegments.join(" / ")}</div>
-                                )}
-                                <div className="artifact-name-row">
-                                  <span className="artifact-name">{art.name}</span>
-                                  <span className={`artifact-type-badge ${art.mediaKind || art.handoffKind || art.groupId}`}>
-                                    {art.typeLabel}
-                                  </span>
-                                </div>
-                                <div className="artifact-desc">{art.description}</div>
-                              </div>
-                              <div className="artifact-actions">
-                                {isPreviewableArtifact(art.path) ? (
+                          {group.id === "handoffs"
+                            ? (
+                              <div className="artifact-group-contents">
+                                {groupEntriesByAgent(group.entries).map(({ agentId, entries }) => {
+                                  const groupKey = agentId || "unassigned";
+                                  const expanded = expandedAgentArtifactGroups.has(groupKey);
+                                  return (
+                                <div className="artifact-agent-group" key={groupKey}>
                                   <button
                                     type="button"
-                                    className="artifact-link"
-                                    onClick={() => handlePreviewArtifact(art.path)}
+                                    className="artifact-agent-group-title artifact-agent-group-toggle"
+                                    aria-expanded={expanded}
+                                    aria-controls={`agent-artifacts-${groupKey}`}
+                                    onClick={() => toggleAgentArtifactGroup(groupKey)}
                                   >
-                                    Open
+                                    <span className="artifact-agent-toggle-label">
+                                      <span className={`artifact-group-chevron ${expanded ? "" : "collapsed"}`} aria-hidden="true">v</span>
+                                      <span>{agentId ? labelForSender(agentId) : "Unassigned"}</span>
+                                    </span>
+                                    <span className="artifact-agent-count">{entries.length}</span>
                                   </button>
-                                ) : (
-                                  <span
-                                    className="artifact-link disabled"
-                                    title="Preview not supported for this file type yet"
-                                  >
-                                    Open
-                                  </span>
-                                )}
+                                  {expanded && (
+                                    <div id={`agent-artifacts-${groupKey}`} className="artifact-agent-contents">
+                                      {entries.map((art) => renderArtifactItem(art, group.label))}
+                                    </div>
+                                  )}
+                                </div>
+                                  );
+                                })}
                               </div>
-                            </div>
-                          ))}
+                            )
+                            : group.entries.map((art) => renderArtifactItem(art, group.label))}
                         </section>
                       ))}
                     </div>
                   )}
                 </div>
 
-                {/* ── 2. Working folder (HARDCODED placeholder) ── */}
+                {/* ── 2. Working folder ── */}
                 <div className="slack-details-section">
                   <div className="slack-section-title">Working folder</div>
-                  {/* Raw task UUIDs are forbidden on screen — identify the
-                      folder by its channel name instead of its id. */}
-                  <div className="working-folder-path">
-                    ~/.yaaa/tasks/#{currentChannelName}
-                  </div>
-                  <div className="working-folder-list">
-                    <div className="working-folder-row">
-                      <span className="working-folder-icon" aria-hidden="true">📁</span>
-                      <span className="working-folder-name">working/</span>
-                    </div>
-                    <div className="working-folder-row">
-                      <span className="working-folder-icon" aria-hidden="true">📄</span>
-                      <span className="working-folder-name">orchestrator.md</span>
-                    </div>
-                    <div className="working-folder-row">
-                      <span className="working-folder-icon" aria-hidden="true">📄</span>
-                      <span className="working-folder-name">messages.jsonl</span>
-                    </div>
+                  <div className="working-folder-path" style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                    <span style={{ fontSize: "11px", color: "var(--slack-text-muted)", wordBreak: "break-all", fontFamily: "var(--font-mono)" }}>
+                      {yaaaDir && (selectedTaskId || taskId) ? `${yaaaDir}/tasks/${selectedTaskId || taskId}/working` : "No active task directory"}
+                    </span>
+                    {yaaaDir && (selectedTaskId || taskId) && (
+                      <button
+                        className="slack-channel-delete-confirm-btn"
+                        style={{ padding: "4px 8px", fontSize: "11px", width: "fit-content", alignSelf: "flex-start" }}
+                        onClick={handleOpenWorkingFolder}
+                      >
+                        Open in Finder
+                      </button>
+                    )}
                   </div>
                 </div>
 
@@ -1582,13 +1903,13 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   )}
                 </div>
 
-                {/* ── 4. Contexts (HARDCODED placeholder) ── */}
+                {/* ── 4. Contexts ── */}
                 <div className="slack-details-section">
                   <div className="slack-section-title">Contexts</div>
                   <div className="context-chips">
-                    <span className="context-chip">Project: yaaa</span>
-                    <span className="context-chip">Language: TypeScript</span>
-                    <span className="context-chip">Runtime: Electron</span>
+                    {contextChips.map((chip, idx) => (
+                      <span className="context-chip" key={idx}>{chip}</span>
+                    ))}
                   </div>
                 </div>
 
@@ -1723,7 +2044,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
       )}
 
       {viewerModal && (
-        <div className="artifact-preview-overlay" onClick={() => setViewerModal(null)} data-testid="universal-viewer-modal">
+        <div className="artifact-preview-overlay viewer-modal-overlay" onClick={() => setViewerModal(null)} data-testid="universal-viewer-modal">
           <div className="artifact-preview-panel universal-viewer-panel" onClick={(event) => event.stopPropagation()}>
             <div className="artifact-preview-header">
               <span className="artifact-preview-title">{viewerModal.title || viewerModal.source.path?.split("/").pop() || `${viewerModal.type} viewer`}</span>
@@ -1853,29 +2174,100 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
             <div className="artifact-preview-body">
               <div className="thread-section">
                 <div className="thread-section-title">
-                  {ORCHESTRATOR_DISPLAY} → {labelForSender(openThread.agent.id)} · Handoff document
+                  {ORCHESTRATOR_DISPLAY} → {labelForSender(openThread.agent.id)} · handsOn assignment
                 </div>
-                <div className="thread-handoff-doc">{openThread.handoff}</div>
+                <button
+                  type="button"
+                  className="thread-handoff-doc thread-doc-open"
+                  title="Open handsOn assignment"
+                  onClick={() =>
+                    setViewerModal({
+                      type: "markdown",
+                      source: openThread.handsOnArtifact?.path
+                        ? { path: openThread.handsOnArtifact.path }
+                        : {
+                            content: `# ${ORCHESTRATOR_DISPLAY} → ${labelForSender(openThread.agent.id)} · handsOn\n\n${openThread.assignment}`,
+                          },
+                      display: "popup",
+                      title: "handsOn assignment",
+                    })
+                  }
+                >
+                  {openThread.assignment}
+                  <span className="thread-doc-open-hint">Open document →</span>
+                </button>
               </div>
+              {openThread.handoffReady && (
+                <div className="thread-section">
+                  <div className="thread-section-title">
+                    {labelForSender(openThread.agent.id)} → {ORCHESTRATOR_DISPLAY} · Handoff document
+                  </div>
+                  <button
+                    type="button"
+                    className="thread-handoff-doc thread-doc-open"
+                    title="Open handoff document"
+                    onClick={() =>
+                      setViewerModal({
+                        type: "markdown",
+                        source: openThread.handOffArtifact?.path
+                          ? { path: openThread.handOffArtifact.path }
+                          : {
+                              content: `# ${labelForSender(openThread.agent.id)} → ${ORCHESTRATOR_DISPLAY} · Handoff\n\n${openThread.handoff}`,
+                            },
+                        display: "popup",
+                        title: "Handoff document",
+                      })
+                    }
+                  >
+                    {openThread.handoff}
+                    <span className="thread-doc-open-hint">Open document →</span>
+                  </button>
+                </div>
+              )}
               <div className="thread-section">
                 <div className="thread-section-title">Thread activity ({openThread.activity.length})</div>
                 {openThread.activity.length === 0 ? (
                   <div className="agent-space-block-text">No activity reported yet.</div>
                 ) : (
                   openThread.activity.map((log) => (
-                    <div className="agent-space-action-row" key={log.id}>
-                      <span className="agent-space-action-icon" aria-hidden="true">💭</span>
-                      <span className="agent-space-action-text">{log.content}</span>
-                    </div>
+                    <ActivityPreview log={log} key={log.id} />
                   ))
                 )}
               </div>
               <div className="thread-section">
                 <div className="thread-section-title">Proof of work</div>
                 <div className="agent-space-block-text">
-                  Status: {openThread.agent.status}
-                  {openThread.agent.summary ? ` — ${openThread.agent.summary}` : ""}
+                  Status: <span className={`detail-status-pill ${openThread.agent.status}`}>{openThread.agent.status}</span>
                 </div>
+                <AgentWorkingStatus agent={openThread.agent} activity={openThread.activity} />
+                {openThread.agent.summary || openThread.proofArtifact ? (
+                  <button
+                    type="button"
+                    className="thread-handoff-doc thread-doc-open"
+                    title="Open proof-of-work document"
+                    onClick={() =>
+                      setViewerModal({
+                        type: "markdown",
+                        source: openThread.proofArtifact?.path
+                          ? { path: openThread.proofArtifact.path }
+                          : {
+                              content: `# ${labelForSender(openThread.agent.id)} → ${ORCHESTRATOR_DISPLAY} · Proof of work\n\n${openThread.agent.summary}`,
+                            },
+                        display: "popup",
+                        title: "Proof of work",
+                      })
+                    }
+                  >
+                    {openThread.proofArtifact
+                      ? `${openThread.proofArtifact.path}\n\n${openThread.proofArtifact.description || "Proof of work artifact ready."}`
+                      : openThread.agent.summary}
+                    <span className="thread-doc-open-hint">Open document →</span>
+                  </button>
+                ) : (
+                  <div className="agent-space-block-text">
+                    The agent has not reported its proof of work yet.
+                  </div>
+                )}
               </div>
             </div>
           </div>

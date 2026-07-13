@@ -404,7 +404,7 @@ describe("DashboardView", () => {
 
     expect(screen.getByRole("tree", { name: "Mission artifacts" })).toBeTruthy();
     expect(screen.getByRole("group", { name: "Plans" })).toBeTruthy();
-    expect(screen.getByRole("group", { name: "Agent handoffs" })).toBeTruthy();
+    expect(screen.getByRole("group", { name: "Agent artifacts" })).toBeTruthy();
     expect(screen.getByRole("group", { name: "Generated media" })).toBeTruthy();
     expect(screen.getByRole("group", { name: "Documents & files" })).toBeTruthy();
     expect(
@@ -416,6 +416,29 @@ describe("DashboardView", () => {
     expect(screen.getByText("HANDS OFF")).toBeTruthy();
     expect(screen.getByText("Video")).toBeTruthy();
     expect(screen.getAllByText("agents / builder")).toHaveLength(2);
+  });
+
+  it("collapses agent artifact subgroups by default and expands them independently", () => {
+    render(<DashboardView viewModel={makeViewModel({
+      taskId: "task-1",
+      artifacts: [
+        { path: "agents/builder/HANDS_ON.md", mimeType: "text/markdown", description: "Agent boundaries" },
+        { path: "agents/builder/HANDS_OFF.md", mimeType: "text/markdown", description: "Completed changes" },
+      ],
+    })} />);
+
+    expect(screen.getByRole("group", { name: "Agent artifacts" })).toBeTruthy();
+    const toggle = screen.getByRole("button", { name: /builder/i });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText("HANDS ON")).toBeNull();
+
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText("HANDS ON")).toBeTruthy();
+
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText("HANDS ON")).toBeNull();
   });
 
   it("lists registered MCP servers in Active Integrations with their consent state", async () => {
@@ -708,14 +731,17 @@ describe("DashboardView", () => {
       }],
     })} />);
 
-    // The handoff document is shown inline on the thread card.
+    // The hands-on assignment is shown inline on the thread card while work is in progress.
     expect(screen.getByText("Investigate the repo")).toBeTruthy();
-    fireEvent.click(screen.getByText(/Show thread/));
-    // Thread overlay shows the handoff document and success criteria.
-    expect(screen.getByText(/Handoff document/)).toBeTruthy();
+    expect(screen.getByText(/handsOn · open/)).toBeTruthy();
+    expect(screen.queryByText(/handoff · open/)).toBeNull();
+    fireEvent.click(screen.getByText(/View channel/));
+    // Thread overlay shows the assignment and success criteria, but no agent handoff yet.
+    expect(screen.getByText(/handsOn assignment/)).toBeTruthy();
+    expect(screen.queryByText(/Handoff document/)).toBeNull();
     expect(screen.getAllByText(/Findings documented/).length).toBeGreaterThan(0);
 
     fireEvent.click(screen.getByText("← Back"));
-    expect(screen.queryByText(/Handoff document/)).toBeNull();
+    expect(screen.queryByText(/handsOn assignment/)).toBeNull();
   });
 });

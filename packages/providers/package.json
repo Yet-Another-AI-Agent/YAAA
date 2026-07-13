@@ -9,10 +9,14 @@
     "build": "tsc -b"
   },
   "dependencies": {
-    "@yaaa/shared": "*",
     "@yaaa/interfaces": "*",
+    "@yaaa/shared": "*",
     "better-sqlite3": "^11.1.2",
-    "openai": "^4.52.7"
+    "cheerio": "^1.0.0",
+    "fast-glob": "^3.3.3",
+    "node-pty": "^1.1.0",
+    "openai": "^4.52.7",
+    "playwright": "^1.61.1"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.11"

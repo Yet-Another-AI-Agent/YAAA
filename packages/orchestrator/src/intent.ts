@@ -23,9 +23,9 @@ const FALLBACK_GREETING =
   "Hello! I'm the YAAA orchestrator. What are we building or working on today?";
 
 /**
- * Deterministic small-talk detector. These inputs must never reach the
- * planner, with or without an LLM available, so the check is pure regex —
- * greetings, thanks, farewells, and short capability questions.
+ * Offline fallback only. Live non-empty messages are always classified by the
+ * model first; these patterns prevent an outage from turning obvious greetings
+ * into tasks.
  */
 const CONVERSATIONAL_PATTERNS: RegExp[] = [
   /^(hi+|hii+|hello+|hey+|heya|yo|sup|howdy|hola|namaste)\b[\s!.,?]*$/i,
@@ -71,7 +71,7 @@ export class IntentRouter {
     message: string,
     context: IntentRouterContext = {},
   ): Promise<IntentDecision> {
-    if (detectConversationalHeuristic(message)) {
+    if (!message.trim()) {
       return {
         intent: "conversation",
         reply: await this.generateReply(message, context),
@@ -79,13 +79,16 @@ export class IntentRouter {
     }
 
     const classification = await this.classifyWithModel(message);
-    if (classification.intent === "conversation") {
+    if (classification?.intent === "conversation") {
       return {
         intent: "conversation",
         reply:
           sanitizeReply(classification.reply) ??
           (await this.generateReply(message, context)),
       };
+    }
+    if (!classification && detectConversationalHeuristic(message)) {
+      return { intent: "conversation", reply: await this.generateReply(message, context) };
     }
     return { intent: "task" };
   }
@@ -95,14 +98,14 @@ export class IntentRouter {
    * network, malformed JSON, mock-mode placeholder output — defaults to "task"
    * so a real work request is never silently swallowed.
    */
-  private async classifyWithModel(message: string): Promise<IntentDecision> {
+  private async classifyWithModel(message: string): Promise<IntentDecision | null> {
     const messages: ChatMessage[] = [
       {
         role: "system",
         content: `You are the intent classifier for YAAA's orchestrator.
 Decide whether the user's message is casual conversation or an actionable work request.
-"conversation": greetings, small talk, questions about you, acknowledgements, chit-chat.
-"task": anything that asks for work — building, researching, writing, fixing, planning, designing.
+"conversation": greetings, small talk, questions about you, acknowledgements, chit-chat, questions about completed work, status queries, or asking where files/slides/artifacts are located.
+"task": anything requesting new work to be started or executed — building, researching, writing, fixing, planning, designing.
 Respond with ONLY a JSON object: {"intent": "conversation" | "task", "reply": "short friendly reply if conversation, else empty string"}`,
       },
       { role: "user", content: message },
@@ -115,7 +118,7 @@ Respond with ONLY a JSON object: {"intent": "conversation" | "task", "reply": "s
       });
       const raw = rawRes.content;
       const match = raw.match(/\{[\s\S]*\}/);
-      if (!match) return { intent: "task" };
+      if (!match) return null;
       const parsed = JSON.parse(match[0]);
       if (parsed?.intent === "conversation") {
         return {
@@ -123,9 +126,10 @@ Respond with ONLY a JSON object: {"intent": "conversation" | "task", "reply": "s
           reply: typeof parsed.reply === "string" ? parsed.reply : undefined,
         };
       }
-      return { intent: "task" };
+      if (parsed?.intent === "task") return { intent: "task" };
+      return null;
     } catch {
-      return { intent: "task" };
+      return null;
     }
   }
 

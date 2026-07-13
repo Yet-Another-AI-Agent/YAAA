@@ -11,7 +11,7 @@ export type RuntimeEvent =
   | { type: "task-started"; taskId: string }
   | { type: "plan-updated"; plan: TaskPlan }
   | { type: "thought"; from: string; content: string }
-  | { type: "tool-requested"; from: string; content: string }
+  | { type: "tool-requested"; from: string; content: string; metadata?: Record<string, unknown> }
   | { type: "agent-status"; agent: AgentRun }
   | { type: "status"; from: string; note: string }
   | { type: "result"; from: string; summary: string; artifacts: ArtifactRef[] }
@@ -74,7 +74,13 @@ export function mapBusEvent(
   if (topic.startsWith(`${base}.agent.`) && topic.endsWith(".tool_requested")) {
     const from =
       topic.split(".").find((p) => p.includes("agent-")) ?? msg?.from ?? "agent";
-    return { type: "tool-requested", from, content: msg?.content ?? "" };
+    const metadata = msg?.metadata && typeof msg.metadata === "object" ? msg.metadata : undefined;
+    return {
+      type: "tool-requested",
+      from,
+      content: msg?.content ?? "",
+      ...(metadata ? { metadata } : {}),
+    };
   }
 
   if (topic.startsWith(`${base}.agent.`) && topic.endsWith(".lifecycle")) {

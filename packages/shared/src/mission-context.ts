@@ -19,6 +19,8 @@ export interface DependencyOutput {
   title: string;
   /** One-paragraph summary of what that subtask produced. */
   summary: string;
+  /** Durable artifacts produced by the agent, including proof and handoff docs. */
+  artifacts?: Array<{ path: string; mimeType: string; description: string }>;
 }
 
 export interface AgentBriefInput {
@@ -38,6 +40,12 @@ export interface AgentBriefInput {
   retryDirective?: string;
   /** Character budget for the dependency-results section (~4 chars/token). */
   maxDependencyChars?: number;
+  /** Orchestrator-authored assignment document path for this agent. */
+  handsOnPath?: string;
+  /** Agent-authored proof-of-work path expected at completion. */
+  proofOfWorkPath?: string;
+  /** Agent-authored handoff path expected at completion. */
+  handOffPath?: string;
 }
 
 /** ~1.5k tokens of dependency context by default. */
@@ -89,6 +97,9 @@ export function buildAgentBrief(input: AgentBriefInput): string {
     dependencyOutputs = [],
     retryDirective,
     maxDependencyChars = DEFAULT_MAX_DEPENDENCY_CHARS,
+    handsOnPath,
+    proofOfWorkPath,
+    handOffPath,
   } = input;
 
   const sections: string[] = [];
@@ -103,9 +114,33 @@ export function buildAgentBrief(input: AgentBriefInput): string {
     `## Success criteria\n${successCriteria?.trim() || "(not specified)"}`,
   );
 
+  if (handsOnPath || proofOfWorkPath || handOffPath) {
+    const lines = [
+      handsOnPath
+        ? `- Read the orchestrator-authored hands-on brief at \`${handsOnPath}\` before acting.`
+        : "",
+      proofOfWorkPath
+        ? `- Create proof of work at \`${proofOfWorkPath}\` with text evidence, test output, screenshots/images, or artifact references.`
+        : "",
+      handOffPath
+        ? `- Create the final handoff at \`${handOffPath}\` with work done, observations, suggestions, asset metadata, residual risks, and continuation instructions for the orchestrator or another agent.`
+        : "",
+    ].filter(Boolean);
+    sections.push(`## Handoff contract\n${lines.join("\n")}`);
+  }
+
+  sections.push(
+    `## Exit checklist\nBefore you stop, verify every item below:\n- The requested deliverable exists as a concrete file/artifact, not only as search results, notes in chat, or a tool observation.\n- The deliverable satisfies the success criteria above; if it does not, keep working or write a clear blocker handoff.\n- You used available tools to check the deliverable exists and, when possible, reopened/read/rendered/tested it.\n${proofOfWorkPath ? `- You wrote proof of work to \`${proofOfWorkPath}\` with the evidence from that check.` : "- You recorded proof of work with concrete evidence from that check."}\n${handOffPath ? `- You wrote the final handoff to \`${handOffPath}\` with work done, observations, suggestions, asset metadata, residual risks, and continuation instructions.` : "- You wrote a final handoff with work done, observations, suggestions, asset metadata, residual risks, and continuation instructions."}\n- Do not exit immediately after web.search, list_files, read_file, or browser inspection unless you have also created/found the deliverable artifact and completed the proof/handoff.`,
+  );
+
   if (dependencyOutputs.length > 0) {
     const lines = dependencyOutputs.map(
-      (d) => `- [${d.id}] ${d.title}: ${d.summary}`,
+      (d) => {
+        const artifactSummary = d.artifacts?.length
+          ? ` Artifacts: ${d.artifacts.map((a) => `${a.path} (${a.description})`).join("; ")}`
+          : "";
+        return `- [${d.id}] ${d.title}: ${d.summary}${artifactSummary}`;
+      },
     );
     sections.push(
       `## Results from completed dependencies\n${budgetLines(lines, maxDependencyChars)}`,
@@ -117,7 +152,7 @@ export function buildAgentBrief(input: AgentBriefInput): string {
   }
 
   sections.push(
-    `Work toward the mission goal above. Use tools as needed, and emit your final result payload once the success criteria are met.`,
+    `Work toward the mission goal above. Use tools as needed. Only emit your final result after the exit checklist is satisfied, or after you have written a blocker handoff explaining exactly why it cannot be satisfied.`,
   );
 
   return sections.join("\n\n");

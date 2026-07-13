@@ -9,6 +9,48 @@ export interface PlanContext {
   priorSummary?: string;
 }
 
+/**
+ * Model tiers used across planning and fallback routing — the single source of
+ * truth so a subtask's *default* model matches the rubric the planner prompt
+ * advertises. These are Mesh model ids; the planner can still override any
+ * subtask with an explicit `model`.
+ */
+export const MODEL_TIERS = {
+  simple: "anthropic/claude-haiku-4.5",
+  medium: "google/gemini-2.5-flash",
+  complex: "anthropic/claude-sonnet-5",
+} as const;
+
+/** Agent templates whose work is engineering-heavy enough to warrant the top tier. */
+const COMPLEX_AGENT_TEMPLATES = new Set([
+  "PrincipalSweAgent",
+  "UiArchitectAgent",
+  "GraphicsEngineerAgent",
+]);
+
+/**
+ * Tier-aware default model for a subtask, used only when the planner did not
+ * assign an explicit `model`. Replaces the previous blanket gemini-flash
+ * fallback that collapsed nearly every subtask onto one mid-tier model.
+ */
+export function defaultModelForSubtask(subtask: {
+  capability: string;
+  riskLevel?: string;
+  agentTemplate?: string;
+}): string {
+  // High-stakes or engineering-heavy work gets the strongest tier.
+  if (subtask.riskLevel === "high") return MODEL_TIERS.complex;
+  if (subtask.agentTemplate && COMPLEX_AGENT_TEMPLATES.has(subtask.agentTemplate)) {
+    return MODEL_TIERS.complex;
+  }
+  // Simple, well-bounded file ops and verification go to the cheapest tier.
+  if (subtask.capability === "verify" || subtask.capability === "files") {
+    return MODEL_TIERS.simple;
+  }
+  // Everything else (docs, browser, integration, shell content work) is mid-tier.
+  return MODEL_TIERS.medium;
+}
+
 const NUMBER_WORDS: Record<string, number> = {
   one: 1,
   two: 2,
@@ -30,7 +72,7 @@ export function getRequestedAgentCount(goal: string): number | null {
   if (!match) return null;
   const token = match[1].toLowerCase();
   const count = NUMBER_WORDS[token] ?? Number.parseInt(token, 10);
-  return Number.isInteger(count) && count > 0 && count <= 20 ? count : null;
+  return Number.isInteger(count) && count > 0 && count <= 300 ? count : null;
 }
 
 /** Render the plan-context preamble prepended to the planning request. */
@@ -79,6 +121,13 @@ export class Planner {
     const systemPrompt = `You are a central Task Planner for YAAA.
 Your job is to break down a user's task into a sequential, structured list of subtasks.
 Each subtask represents a step in a task graph and must declare its capabilities, dependencies, riskLevel, and success criteria.
+You must also choose the best agentTemplate from the allowed roster and explain that choice in routingReason.
+You MUST assign every subtask an explicit 'model'. Tier it to the actual difficulty of the work — do NOT default everything to flash:
+- "anthropic/claude-haiku-4.5" (cheapest) — simple file operations, QA/verification, unit testing, and other well-bounded low-risk steps. This is the correct default for FilesAgent/QaTesterAgent/verify work.
+- "google/gemini-2.5-flash" (mid, cost-aware) — web research, browser/search, document/PPT/content generation, and other medium tasks where a fast first tool turn matters.
+- "anthropic/claude-sonnet-5" (strongest) — complex coding, software architecture, hard debugging, high-stakes product/layout decisions, and any subtask routed to PrincipalSweAgent, UiArchitectAgent, or GraphicsEngineerAgent, or with riskLevel "high".
+- "google/gemini-2.5-pro" — only for non-interactive deep synthesis tasks that do not need immediate tool calls.
+Make this semantic decision from the complete subtask, not by matching isolated keywords. Reserve sonnet for genuinely hard work and prefer haiku for simple steps so the plan stays cost-aware.
 
 Execution contract:
 - Every subtask is executed by a newly spawned agent. Therefore the number of subtasks is the number of agents that will be spawned.
@@ -87,8 +136,27 @@ Execution contract:
 ${requestedAgentCount ? `- This user explicitly requested exactly ${requestedAgentCount} agents, so this plan MUST contain exactly ${requestedAgentCount} subtasks.` : ""}
 
 Available capabilities:
-- "files": file read, write, search.
-- "verify": validation pass.
+- "files", "browser", "shell", "integration", "docs", and "verify".
+
+Allowed agentTemplate values:
+- FilesAgent: general file and document work
+- DocumentAgent: reports, Markdown documents, PowerPoint/PPTX, slide outlines, speaker notes, spreadsheets, and non-code content artifacts
+- PrincipalSweAgent: backend and complex software engineering
+- UiArchitectAgent: frontend and interface engineering
+- GraphicsEngineerAgent: graphics, geometry, WebGL, and rendering
+- ResearcherAgent: web research and analysis
+- AdStrategistAgent: advertising and campaign strategy
+- DesignerAgent: visual and brand design
+- DevOpsAgent: infrastructure, deployment, and operational work
+- QaTesterAgent: functional and automated verification
+- CvTesterAgent: visual, screenshot, and GUI verification
+
+Routing constraints:
+- Use DocumentAgent for docs/PPT/report/spreadsheet/content-artifact creation. Do NOT use PrincipalSweAgent for document or presentation generation unless the user explicitly asks for software engineering.
+- For PowerPoint/PPTX requests, plan for a real .pptx artifact generated with pptxgenjs. For multi-slide decks, split slide research/content into separate docs/browser subtasks when useful, then add a final DocumentAgent subtask that stitches the final deck with pptxgenjs and speaker notes.
+- When the goal asks for images, illustrations, diagrams, or a visual deck, the assigned agent HAS a native generate_image tool that produces real PNG files. Make image generation an explicit part of the relevant subtask's success criteria (e.g. "each slide embeds a generated image"), and route visual-asset work to DocumentAgent, DesignerAgent, or GraphicsEngineerAgent. Do not plan a deliverable that only describes images in text when actual images were requested.
+- Use QaTesterAgent only for verification. It must inspect artifacts and run checks; it must not create the primary deliverable or write implementation code.
+- Use PrincipalSweAgent only for actual software engineering tasks.
 
 Risk levels:
 - "low": auto-run
@@ -105,7 +173,10 @@ You MUST return a JSON object that strictly adheres to this structure:
       "capability": "files",
       "dependsOn": [],
       "riskLevel": "low",
-      "successCriteria": "A text file battery_facts.txt exists with information."
+      "successCriteria": "A text file battery_facts.txt exists with information.",
+      "agentTemplate": "ResearcherAgent",
+      "routingReason": "The subtask requires gathering and validating factual information.",
+      "model": "google/gemini-2.5-flash"
     },
     {
       "id": "subtask-2",
@@ -113,7 +184,10 @@ You MUST return a JSON object that strictly adheres to this structure:
       "capability": "verify",
       "dependsOn": ["subtask-1"],
       "riskLevel": "low",
-      "successCriteria": "Verification status reports success."
+      "successCriteria": "Verification status reports success.",
+      "agentTemplate": "QaTesterAgent",
+      "routingReason": "Independent functional verification is required.",
+      "model": "anthropic/claude-haiku-4.5"
     }
   ]
 }
@@ -162,6 +236,17 @@ DO NOT output any conversational text before or after the JSON. Only return a va
     }
     const rawJson = JSON.parse(jsonMatch[1] || jsonMatch[0]);
     const plan = TaskPlanSchema.parse(rawJson);
+    for (const subtask of plan.subtasks) {
+      if (!subtask.agentTemplate || !subtask.routingReason) {
+        throw new Error(`Subtask ${subtask.id} is missing the required AI routing decision (agentTemplate and routingReason).`);
+      }
+      if (!subtask.model) {
+        // Tier the default by the subtask's shape instead of defaulting almost
+        // everything to mid-tier flash. Simple file/verify work → cheapest tier,
+        // engineering/high-risk work → strongest tier, the rest → mid-tier.
+        subtask.model = defaultModelForSubtask(subtask);
+      }
+    }
     if (
       requestedAgentCount !== null &&
       plan.subtasks.length !== requestedAgentCount
