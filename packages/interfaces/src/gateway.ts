@@ -37,6 +37,21 @@ export interface ChatResult {
   }[];
 }
 
+/** Outcome of resolving a requested model against Mesh's live catalog. */
+export interface ModelResolution {
+  /** Concrete model id to run with, or undefined when nothing could be chosen. */
+  model?: string;
+  /** Human-readable rationale, surfaced to the user next to the agent. */
+  reason: string;
+}
+
+/**
+ * Resolves the model an agent should run with. YAAA loads Mesh's catalog once
+ * per runtime and answers every request from that snapshot, so the planner's
+ * choice is honoured whenever Mesh actually offers it.
+ */
+export type ModelResolver = (requested?: string) => Promise<ModelResolution>;
+
 export interface IMeshGateway {
   chat(messages: ChatMessage[], options: ChatOptions): Promise<ChatResult>;
   chatStream(messages: ChatMessage[], options: ChatOptions): AsyncIterable<string>;

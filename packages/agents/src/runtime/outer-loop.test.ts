@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { container, PermissionEngine } from "@yaaa/platform";
+import { container, PermissionEngine, orchestratorMailbox } from "@yaaa/platform";
 import type { IBus, IStore, ModelRole } from "@yaaa/interfaces";
 import type { TaskPlan } from "@yaaa/shared";
 import { BaseChatModel } from "@langchain/core/language_models/chat_models";
@@ -96,6 +96,7 @@ describe("OuterLoop Manager", () => {
       writeFile: vi.fn().mockResolvedValue(undefined),
       listFiles: vi.fn().mockResolvedValue([]),
       searchFiles: vi.fn().mockResolvedValue([]),
+      screenshot: vi.fn().mockResolvedValue({ screenshotPath: "agent-workspaces/files-agent-test/yaaa-proof.png", title: "Rendered proof" }),
     });
     container.register(
       "ChatModelFactory",
@@ -124,7 +125,7 @@ describe("OuterLoop Manager", () => {
     );
     expect(mockStore.saveAgent).toHaveBeenCalledWith(
       "task-123",
-      expect.objectContaining({ handle: "@sage-1", status: "working" }),
+      expect.objectContaining({ handle: expect.stringMatching(/^@[a-z0-9-]+-1$/), status: "working" }),
     );
     expect(plan.subtasks[0].artifacts).toEqual(
       expect.arrayContaining([
@@ -134,6 +135,53 @@ describe("OuterLoop Manager", () => {
     );
     const dependentBrief = captured.at(-1)?.messages.map((m) => String(m.content)).join("\n") ?? "";
     expect(dependentBrief).toContain("handOff.md");
+  });
+
+  it("answers a queued message even when no worker is active yet", async () => {
+    const taskId = "task-queued-without-worker";
+    mockStore.getAgents = vi.fn().mockResolvedValue([]);
+    orchestratorMailbox.post({
+      id: "queued-1",
+      taskId,
+      from: "user",
+      content: "there?",
+      createdAt: new Date().toISOString(),
+    });
+
+    await outerLoop.run(taskId, singleSubtaskPlan());
+
+    expect(mockBus.publish).toHaveBeenCalledWith(
+      `task.${taskId}.started`,
+      expect.objectContaining({ note: expect.stringContaining("I’m here") }),
+    );
+    orchestratorMailbox.clear(taskId);
+  });
+
+  it("injects persisted checkpoint evidence when a run is resumed after restart", async () => {
+    const plan = singleSubtaskPlan();
+    mockStore.getMessages = vi.fn().mockResolvedValue([
+      {
+        kind: "result",
+        from: "files-agent-old",
+        taskId: "task-restart",
+        incomplete: true,
+        summary: "Amazon search reached results but the product URL was not extracted.",
+        artifacts: [{ path: "agent-workspaces/files-agent-old/handOff.md", mimeType: "text/markdown", description: "Continuation notes" }],
+      },
+    ]);
+    mockStore.getLedgerEntries = vi.fn().mockResolvedValue([
+      { timestamp: new Date().toISOString(), step: 8, facts: [], assumptions: [], subtaskStates: { "task-1": "running" }, nextStepStrategy: "Resume inspection" },
+    ]);
+
+    await expect(outerLoop.run("task-restart", plan)).resolves.not.toThrow();
+
+    const firstPrompt = captured[0]?.messages.map((message) => String(message.content)).join("\n") || "";
+    expect(firstPrompt).toContain("previous process stopped after saving an incomplete checkpoint");
+    expect(firstPrompt).toContain("Amazon search reached results");
+    expect(mockStore.saveLedgerEntry).toHaveBeenCalledWith(
+      "task-restart",
+      expect.objectContaining({ step: 9 }),
+    );
   });
 
   it("negotiates a failed verification: sends the deliverable back to a worker, then re-verifies to pass", async () => {
@@ -340,10 +388,70 @@ describe("OuterLoop Manager", () => {
         "task.task-timebox.started",
         expect.objectContaining({ note: expect.stringMatching(/supervisor reviewed/i) }),
       );
+      const supervisorPrompt = supervisorGateway.chat.mock.calls
+        .map((call) => call[0]?.map((message: any) => message.content).join("\n"))
+        .join("\n");
+      expect(supervisorPrompt).toContain("Runtime tool evidence reviewed by supervisor");
+      expect(supervisorPrompt).toContain("files.readFile");
     } finally {
       delete process.env.YAAA_AGENT_INVOKE_TIMEOUT_MS;
       delete process.env.YAAA_AGENT_CHECKPOINT_TIMEOUT_MS;
     }
+  });
+
+  it("passes screenshot and tool metadata to the supervisor before choosing a timeout continuation", async () => {
+    process.env.YAAA_AGENT_INVOKE_TIMEOUT_MS = "20";
+    process.env.YAAA_AGENT_CHECKPOINT_TIMEOUT_MS = "50";
+    let turn = 0;
+    responder = async (_role, messages) => {
+      const text = messages.map((m) => String(m.content)).join("\n");
+      if (text.includes("reached its timebox after making tool progress")) {
+        return finalMessage("Checkpoint: captured agent-workspaces/files-agent-test/yaaa-proof.png and needs a continuation.");
+      }
+      if (text.includes("Previous agent reached its timebox")) {
+        return finalMessage("Continued from screenshot evidence and finished.");
+      }
+      turn++;
+      if (turn === 1) return toolCall("file_screenshot", { path: "report.md", outputPath: "agent-workspaces/files-agent-test/yaaa-proof.png" });
+      return new Promise<AIMessage>(() => {});
+    };
+
+    try {
+      await expect(outerLoop.run("task-screenshot-evidence", singleSubtaskPlan())).resolves.not.toThrow();
+      const supervisorPrompt = supervisorGateway.chat.mock.calls
+        .map((call) => call[0]?.map((message: any) => message.content).join("\n"))
+        .join("\n");
+      expect(supervisorPrompt).toContain("files.screenshot");
+      expect(supervisorPrompt).toContain("screenshotPath: agent-workspaces/files-agent-test/yaaa-proof.png");
+      expect(supervisorPrompt).toContain("path: report.md");
+    } finally {
+      delete process.env.YAAA_AGENT_INVOKE_TIMEOUT_MS;
+      delete process.env.YAAA_AGENT_CHECKPOINT_TIMEOUT_MS;
+    }
+  });
+
+  it("course-corrects after a completed worker result when the supervisor redirects the todo", async () => {
+    supervisorGateway.chat
+      .mockResolvedValueOnce({
+        content: '{"action":"redirect","reason":"the game needs actual canvas controls","handsOn":"Add keyboard controls and render a visible canvas before handing off."}',
+      })
+      .mockResolvedValueOnce({ content: '{"action":"accept","reason":"corrected result meets the current todo"}' });
+    let workerCalls = 0;
+    responder = async () => {
+      workerCalls++;
+      return finalMessage(workerCalls === 1 ? "Built static files." : "Added canvas and keyboard controls.");
+    };
+
+    await expect(outerLoop.run("task-course-correct", singleSubtaskPlan())).resolves.not.toThrow();
+
+    expect(workerCalls).toBe(2);
+    const instructions = captured.map((c) => c.messages.map((m) => String(m.content)).join("\n"));
+    expect(instructions.some((text) => text.includes("Supervisor course-correction"))).toBe(true);
+    expect(instructions.some((text) => text.includes("Add keyboard controls and render a visible canvas"))).toBe(true);
+    expect(mockBus.publish).toHaveBeenCalledWith(
+      "task.task-course-correct.started",
+      expect.objectContaining({ note: expect.stringMatching(/Supervisor checked.*redirect/i) }),
+    );
   });
 
   it("keeps renewing incomplete timeboxes even when the error budget is 1 (continuations are not errors)", async () => {
@@ -468,14 +576,13 @@ describe("OuterLoop Manager", () => {
 
     await expect(outerLoop.run("task-model-reuse", singleSubtaskPlan())).resolves.not.toThrow();
 
-    // Both attempts resolve through the files agent's own role ("worker"), never
-    // a hardcoded, possibly-unavailable fallback model id.
+    // Both attempts preserve the planner/template worker role.
     const workerCalls = captured.filter((c) => c.role === "worker");
     expect(workerCalls).toHaveLength(2);
   });
 
-  it("switches to the operator-configured backup model on retries", async () => {
-    process.env.YAAA_BACKUP_MODEL = "anthropic/claude-sonnet-5";
+  it("keeps a worker on its planner-selected model instead of switching providers on retries", async () => {
+    process.env.YAAA_BACKUP_MODEL = "anthropic/claude-sonnet-4.5";
     let attempt = 0;
     responder = async () => {
       attempt++;
@@ -487,7 +594,7 @@ describe("OuterLoop Manager", () => {
       await expect(outerLoop.run("task-model-backup", singleSubtaskPlan())).resolves.not.toThrow();
       const roles = captured.map((c) => c.role);
       expect(roles[0]).toBe("worker");
-      expect(roles[2]).toBe("anthropic/claude-sonnet-5");
+      expect(roles[2]).toBe("worker");
     } finally {
       delete process.env.YAAA_BACKUP_MODEL;
     }

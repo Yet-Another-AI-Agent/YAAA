@@ -1,9 +1,15 @@
-import type { IBus, IStore } from "@yaaa/interfaces";
-import { container, type Container } from "@yaaa/platform";
+import type { IBus, IStore, ModelResolution, ModelResolver } from "@yaaa/interfaces";
+import { agentControl, container, orchestratorMailbox, type Container } from "@yaaa/platform";
 import { type AgentRun, type Subtask, type TaskPlan, type LedgerEntry, type DependencyOutput, buildAgentBrief, getErrorFingerprint, isInsufficientFundsError } from "@yaaa/shared";
 import { AGENT_REGISTRY, selectAgentTemplate } from "../registry.js";
 import { InnerLoop } from "./inner-loop.js";
 import { SupervisorAssessor } from "./supervisor-assessor.js";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // Gender-neutral display names for generalist agents without a roster handle.
 const AGENT_DISPLAY_NAMES = ["Sage", "Quill", "Harbor", "Nova", "Rowan", "Cedar"];
@@ -59,6 +65,12 @@ function warnOuter(taskId: string, message: string, details?: Record<string, unk
   console.warn(`[YAAA:OuterLoop:${taskId}] ${message}${suffix}`);
 }
 
+function summaryWithRuntimeEvidence(summary: string, evidence?: unknown): string {
+  const evidenceText = typeof evidence === "string" ? evidence.trim() : "";
+  if (!evidenceText || evidenceText === "- None recorded.") return summary;
+  return `${summary}\n\nRuntime tool evidence reviewed by supervisor:\n${evidenceText}`;
+}
+
 /** Run-wide mutable state shared (by reference) across concurrent subtasks. */
 interface RunContext {
   subtaskStates: Record<string, "pending" | "running" | "completed" | "failed">;
@@ -68,37 +80,163 @@ interface RunContext {
   completedOutputs: Map<string, DependencyOutput>;
   /** Synchronous read-then-increment step allocator (see run() for why it's safe). */
   allocateStep: () => number;
+  /** Structured evidence recovered after a process restart. */
+  resumeDirective?: string;
 }
+
+const TEXT_ARTIFACT_EXTENSIONS = new Set([
+  ".txt", ".md", ".markdown", ".json", ".csv", ".tsv", ".html", ".css", ".js", ".jsx", ".ts", ".tsx", ".xml",
+]);
+const MAX_DEPENDENCY_EVIDENCE_CHARS = 18_000;
 
 export class OuterLoop {
   private bus: IBus;
   private store: IStore;
   private innerLoop: InnerLoop;
   private supervisor: SupervisorAssessor;
+  private scope: Container;
+  private modelResolver?: ModelResolver;
 
   constructor(scope: Container = container) {
+    this.scope = scope;
     this.bus = scope.resolve<IBus>("IBus");
     this.store = scope.resolve<IStore>("IStore");
     this.innerLoop = new InnerLoop(scope);
     this.supervisor = new SupervisorAssessor(scope);
+    try {
+      this.modelResolver = scope.resolve<ModelResolver>("modelResolver");
+    } catch {
+      // Unit tests and alternate runtimes may not provide Mesh catalog access.
+    }
   }
 
   private selectTemplate(subtask: Subtask): string {
     return selectAgentTemplate(subtask);
   }
 
-  private createAgentRun(taskId: string, subtask: Subtask, step: number): AgentRun {
-    const templateName = this.selectTemplate(subtask);
+  /**
+   * Ask the runtime which model this agent should actually run on. The catalog
+   * behind the resolver is fetched once and cached, so this is a cheap call per
+   * attempt. If the lookup is unavailable the requested model is used as-is,
+   * which keeps keyless/test runtimes working.
+   */
+  private async resolveModel(taskId: string, requested?: string): Promise<ModelResolution> {
+    if (!this.modelResolver) {
+      return {
+        model: requested,
+        reason: requested
+          ? `YAAA used ${requested} as requested; Mesh's catalog was not consulted in this runtime.`
+          : "No model was requested and Mesh's catalog was not consulted in this runtime.",
+      };
+    }
+    try {
+      const resolution = await this.modelResolver(requested);
+      logOuter(taskId, "resolved model from Mesh catalog", {
+        requestedModel: requested ?? null,
+        selectedModel: resolution.model ?? null,
+      });
+      return resolution;
+    } catch (error) {
+      warnOuter(taskId, "model catalog lookup failed; preserving requested model", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return {
+        model: requested,
+        reason: requested
+          ? `Mesh's catalog could not be read, so YAAA kept the requested model ${requested}.`
+          : "Mesh's catalog could not be read and no model was requested.",
+      };
+    }
+  }
+
+  private static avatarSlug(name: string): string {
+    return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  }
+
+  private findCachedAvatar(name: string): string | undefined {
+    const fileName = `${OuterLoop.avatarSlug(name)}.png`;
+    const directories = [
+      path.resolve(__dirname, "../assets/pokemon-avatars"),
+      path.resolve(__dirname, "../../assets/pokemon-avatars"),
+      path.resolve(process.cwd(), "packages/agents/assets/pokemon-avatars"),
+    ];
+    return directories
+      .map((directory) => path.join(directory, fileName))
+      .find((candidate) => fs.existsSync(candidate));
+  }
+
+  private async selectPokemonAndImage(taskId: string): Promise<{ name: string; image: string }> {
+    try {
+      const paths = [
+        path.resolve(__dirname, "../pokemon.json"),
+        path.resolve(__dirname, "../../pokemon.json"),
+        path.resolve(__dirname, "../src/pokemon.json"),
+        path.resolve(process.cwd(), "packages/agents/src/pokemon.json"),
+        path.resolve(process.cwd(), "pokemon.json"),
+      ];
+      let pokemonList: Array<{ name: string; prompt: string }> = [];
+      for (const p of paths) {
+        if (fs.existsSync(p)) {
+          pokemonList = JSON.parse(fs.readFileSync(p, "utf8"));
+          break;
+        }
+      }
+      if (pokemonList.length === 0) {
+        pokemonList = [
+          { name: "Pikachu", prompt: "cute electric mouse pikachu" },
+          { name: "Charizard", prompt: "orange fire dragon charizard" },
+          { name: "Bulbasaur", prompt: "cute green toad plant bulbasaur" },
+          { name: "Squirtle", prompt: "cute water turtle squirtle" },
+          { name: "Jigglypuff", prompt: "cute singing pink balloon jigglypuff" },
+        ];
+      }
+
+      // The roster has historically contained accidental duplicate entries.
+      // Keep one stable entry per character so persisted assignments remain
+      // deterministic across app restarts.
+      const seenNames = new Set<string>();
+      pokemonList = pokemonList.filter((pokemon) => {
+        const key = pokemon.name.trim().toLowerCase();
+        if (!key || seenNames.has(key)) return false;
+        seenNames.add(key);
+        return true;
+      });
+
+      // Query used pokemons for this task from db
+      const existingAgents = (await this.store.getAgents(taskId)) || [];
+      const usedNames = new Set(existingAgents.map((a) => a.pokemonName).filter(Boolean));
+
+      // Find available Pokemons
+      let available = pokemonList.filter((p) => !usedNames.has(p.name));
+      if (available.length === 0) {
+        available = pokemonList;
+      }
+
+      // Select a random one
+      const selected = available[Math.floor(Math.random() * available.length)];
+
+      // Avatars are pre-generated and shipped with the app. Never spend a
+      // Mesh image-generation call during agent creation; a missing asset is
+      // allowed to fall back to the UI initials avatar.
+      const avatarPath = this.findCachedAvatar(selected.name);
+      const imageVal = avatarPath
+        ? `data:image/png;base64,${fs.readFileSync(avatarPath).toString("base64")}`
+        : "";
+      if (!avatarPath) {
+        warnOuter(taskId, "cached Pokemon avatar missing", { pokemon: selected.name });
+      }
+      return { name: selected.name, image: imageVal };
+    } catch (err) {
+      console.error("Error in selectPokemonAndImage:", err);
+      return { name: "Pikachu", image: "" };
+    }
+  }
+
+  private async createAgentRun(taskId: string, subtask: Subtask, step: number, templateName = this.selectTemplate(subtask)): Promise<AgentRun> {
     const template = AGENT_REGISTRY[templateName];
-    const fallbackName = AGENT_DISPLAY_NAMES[(step - 1) % AGENT_DISPLAY_NAMES.length];
-    // Roster specialists surface their blueprint handle (e.g. @qa-tester-2);
-    // generalists keep the gender-neutral display-name scheme (@sage-1).
-    const handle = template?.handle
-      ? `${template.handle}-${step}`
-      : `@${fallbackName.toLowerCase()}-${step}`;
-    const displayName = template?.handle
-      ? template.handle.slice(1)
-      : fallbackName;
+    const pokemon = await this.selectPokemonAndImage(taskId);
+    const handle = `@${pokemon.name.toLowerCase()}-${step}`;
+    const displayName = pokemon.name;
     return {
       id: `${subtask.capability}-agent-${Math.random().toString(36).slice(2, 6)}`,
       handle,
@@ -107,9 +245,78 @@ export class OuterLoop {
       subtaskId: subtask.id,
       role: templateName,
       modelRole: template?.modelRole ?? "worker",
-      status: "working",
-      startedAt: new Date().toISOString(),
+      initialGoal: subtask.title,
+      activeAssignment: subtask.title,
+      model: subtask.model,
+      modelReason: subtask.modelReason,
+      status: "planned",
+      pokemonName: pokemon.name,
+      pokemonImage: pokemon.image,
     };
+  }
+
+  private requiredArtifactGaps(subtask: Subtask, artifacts: Array<{ path: string }>, missionGoal = ""): string[] {
+    const contract = `${missionGoal}\n${subtask.title}\n${subtask.successCriteria}`.toLowerCase();
+    const paths = artifacts.map((artifact) => String(artifact.path || "").toLowerCase());
+    const gaps: string[] = [];
+    if (/powerpoint|pptx|slide deck|presentation|slides?/.test(contract) && !paths.some((p) => p.endsWith(".pptx"))) {
+      gaps.push("Create and verify a real .pptx presentation file; a Markdown outline is not an acceptable substitute.");
+    }
+    if (/generated image|actual image|illustration|visual(?:ly)?(?: appealing| asset| deck)?|embed(?:ded|s)? image|png|jpg|jpeg/.test(contract) && !paths.some((p) => /\.(png|jpe?g|webp|gif)$/.test(p))) {
+      gaps.push("Create the required image assets as real PNG/JPG/WebP files and reference/embed them in the deliverable.");
+    }
+    return gaps;
+  }
+
+  /** Read dependency artifacts once, immediately before the next agent starts. */
+  private readDependencyEvidence(outputs: DependencyOutput[]): DependencyOutput[] {
+    let workingDir: string;
+    try {
+      workingDir = this.scope.resolve<string>("workingDir");
+    } catch {
+      return outputs;
+    }
+    const root = path.resolve(workingDir);
+    let remaining = MAX_DEPENDENCY_EVIDENCE_CHARS;
+    return outputs.map((output) => {
+      const evidence: string[] = [];
+      for (const artifact of output.artifacts ?? []) {
+        if (remaining <= 0) break;
+        const artifactPath = String(artifact.path || "");
+        const extension = path.extname(artifactPath).toLowerCase();
+        if (!TEXT_ARTIFACT_EXTENSIONS.has(extension)) continue;
+        const absolute = path.resolve(root, artifactPath);
+        if (absolute !== root && !absolute.startsWith(`${root}${path.sep}`)) continue;
+        try {
+          const stat = fs.statSync(absolute);
+          if (!stat.isFile() || stat.size === 0 || stat.size > remaining) continue;
+          const contents = fs.readFileSync(absolute, "utf8").trim();
+          if (!contents) continue;
+          evidence.push(`### ${artifactPath}\n${contents}`);
+          remaining -= contents.length;
+        } catch {
+          // A missing or binary artifact remains available by path in the brief.
+        }
+      }
+      if (evidence.length === 0) return output;
+      return {
+        ...output,
+        summary: `${output.summary}\n\nYAAA inspected these dependency files before starting you:\n\n${evidence.join("\n\n")}`,
+      };
+    });
+  }
+
+  private writeHandsOnBrief(agent: AgentRun, brief: string): void {
+    let workingDir: string;
+    try {
+      workingDir = this.scope.resolve<string>("workingDir");
+    } catch {
+      return;
+    }
+    const workspaceDir = path.join(workingDir, "agent-workspaces", agent.id);
+    fs.mkdirSync(workspaceDir, { recursive: true });
+    const content = `# handsOn\n\n- Prepared by YAAA immediately before execution.\n- Agent: ${agent.handle} (${agent.displayName})\n- Model: ${agent.model ?? agent.modelRole}\n\n${brief}\n`;
+    fs.writeFileSync(path.join(workspaceDir, "handsOn.md"), content, "utf8");
   }
 
   private async recordAgentLifecycle(agent: AgentRun): Promise<void> {
@@ -127,6 +334,59 @@ export class OuterLoop {
     });
     await this.store.saveAgent(snapshot.taskId, snapshot);
     await this.bus.publish(`task.${snapshot.taskId}.agent.${snapshot.id}.lifecycle`, snapshot);
+  }
+
+  /** Drain messages posted while the run is busy and route them cooperatively
+   * at a model-turn boundary. This keeps the LangGraph graph unchanged while
+   * making the orchestrator a real event loop instead of a one-shot Promise. */
+  private async processQueuedMessages(taskId: string, force = false): Promise<void> {
+    const queued = orchestratorMailbox.drain(taskId);
+    if (queued.length === 0) return;
+    const agents = (await this.store.getAgents(taskId)) ?? [];
+    const workingAgents = agents.filter((agent) => agent.status === "working" || agent.status === "blocked");
+    if (workingAgents.length === 0 && !force) {
+      orchestratorMailbox.requeue(taskId, queued);
+      return;
+    }
+    for (const message of queued) {
+      await this.bus.publish(`task.${taskId}.started`, {
+        kind: "status",
+        from: "orchestrator",
+        taskId,
+        state: "working",
+        note: message.from === "agent"
+          ? `❓ Agent requested orchestrator input: ${message.content}`
+          : `📬 Processing queued ${message.from} message: ${message.content}`,
+      });
+      if (message.from === "agent") continue;
+
+      // A pickup event alone is not an answer: the UI uses it to move the
+      // optimistic user turn out of the queue, but the user still needs a
+      // visible orchestrator response. Keep this acknowledgement on the
+      // event-loop path so every queued user message is answered even while
+      // the workers continue their current subtasks.
+      await this.bus.publish(`task.${taskId}.started`, {
+        kind: "status",
+        from: "orchestrator",
+        taskId,
+        state: "working",
+        note: workingAgents.length > 0
+          ? `✅ I’m here — I received your message and routed it to the active agents. I’ll keep the existing work moving and report back with the next result.`
+          : `✅ I’m here — I received your message. There are no active workers at this instant, so I’ll incorporate it at the next mission checkpoint and report back with the next result.`,
+      });
+      for (const agent of workingAgents) {
+        agentControl.post(agent.id, {
+          type: "redirect",
+          handsOn: `${message.from === "user" ? "User" : "Orchestrator"} message received while you were working:\n\n${message.content}\n\nIncorporate it at the next safe turn. Continue from existing artifacts; do not restart unless the evidence requires it.`,
+          reason: "Queued message delivered by the orchestrator event loop.",
+        });
+        agentControl.post(agent.id, {
+          type: "extend",
+          additionalMs: 120_000,
+          reason: "Time granted to process queued orchestration input.",
+        });
+      }
+    }
   }
 
   /**
@@ -164,7 +424,7 @@ export class OuterLoop {
       });
 
       // 1) Fix worker — repair the producer's deliverable using the findings.
-      const fixAgent = this.createAgentRun(taskId, producer ?? verifySubtask, ctx.allocateStep());
+      const fixAgent = await this.createAgentRun(taskId, producer ?? verifySubtask, ctx.allocateStep());
       await this.recordAgentLifecycle(fixAgent);
       const fixWorkspace = `agent-workspaces/${fixAgent.id}`;
       const fixBrief = buildAgentBrief({
@@ -190,7 +450,7 @@ export class OuterLoop {
       ctx.facts.push(`Verification round ${round} fix for ${verifySubtask.id}: ${fixAgent.summary || "(no summary)"}`);
 
       // 2) Re-verify the repaired deliverable with a fresh verifier agent.
-      const reVerifyAgent = this.createAgentRun(taskId, verifySubtask, ctx.allocateStep());
+      const reVerifyAgent = await this.createAgentRun(taskId, verifySubtask, ctx.allocateStep());
       await this.recordAgentLifecycle(reVerifyAgent);
       const verifyWorkspace = `agent-workspaces/${reVerifyAgent.id}`;
       const verifyBrief = buildAgentBrief({
@@ -267,7 +527,8 @@ export class OuterLoop {
       note: `Starting subtask: ${subtask.title}`
     });
 
-    const templateName = this.selectTemplate(subtask);
+    let templateName = this.selectTemplate(subtask);
+    let nextModelOverride: string | undefined;
     const maxAttempts = resolveMaxSubtaskAttempts();
     const maxContinuations = resolveMaxContinuations();
     const backupModel = resolveBackupModel();
@@ -301,16 +562,30 @@ export class OuterLoop {
 
     while (subtaskStates[subtask.id] === "running") {
       attempts++;
-      // First attempt uses the planner-assigned model. Retries use an
-      // operator-configured backup model when present; otherwise they fall back
-      // to the agent template's default role mapping.
-      const selectedModel = attempts === 1 ? (subtask.model || undefined) : backupModel;
-      const modelSource =
+      // Preserve the planner's cost-aware model choice for workers. On worker
+      // retries, keep that same model rather than silently switching to a
+      // hardcoded/provider-specific backup. Non-worker roles may use the
+      // configured backup model on retries. Whatever is requested is then
+      // resolved against Mesh's catalog, so an agent only ever spawns on a
+      // model Mesh actually offers.
+      const template = AGENT_REGISTRY[templateName];
+      const isWorker = template?.modelRole === "worker";
+      const requestedModel =
+        nextModelOverride || (attempts === 1 || isWorker ? subtask.model || undefined : backupModel);
+      const requestSource =
         attempts === 1
-          ? selectedModel ? "planner" : "template-default"
-          : selectedModel ? "backup" : "template-default-retry";
-      const agent = this.createAgentRun(taskId, subtask, currentStep);
-      if (selectedModel) agent.modelRole = selectedModel;
+          ? requestedModel ? "planner" : "template-default"
+          : isWorker
+            ? requestedModel ? "planner-stable-retry" : "template-default-retry"
+            : requestedModel ? "backup" : "template-default-retry";
+      const resolution = await this.resolveModel(taskId, requestedModel);
+      const selectedModel = resolution.model;
+      const agent = await this.createAgentRun(taskId, subtask, currentStep, templateName);
+      if (selectedModel) {
+        agent.modelRole = selectedModel;
+        agent.model = selectedModel;
+        agent.modelReason = resolution.reason;
+      }
       const workspacePrefix = `agent-workspaces/${agent.id}`;
       const handsOnArtifact = {
         path: `${workspacePrefix}/handsOn.md`,
@@ -328,10 +603,14 @@ export class OuterLoop {
         agentId: agent.id,
         handle: agent.handle,
         templateName,
+        requestedModel: requestedModel ?? null,
         selectedModel: selectedModel ?? null,
-        modelSource,
+        requestSource,
         effectiveModelRole: agent.modelRole,
       });
+      // The agent is visible as planned while YAAA prepares its concrete,
+      // dependency-aware assignment. It becomes working only after handsOn.md
+      // has been written and the effective role/model are finalized below.
       await this.recordAgentLifecycle(agent);
       await this.bus.publish(`task.${taskId}.plan_updated`, plan);
 
@@ -347,23 +626,37 @@ export class OuterLoop {
         ? `Previous agents failed ${identicalErrors} consecutive times with: "${lastErrorMessage}". Attempt a COMPLETELY DIFFERENT approach — do not repeat the failed strategy.`
         : lastIncompleteSummary
           ? `Previous agent reached its timebox and produced an incomplete handoff instead of a final deliverable. Continue from the listed artifacts; do not restart unless the evidence is insufficient.\n\nCheckpoint summary:\n${lastIncompleteSummary}\n\nCheckpoint artifacts:\n${lastIncompleteArtifacts.map((artifact) => `- ${artifact.path}: ${artifact.description}`).join("\n") || "- None recorded."}`
+          : attempts > 1 && lastErrorMessage
+            ? `A previous attempt to execute this subtask failed with the following error: "${lastErrorMessage}". Please check the existing files in the workspace and correct any mistakes to resolve this issue.`
+            : ctx.resumeDirective
+              ? ctx.resumeDirective
         : undefined;
 
+      const preparedDependencyOutputs = this.readDependencyEvidence(dependencyOutputs);
       const instruction = buildAgentBrief({
         missionGoal: plan.goal,
         subtaskTitle: subtask.title,
         successCriteria: subtask.successCriteria,
-        dependencyOutputs,
+        dependencyOutputs: preparedDependencyOutputs,
         retryDirective,
         handsOnPath: `${workspacePrefix}/handsOn.md`,
         proofOfWorkPath: `${workspacePrefix}/proofOfWork.md`,
         handOffPath: `${workspacePrefix}/handOff.md`,
       });
+      this.writeHandsOnBrief(agent, instruction);
+      // Persist the concise live assignment on the agent card; the complete
+      // brief remains in handsOn.md for the agent and downstream workers.
+      agent.activeAssignment = retryDirective
+        ? `${subtask.title}\n\n${retryDirective}`
+        : subtask.title;
+      agent.status = "working";
+      agent.startedAt = new Date().toISOString();
+      await this.recordAgentLifecycle(agent);
 
       try {
         const modelLabel = selectedModel
-          ? ` using ${modelSource} model: ${selectedModel}`
-          : ` using ${modelSource}`;
+          ? ` using ${requestSource} model: ${selectedModel}`
+          : ` using ${requestSource}`;
         console.log(`[OuterLoop] Executing subtask ${subtask.id} (attempt ${attempts})${modelLabel}`);
         const result = await this.innerLoop.run({
           agentId: agent.id,
@@ -406,7 +699,7 @@ export class OuterLoop {
             missionGoal: plan.goal,
             subtaskTitle: subtask.title,
             successCriteria: subtask.successCriteria,
-            checkpointSummary: summary,
+            checkpointSummary: summaryWithRuntimeEvidence(summary, result.runtimeEvidence),
             artifacts: resultArtifacts.map((a) => ({ path: a.path, description: a.description })),
             continuations,
             maxContinuations,
@@ -447,6 +740,19 @@ export class OuterLoop {
           // continue or redirect → renew the timer with a continuation agent. A
           // redirect carries corrected instructions into the next brief.
           supervisorRedirect = decision.action === "redirect" ? decision.handsOn ?? null : null;
+          if (decision.nextAgentTemplate && AGENT_REGISTRY[decision.nextAgentTemplate]) {
+            templateName = decision.nextAgentTemplate;
+          }
+          nextModelOverride = decision.nextModel || undefined;
+          if (decision.nextAgentTemplate || decision.nextModel) {
+            await this.bus.publish(`task.${taskId}.started`, {
+              kind: "status",
+              from: "orchestrator",
+              taskId,
+              state: "working",
+              note: `🔀 Adaptive continuation: next agent will use ${templateName}${nextModelOverride ? ` on ${nextModelOverride}` : ""}.`,
+            });
+          }
           currentStep = allocateStep();
           continue;
         }
@@ -478,6 +784,80 @@ export class OuterLoop {
           facts.push(`Subtask ${subtask.id} passed after ${resolveMaxVerificationRounds()}-round fix negotiation. Summary: ${outcome.summary || summary}`);
           completedOutputs.set(subtask.id, { id: subtask.id, title: subtask.title, summary: outcome.summary || summary, artifacts: resultArtifacts });
           logOuter(taskId, "verification reconciled to pass", { subtaskId: subtask.id });
+          continue;
+        }
+
+        const artifactGaps = this.requiredArtifactGaps(subtask, resultArtifacts, plan.goal);
+        const completionReview = await this.supervisor.assess(taskId, {
+          missionGoal: plan.goal,
+          subtaskTitle: subtask.title,
+          successCriteria: artifactGaps.length > 0
+            ? `${subtask.successCriteria}\n\nMANDATORY ARTIFACT GAPS — do not accept until resolved:\n- ${artifactGaps.join("\n- ")}`
+            : subtask.successCriteria,
+          checkpointSummary: artifactGaps.length > 0
+            ? `${summaryWithRuntimeEvidence(summary, result.runtimeEvidence)}\n\nThe orchestrator's artifact gate found:\n- ${artifactGaps.join("\n- ")}`
+            : summaryWithRuntimeEvidence(summary, result.runtimeEvidence),
+          artifacts: resultArtifacts.map((a) => ({ path: a.path, description: a.description })),
+          continuations,
+          maxContinuations,
+        });
+        const effectiveCompletionReview = artifactGaps.length > 0 && completionReview.action !== "fail"
+          ? {
+              action: "redirect" as const,
+              reason: `Required deliverables are missing: ${artifactGaps.join(" ")}`,
+              handsOn: `${completionReview.handsOn ? `${completionReview.handsOn}\n\n` : ""}Do not stop at the Markdown outline. Produce the missing concrete deliverables now: ${artifactGaps.join(" ")} Inspect the existing files first and continue from them.`,
+              nextAgentTemplate: completionReview.nextAgentTemplate,
+              nextModel: completionReview.nextModel,
+            }
+          : completionReview;
+        await this.bus.publish(`task.${taskId}.started`, {
+          kind: "status",
+          from: "orchestrator",
+          taskId,
+          state: "working",
+          note: `Supervisor checked "${subtask.title}" against the current todo → ${effectiveCompletionReview.action}: ${effectiveCompletionReview.reason}`,
+        });
+
+        if (effectiveCompletionReview.action === "redirect") {
+          subtask.result = summary;
+          subtask.artifacts = resultArtifacts;
+          lastIncompleteSummary = summary;
+          lastIncompleteArtifacts = resultArtifacts;
+          supervisorRedirect = effectiveCompletionReview.handsOn ?? null;
+          if (effectiveCompletionReview.nextAgentTemplate && AGENT_REGISTRY[effectiveCompletionReview.nextAgentTemplate]) {
+            templateName = effectiveCompletionReview.nextAgentTemplate;
+          }
+          nextModelOverride = effectiveCompletionReview.nextModel || undefined;
+          await this.bus.publish(`task.${taskId}.started`, {
+            kind: "status",
+            from: "orchestrator",
+            taskId,
+            state: "working",
+            note: `🔀 Adaptive handoff: next agent will use ${templateName}${nextModelOverride ? ` on ${nextModelOverride}` : ""}.`,
+          });
+          facts.push(`Subtask ${subtask.id} course-corrected after agent execution. Reason: ${completionReview.reason}`);
+          agent.status = "exited";
+          agent.finishedAt = new Date().toISOString();
+          agent.summary = `Course correction requested: ${effectiveCompletionReview.reason}`;
+          await this.recordAgentLifecycle(agent);
+          await this.store.savePlan(taskId, plan);
+          await this.bus.publish(`task.${taskId}.plan_updated`, plan);
+          currentStep = allocateStep();
+          continue;
+        }
+
+        if (effectiveCompletionReview.action === "fail") {
+          subtaskStates[subtask.id] = "failed";
+          subtask.state = "failed";
+          subtask.result = summary;
+          subtask.artifacts = resultArtifacts;
+          facts.push(`Subtask ${subtask.id} failed supervisor validation after agent execution. ${effectiveCompletionReview.reason}`);
+          agent.status = "failed";
+          agent.finishedAt = new Date().toISOString();
+          agent.summary = effectiveCompletionReview.reason;
+          await this.recordAgentLifecycle(agent);
+          await this.store.savePlan(taskId, plan);
+          await this.bus.publish(`task.${taskId}.plan_updated`, plan);
           continue;
         }
 
@@ -587,10 +967,32 @@ export class OuterLoop {
   async run(taskId: string, plan: TaskPlan): Promise<void> {
     await this.store.savePlan(taskId, plan);
 
+    // Recover structured checkpoint evidence before creating any new agent.
+    // The workspace and handoff files remain the source of truth for concrete
+    // work; this directive gives the replacement agent the durable reason and
+    // next action without replaying the entire chat transcript.
+    const persistedMessages = (await this.store.getMessages(taskId)) ?? [];
+    const checkpointMessages = persistedMessages.filter(
+      (message): message is Extract<typeof message, { kind: "result" }> =>
+        message.kind === "result" && message.incomplete === true,
+    );
+    const statusMessages = persistedMessages.filter((m) => m.kind === "status");
+    const lastFailedStatus = [...statusMessages]
+      .reverse()
+      .find((m: any) => m.note?.includes("failed") || m.note?.includes("Failed") || m.state === "blocked") as any;
+
+    let resumeDirective: string | undefined = undefined;
+    if (checkpointMessages.length > 0) {
+      resumeDirective = `A previous process stopped after saving an incomplete checkpoint. Resume the existing mission from its durable evidence; do not claim the mission is complete and do not discard existing artifacts.\n\n${checkpointMessages.map((message) => `Checkpoint from ${message.from}: ${message.summary}\nArtifacts: ${message.artifacts.map((artifact) => `${artifact.path} (${artifact.description})`).join("; ") || "none recorded"}`).join("\n\n")}`;
+    } else if (lastFailedStatus) {
+      resumeDirective = `A previous attempt to execute this mission failed or was interrupted with the following message:\n"${lastFailedStatus.note || lastFailedStatus.summary || "Unknown error"}"\n\nResume the existing mission, inspect the working directory for any existing files/artifacts from the previous attempt, and continue or fix them to satisfy the goal. Do not restart from scratch unless necessary.`;
+    }
+
     const subtasks = [...plan.subtasks];
     const subtaskStates: Record<string, "pending" | "running" | "completed" | "failed"> = {};
     for (const st of subtasks) {
-      subtaskStates[st.id] = "pending";
+      subtaskStates[st.id] = st.state === "completed" ? "completed" : "pending";
+      if (st.state !== "completed") st.state = "pending";
     }
 
     const facts: string[] = [];
@@ -598,6 +1000,17 @@ export class OuterLoop {
     // Structured results keyed by subtask id, threaded into each dependent
     // agent's brief so siblings actually see what prior steps produced.
     const completedOutputs = new Map<string, DependencyOutput>();
+    for (const st of subtasks) {
+      if (st.state === "completed") {
+        completedOutputs.set(st.id, {
+          id: st.id,
+          title: st.title,
+          summary: st.result ?? "",
+          artifacts: st.artifacts ?? [],
+        });
+        facts.push(`Resumed with completed subtask ${st.id}: ${st.result ?? "(no prior summary)"}`);
+      }
+    }
 
     // `step` numbers ledger entries and agent ids. Now that sibling subtasks
     // run concurrently, several `runSubtask` calls draw from this counter with
@@ -605,11 +1018,17 @@ export class OuterLoop {
     // read-then-increment: because JS is single-threaded and there is no
     // `await` between reading `step` and bumping it, each call is guaranteed a
     // unique number — two concurrent subtasks can never silently share a step.
-    let step = 1;
+    const priorLedger = (await this.store.getLedgerEntries(taskId)) ?? [];
+    let step = Math.max(0, ...priorLedger.map((entry) => entry.step)) + 1;
     const allocateStep = (): number => step++;
+    // Warm Mesh's catalog once up front so the first agent does not pay the
+    // lookup latency, and so an unreachable catalog is reported before any
+    // subtask starts rather than mid-run.
+    if (this.modelResolver) await this.resolveModel(taskId, undefined);
 
     // Outer plan loop
     while (subtasks.some((st) => subtaskStates[st.id] !== "completed" && subtaskStates[st.id] !== "failed")) {
+      await this.processQueuedMessages(taskId);
       const readySubtasks = subtasks.filter(
         (st) =>
           subtaskStates[st.id] === "pending" &&
@@ -632,23 +1051,46 @@ export class OuterLoop {
       // iteration, once their dependencies' outputs have already been recorded.
       // An insufficient-funds error from any subtask rejects this `Promise.all`
       // and propagates out of the whole run.
-      await Promise.all(
-        readySubtasks.map((subtask) =>
-          this.runSubtask(taskId, plan, subtask, {
-            subtaskStates,
-            facts,
-            assumptions,
-            completedOutputs,
-            allocateStep,
-          }),
-        ),
-      );
+      let polling = true;
+      const eventLoop = (async () => {
+        while (polling) {
+          try {
+            await this.processQueuedMessages(taskId);
+          } catch (error) {
+            warnOuter(taskId, "event-loop tick failed; will retry", {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+      })();
+      try {
+        await Promise.all(
+          readySubtasks.map((subtask) =>
+            this.runSubtask(taskId, plan, subtask, {
+              subtaskStates,
+              facts,
+              assumptions,
+              completedOutputs,
+              allocateStep,
+              resumeDirective,
+            }),
+          ),
+        );
+      } finally {
+        polling = false;
+        await eventLoop;
+      }
     }
 
     const failedTasks = subtasks.filter((st) => subtaskStates[st.id] === "failed");
     if (failedTasks.length > 0) {
       throw new Error("Task execution failed due to subtask failure.");
     }
+
+    // The run can finish between two event-loop ticks. Drain once more so a
+    // message posted during that race cannot remain in the mailbox forever.
+    await this.processQueuedMessages(taskId, true);
 
     const finalLedger: LedgerEntry = {
       timestamp: new Date().toISOString(),

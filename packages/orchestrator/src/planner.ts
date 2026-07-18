@@ -1,6 +1,36 @@
 import type { IMeshGateway, IBus, ChatMessage } from "@yaaa/interfaces";
 import { container, type Container } from "@yaaa/platform";
 import { TaskPlanSchema, type TaskPlan } from "@yaaa/shared";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+function readArchitectureDoc(): string {
+  const paths = [
+    path.resolve(__dirname, "../../../docs/architecture.md"),
+    path.resolve(__dirname, "../../docs/architecture.md"),
+    path.resolve(process.cwd(), "docs/architecture.md"),
+    path.resolve(process.cwd(), "../docs/architecture.md"),
+  ];
+  for (const p of paths) {
+    if (fs.existsSync(p)) {
+      try {
+        return fs.readFileSync(p, "utf8");
+      } catch (err) {
+        // ignore
+      }
+    }
+  }
+  return "";
+}
+
+const archDoc = readArchitectureDoc();
+const ARCH_INSTRUCTION = archDoc
+  ? `\n\nHere is the system architecture of the application we are running within:\n\n${archDoc}`
+  : "";
 
 /** Optional context threaded into planning so the planner is not memoryless. */
 export interface PlanContext {
@@ -16,9 +46,9 @@ export interface PlanContext {
  * subtask with an explicit `model`.
  */
 export const MODEL_TIERS = {
-  simple: "anthropic/claude-haiku-4.5",
+  simple: "google/gemini-2.5-flash",
   medium: "google/gemini-2.5-flash",
-  complex: "anthropic/claude-sonnet-5",
+  complex: "google/gemini-2.5-pro",
 } as const;
 
 /** Agent templates whose work is engineering-heavy enough to warrant the top tier. */
@@ -49,6 +79,21 @@ export function defaultModelForSubtask(subtask: {
   }
   // Everything else (docs, browser, integration, shell content work) is mid-tier.
   return MODEL_TIERS.medium;
+}
+
+/** Explain the cost/capability tradeoff behind the model shown at agent creation. */
+export function defaultModelReasonForSubtask(subtask: {
+  capability: string;
+  riskLevel?: string;
+  agentTemplate?: string;
+}, model: string): string {
+  if (model === MODEL_TIERS.simple) {
+    return `Gemini Flash is the cost-efficient default for bounded ${subtask.capability} work and verification.`;
+  }
+  if (model === MODEL_TIERS.complex) {
+    return "Gemini Pro is reserved for high-risk or engineering-heavy work that benefits from stronger reasoning.";
+  }
+  return `Gemini Flash is a balanced choice for ${subtask.capability} work without a high-risk or specialist constraint.`;
 }
 
 const NUMBER_WORDS: Record<string, number> = {
@@ -96,17 +141,56 @@ export function renderPlanContext(context?: PlanContext): string {
   return parts.length ? `${parts.join("\n\n")}\n\n` : "";
 }
 
+/**
+ * The static rubric, used only when Mesh's live catalog cannot be read. It names
+ * models that may not exist on the account, which is exactly why the live menu
+ * is preferred: a hardcoded list is why every plan picked the same model.
+ */
+const FALLBACK_MODEL_RUBRIC = `- "${MODEL_TIERS.simple}" (cheapest) — simple file operations, QA/verification, unit testing, and other well-bounded low-risk steps. This is the correct default for FilesAgent/QaTesterAgent/verify work.
+- "${MODEL_TIERS.complex}" (strongest, default) — web research, browser/search, document/PPT/content generation, complex coding, software architecture, hard debugging, high-stakes decisions.
+- "${MODEL_TIERS.medium}" (mid, cost-aware) — only for simple non-critical tasks or when specifically requested.`;
+
+/**
+ * Supplies the live model menu as prompt-ready lines. The runtime owns the
+ * catalog (and the cycle rules keep this package from importing it), so the
+ * planner takes the rendered menu rather than the catalog itself.
+ */
+export type ModelMenuProvider = () => Promise<string>;
+
 export class Planner {
   private gateway: IMeshGateway;
   private bus: IBus;
+  private modelMenuProvider?: ModelMenuProvider;
 
   constructor(scope: Container = container) {
     this.gateway = scope.resolve<IMeshGateway>("IMeshGateway");
     this.bus = scope.resolve<IBus>("IBus");
+    try {
+      this.modelMenuProvider = scope.resolve<ModelMenuProvider>("modelMenuProvider");
+    } catch {
+      // Tests and alternate runtimes may not expose Mesh's catalog.
+    }
+  }
+
+  /**
+   * The model rubric handed to the planner: Mesh's live, tool-capable lineup
+   * when it can be read, so a newly released model is selectable the day the
+   * account gets it, and the static tier list otherwise.
+   */
+  private async renderModelRubric(): Promise<string> {
+    if (!this.modelMenuProvider) return FALLBACK_MODEL_RUBRIC;
+    try {
+      const menu = (await this.modelMenuProvider()).trim();
+      if (!menu) return FALLBACK_MODEL_RUBRIC;
+      return `${menu}\n\nPick from that list by price and difficulty: the cheapest adequate model for well-bounded, low-risk steps (simple file operations, QA/verification, unit tests), and a stronger, pricier one only for work that earns it (web research, document/PPT generation, complex coding, architecture, hard debugging, high-stakes decisions).`;
+    } catch {
+      return FALLBACK_MODEL_RUBRIC;
+    }
   }
 
   async plan(goal: string, taskId?: string, context?: PlanContext): Promise<TaskPlan> {
     const requestedAgentCount = getRequestedAgentCount(goal);
+    const modelRubric = await this.renderModelRubric();
     // Surface the orchestrator's reasoning tokens as "thinking" for the UI.
     const onReasoning = taskId
       ? (reasoning: string) => {
@@ -121,16 +205,16 @@ export class Planner {
     const systemPrompt = `You are a central Task Planner for YAAA.
 Your job is to break down a user's task into a sequential, structured list of subtasks.
 Each subtask represents a step in a task graph and must declare its capabilities, dependencies, riskLevel, and success criteria.
-You must also choose the best agentTemplate from the allowed roster and explain that choice in routingReason.
-You MUST assign every subtask an explicit 'model'. Tier it to the actual difficulty of the work — do NOT default everything to flash:
-- "anthropic/claude-haiku-4.5" (cheapest) — simple file operations, QA/verification, unit testing, and other well-bounded low-risk steps. This is the correct default for FilesAgent/QaTesterAgent/verify work.
-- "google/gemini-2.5-flash" (mid, cost-aware) — web research, browser/search, document/PPT/content generation, and other medium tasks where a fast first tool turn matters.
-- "anthropic/claude-sonnet-5" (strongest) — complex coding, software architecture, hard debugging, high-stakes product/layout decisions, and any subtask routed to PrincipalSweAgent, UiArchitectAgent, or GraphicsEngineerAgent, or with riskLevel "high".
-- "google/gemini-2.5-pro" — only for non-interactive deep synthesis tasks that do not need immediate tool calls.
-Make this semantic decision from the complete subtask, not by matching isolated keywords. Reserve sonnet for genuinely hard work and prefer haiku for simple steps so the plan stays cost-aware.
+You must also choose the best agentTemplate from the allowed roster and explain that choice in routingReason. Explain the model choice in modelReason using one concise sentence focused on capability and cost.
+You MUST assign every subtask an explicit 'model', chosen from the models this account can actually reach right now:
+${modelRubric}
+Make this semantic decision from the complete subtask, not by matching isolated keywords. Do not default every subtask to the same model: match each one to the difficulty of its own work so the plan stays cost-aware. Use a model id exactly as written above.
 
 Execution contract:
-- Every subtask is executed by a newly spawned agent. Therefore the number of subtasks is the number of agents that will be spawned.
+- Every subtask is executed by a newly spawned agent. Therefore the number of subtasks is the number of agents that will be spawned. Keep the number of subtasks to an absolute minimum.
+- Spawning multiple agents is ONLY for complex multi-role codebase work (e.g. one implementing code and one verifying, or different domains).
+- If a goal is a single research task, report generation, or simple script, assign it to a SINGLE agent with a single subtask. That agent can do multiple searches, read/write multiple files, and produce the final output. Do NOT split research, outlines, and drafting into separate sequential subtasks. One agent can handle the entire research and drafting flow.
+- A typical task should have 1 to 2 subtasks. Never exceed 3 subtasks unless the user explicitly requested a higher number of agents or the task involves a genuine multi-role codebase implementation.
 - If the user explicitly requests an exact number of agents, return exactly that many subtasks. Bundle requirements, implementation, revisions, and verification work into those agents' assignments rather than creating extra workflow-step subtasks.
 - Preserve the requested role split in subtask titles and use dependencies to express handoffs between those agents.
 ${requestedAgentCount ? `- This user explicitly requested exactly ${requestedAgentCount} agents, so this plan MUST contain exactly ${requestedAgentCount} subtasks.` : ""}
@@ -187,12 +271,13 @@ You MUST return a JSON object that strictly adheres to this structure:
       "successCriteria": "Verification status reports success.",
       "agentTemplate": "QaTesterAgent",
       "routingReason": "Independent functional verification is required.",
-      "model": "anthropic/claude-haiku-4.5"
+      "modelReason": "Gemini Flash is the cost-efficient fit for bounded verification.",
+      "model": "google/gemini-2.5-flash"
     }
   ]
 }
 
-DO NOT output any conversational text before or after the JSON. Only return a valid JSON block inside markdown triple backticks (\`\`\`json ... \`\`\`).`;
+DO NOT output any conversational text before or after the JSON. Only return a valid JSON block inside markdown triple backticks (\`\`\`json ... \`\`\`).${ARCH_INSTRUCTION}`;
 
     const messages: ChatMessage[] = [
       { role: "system", content: systemPrompt },
@@ -245,6 +330,9 @@ DO NOT output any conversational text before or after the JSON. Only return a va
         // everything to mid-tier flash. Simple file/verify work → cheapest tier,
         // engineering/high-risk work → strongest tier, the rest → mid-tier.
         subtask.model = defaultModelForSubtask(subtask);
+      }
+      if (!subtask.modelReason) {
+        subtask.modelReason = defaultModelReasonForSubtask(subtask, subtask.model);
       }
     }
     if (

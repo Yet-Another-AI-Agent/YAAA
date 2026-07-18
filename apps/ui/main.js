@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, nativeImage, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, nativeImage, shell } from "electron";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Workspace } from "@yaaa/core";
@@ -31,6 +31,8 @@ const pendingApprovals = new Map();
 // the backend doesn't block forever on a renderer that gave up on it.
 const killedTasks = new Set();
 const confirmingTasks = new Set();
+const recentTaskEvents = new Map();
+const MAX_RECENT_TASK_EVENTS = 100;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -68,6 +70,14 @@ function sendToRenderer(channel, payload) {
   }
 }
 
+function emitTaskEvent(taskId, payload) {
+  const recent = recentTaskEvents.get(taskId) ?? [];
+  recent.push(payload);
+  if (recent.length > MAX_RECENT_TASK_EVENTS) recent.shift();
+  recentTaskEvents.set(taskId, recent);
+  sendToRenderer("task-event", payload);
+}
+
 /**
  * Translate a typed RuntimeEvent from the core into the topic/data shape the
  * renderer already consumes (previously produced by parsing CLI stdout).
@@ -76,52 +86,52 @@ function forwardRuntimeEvent(taskId, event) {
   if (killedTasks.has(taskId)) return;
   switch (event.type) {
     case "task-started":
-      sendToRenderer("task-event", {
+      emitTaskEvent(taskId, {
         topic: `task.${taskId}.task-started`,
         data: { taskId: event.taskId },
       });
       break;
     case "plan-updated":
-      sendToRenderer("task-event", {
+      emitTaskEvent(taskId, {
         topic: `task.${taskId}.plan_updated`,
         data: event.plan,
       });
       break;
     case "thought":
-      sendToRenderer("task-event", {
+      emitTaskEvent(taskId, {
         topic: `task.${taskId}.agent.${event.from}.thought`,
         data: { content: event.content },
       });
       break;
     case "tool-requested":
-      sendToRenderer("task-event", {
+      emitTaskEvent(taskId, {
         topic: `task.${taskId}.agent.${event.from}.tool_requested`,
         data: { content: event.content, metadata: event.metadata },
       });
       break;
     case "agent-status":
-      sendToRenderer("task-event", {
+      emitTaskEvent(taskId, {
         topic: `task.${taskId}.agent_status`,
         data: event.agent,
       });
       break;
     case "status":
-      sendToRenderer("task-event", {
+      emitTaskEvent(taskId, {
         topic: `task.${taskId}.started`,
         data: { note: event.note },
       });
       break;
     case "topic-updated":
-      sendToRenderer("task-event", {
+      emitTaskEvent(taskId, {
         topic: `task.${taskId}.topic_updated`,
         data: { topic: event.topic },
       });
       break;
-    case "result":
-      sendToRenderer("task-event", {
-        topic: `task.${taskId}.agent.${event.from}.result`,
-        data: { artifacts: event.artifacts, summary: event.summary },
-      });
+      case "result":
+        emitTaskEvent(taskId, {
+          topic: `task.${taskId}.agent.${event.from}.result`,
+          data: { artifacts: event.artifacts, summary: event.summary, incomplete: event.incomplete },
+        });
       break;
     // "complete" is handled by the run() caller below.
     default:
@@ -157,6 +167,10 @@ ipcMain.handle("route-user-message", async (_event, message) => {
     return { kind: "task" };
   }
 });
+
+ipcMain.handle("classify-plan-review-intent", async (_event, message) =>
+  workspace.classifyPlanReviewIntent(String(message ?? "")),
+);
 
 ipcMain.handle("start-task", async (_event, goal) => {
   const task = workspace.createTask(goal);
@@ -259,32 +273,55 @@ ipcMain.handle("record-plan-review", async (_event, { taskId, content, authorKin
   return { status: "saved" };
 });
 
+ipcMain.handle("get-recent-task-events", async (_event, taskId) => {
+  return recentTaskEvents.get(taskId) ?? [];
+});
+
 ipcMain.handle("continue-task", async (_event, { taskId, message }) => {
   if (killedTasks.has(taskId)) {
-    return { status: "error", error: "Mission was deleted" };
+    return { status: "error", error: "Task was deleted" };
   }
-  try {
-    const result = await workspace.continueMission(taskId, message, {
-      onEvent: (event) => forwardRuntimeEvent(taskId, event),
-      onApproval: makeApprovalHandler(taskId),
-    });
-    if (result.kind === "direct_execute") {
-      sendToRenderer("task-complete", {
-        success: true,
-        summary: result.reply,
+  const alreadyRunning = confirmingTasks.has(taskId);
+  if (!alreadyRunning) confirmingTasks.add(taskId);
+  setTimeout(() => {
+    workspace
+      .continueMission(taskId, message, {
+        onEvent: (event) => forwardRuntimeEvent(taskId, event),
+        onApproval: makeApprovalHandler(taskId),
+      })
+      .then((result) => {
+        if (killedTasks.has(taskId)) return;
+        if (result.kind === "direct_execute") {
+          sendToRenderer("task-complete", {
+            success: true,
+            summary: result.reply,
+          });
+        } else if (result.kind === "conversation") {
+          sendToRenderer("task-complete", {
+            success: true,
+            summary: "",
+          });
+        } else if (result.result) {
+          const reason =
+            !result.result.success && isInsufficientFundsError(result.result.summary)
+              ? "insufficient_funds"
+              : undefined;
+          sendToRenderer("task-complete", { ...result.result, reason });
+        }
+      })
+      .catch((err) => {
+        if (killedTasks.has(taskId)) return;
+        sendToRenderer("task-complete", {
+          success: false,
+          summary: err?.message ?? String(err),
+          reason: isInsufficientFundsError(err) ? "insufficient_funds" : undefined,
+        });
+      })
+      .finally(() => {
+        if (!alreadyRunning) confirmingTasks.delete(taskId);
       });
-      return { status: "conversation" };
-    }
-    return { status: result.kind };
-  } catch (err) {
-    if (killedTasks.has(taskId)) return { status: "cancelled" };
-    sendToRenderer("task-complete", {
-      success: false,
-      summary: err?.message ?? String(err),
-      reason: isInsufficientFundsError(err) ? "insufficient_funds" : undefined,
-    });
-    return { status: "error", error: err?.message ?? String(err) };
-  }
+  }, 0);
+  return { status: "started" };
 });
 
 ipcMain.handle("resolve-approval", async (_event, { callId, approved }) => {
@@ -300,6 +337,7 @@ ipcMain.handle("resolve-approval", async (_event, { callId, approved }) => {
 ipcMain.handle("delete-task", async (_event, taskId) => {
   // Mark killed first so any in-flight run's late events/approvals no-op.
   killedTasks.add(taskId);
+  recentTaskEvents.delete(taskId);
   for (const [approvalId, resolve] of pendingApprovals) {
     if (approvalId.startsWith(`${taskId}:`)) {
       resolve(false);
@@ -318,6 +356,14 @@ ipcMain.handle("get-task-history", async (_event, taskId) =>
 
 ipcMain.handle("get-task-agents", async (_event, taskId) =>
   workspace.getTaskAgents(taskId),
+);
+
+ipcMain.handle("get-mission-snapshot", async (_event, taskId) =>
+  workspace.getMissionSnapshot(taskId),
+);
+
+ipcMain.handle("get-agent-workspace", async (_event, { taskId, agentId }) =>
+  workspace.getAgentWorkspace(taskId, agentId),
 );
 
 ipcMain.handle(
@@ -412,11 +458,39 @@ ipcMain.handle("open-working-folder", async (_event, taskId) => {
 
 // ------------------------------------------------------------------- lifecycle
 
+/**
+ * Running elevated is the single most common cause of "permission denied" in
+ * YAAA: every file an agent writes while root — task folders, generated decks,
+ * agent workspaces — stays root-owned, so the next non-root run cannot touch
+ * them and fails in a way that looks like a bug in the app. Warn rather than
+ * exit: the damage is done by writes, and the user may be here precisely to
+ * read what an earlier elevated run left behind.
+ */
+function warnIfElevated() {
+  const elevated = typeof process.getuid === "function" && process.getuid() === 0;
+  if (!elevated) return;
+  const message =
+    "YAAA is running as root. Files written now stay root-owned and will cause permission errors on later normal runs. Quit, and start it again with `npm start` as your normal user.";
+  console.warn(`[YAAA] ${message}`);
+  dialog.showMessageBox({
+    type: "warning",
+    title: "Running as root",
+    message: "YAAA is running with elevated privileges",
+    detail: message,
+    buttons: ["Continue anyway", "Quit"],
+    defaultId: 1,
+    cancelId: 0,
+  }).then(({ response }) => {
+    if (response === 1) app.quit();
+  });
+}
+
 app.whenReady().then(() => {
   // On macOS the dock icon is set at runtime rather than via BrowserWindow.icon.
   if (process.platform === "darwin" && app.dock && !appIcon.isEmpty()) {
     app.dock.setIcon(appIcon);
   }
+  warnIfElevated();
   createWindow();
 
   app.on("activate", () => {

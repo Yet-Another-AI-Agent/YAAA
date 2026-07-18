@@ -53,6 +53,80 @@ function createInMemoryStore(): IStore & { closeAll: () => void } {
   };
 }
 
+import { BaseChatModel } from "@langchain/core/language_models/chat_models";
+import { AIMessage } from "@langchain/core/messages";
+
+class MockWorkerChatModel extends BaseChatModel {
+  constructor(private readonly roleOrModel: string) {
+    super({});
+  }
+  _llmType() {
+    return "yaaa-mock-worker";
+  }
+  async _generate(messages: any[]): Promise<any> {
+    const joined = messages
+      .map((m) => (typeof m.content === "string" ? m.content : ""))
+      .join("\n");
+    const isVerifier =
+      this.roleOrModel === "verifier" ||
+      this.roleOrModel === "QaTesterAgent" ||
+      /"status"\s*:\s*"passed"\s*\|\s*"failed"/i.test(joined);
+    if (isVerifier) {
+      const text = JSON.stringify({ status: "passed", summary: "Mock verification: all stated criteria appear satisfied.", findings: [], evidence: ["Deterministic mock-mode verification"] });
+      const message = new AIMessage({ content: text });
+      return { generations: [{ text, message }] };
+    }
+
+    const hasToolResult = messages.some((m) => m.constructor.name === "ToolMessage" || m._getType?.() === "tool");
+    if (!hasToolResult) {
+      let toolCall: any = null;
+      if (joined.includes("summary.txt")) {
+        toolCall = {
+          name: "write_file",
+          args: {
+            path: "summary.txt",
+            content: "1. Solid-state batteries use solid electrolytes instead of liquid ones, significantly reducing fire risk.\n2. They offer higher energy density, allowing longer range or runtime in the same physical size.\n3. They support faster charging rates and have a longer overall lifecycle."
+          },
+          id: "call-1"
+        };
+      } else if (joined.includes("notes.txt")) {
+        toolCall = {
+          name: "write_file",
+          args: {
+            path: "notes.txt",
+            content: "E2E plan persistence test"
+          },
+          id: "call-2"
+        };
+      } else if (joined.includes("reviewed.txt")) {
+        toolCall = {
+          name: "write_file",
+          args: {
+            path: "reviewed.txt",
+            content: "approved"
+          },
+          id: "call-3"
+        };
+      }
+
+      if (toolCall) {
+        const message = new AIMessage({
+          content: "",
+          tool_calls: [toolCall]
+        });
+        return { generations: [{ text: "", message }] };
+      }
+    }
+
+    const text = "Mock mode: subtask completed (no live model configured).";
+    const message = new AIMessage({ content: text });
+    return { generations: [{ text, message }] };
+  }
+  override bindTools() {
+    return this;
+  }
+}
+
 describe("E2E Spine Integration Scenario", () => {
   // Use os.tmpdir() so directory creation and cleanup work on macOS, Linux, and Windows
   const e2eDir = path.join(os.tmpdir(), `yaaa-e2e-workspace-${Date.now()}`);
@@ -74,6 +148,7 @@ describe("E2E Spine Integration Scenario", () => {
     container.register("PermissionEngine", permissions);
     container.register("IMeshGateway", gateway);
     container.register("capability:files", filesProvider);
+    container.register("ChatModelFactory", (role: string) => new MockWorkerChatModel(role));
   });
 
   afterAll(async () => {
@@ -151,7 +226,7 @@ describe("E2E Spine Integration Scenario", () => {
     expect(result.success).toBe(true);
     await expect(store.getAgents(taskId)).resolves.toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ handle: "@sage-1", status: "completed" }),
+        expect.objectContaining({ handle: expect.stringMatching(/^@[a-z0-9-]+-1$/), status: "completed" }),
       ]),
     );
   });

@@ -1,8 +1,13 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, act, fireEvent } from "@testing-library/react";
+import { render, screen, act, fireEvent, within } from "@testing-library/react";
 import { DashboardView } from "./DashboardView";
-import { agentIdentity, displaySender } from "../utils/displayNames";
+import {
+  ORCHESTRATOR_DISPLAY,
+  ORCHESTRATOR_MENTION,
+  agentIdentity,
+  displaySender,
+} from "../utils/displayNames";
 
 vi.mock("../assets/logo.jpg", () => ({ default: "logo.jpg" }));
 
@@ -22,6 +27,7 @@ const makeViewModel = (overrides = {}) => ({
   summary: null,
   success: null,
   channelTopic: null,
+  queuedMessages: [],
   chatMessages: [],
   startTask: vi.fn(),
   continueMission: vi.fn(),
@@ -483,6 +489,20 @@ describe("DashboardView", () => {
     expect(notices.length).toBe(2);
   });
 
+  it("keeps queued follow-ups pinned above the chat messages", () => {
+    const { container } = render(<DashboardView viewModel={makeViewModel({
+      taskId: "task-1",
+      running: true,
+      queuedMessages: [{ id: "queued-1", content: "whats happening?", time: "09:39:24" }],
+    })} />);
+
+    const queue = container.querySelector(".slack-queued-messages");
+    expect(queue).toBeTruthy();
+    expect(queue?.textContent).toContain("Queued for YAAA");
+    expect(queue?.textContent).toContain("whats happening?");
+    expect(container.querySelector(".slack-chat-messages")?.firstElementChild).toBe(queue);
+  });
+
   it("shows the LLM-generated channel topic instead of the raw task id once available", () => {
     render(<DashboardView viewModel={makeViewModel({
       taskId: "task-1",
@@ -610,6 +630,167 @@ describe("DashboardView", () => {
     expect(screen.getByText(`${identity.display} · ${identity.mention}`)).toBeTruthy();
   });
 
+  it("shows YAAA in the mission team with its thumbnail before any agent has joined", () => {
+    render(<DashboardView viewModel={makeViewModel({ taskId: "task-1", agents: [] })} />);
+
+    const team = screen.getByLabelText("Mission team");
+    // YAAA leads the roster from the first message, not only once agents exist.
+    expect(within(team).getByText(`${ORCHESTRATOR_DISPLAY} · ${ORCHESTRATOR_MENTION}`)).toBeTruthy();
+    // Its dot is the "active" (green) status, never a pending/failed one.
+    expect(within(team).getByLabelText("active")).toBeTruthy();
+    // YAAA's thumbnail is the app's own brand mark, as used in the sidebar.
+    expect(within(team).getByAltText(ORCHESTRATOR_DISPLAY).getAttribute("src")).toBe("logo.jpg");
+  });
+
+  it("names the model each agent was spun up on, with the reason as its tooltip", () => {
+    render(<DashboardView viewModel={makeViewModel({
+      taskId: "task-1",
+      agents: [{
+        id: "agent-research",
+        handle: "@sage-1",
+        displayName: "Sage",
+        taskId: "task-1",
+        subtaskId: "research",
+        role: "Researcher",
+        modelRole: "anthropic/claude-sonnet-4.5",
+        model: "anthropic/claude-sonnet-4.5",
+        modelReason: "Mesh's live catalog offers it.",
+        status: "working",
+      }],
+    })} />);
+
+    const team = screen.getByLabelText("Mission team");
+    const model = within(team).getByText("Anthropic Claude Sonnet 4.5");
+    expect(model.getAttribute("title")).toBe("Mesh's live catalog offers it.");
+
+    // Agent Space spells out the same model plus why it was chosen.
+    fireEvent.click(screen.getByTitle("Agent Space"));
+    expect(screen.getByText("Model: Anthropic Claude Sonnet 4.5")).toBeTruthy();
+    expect(screen.getByText("Mesh's live catalog offers it.")).toBeTruthy();
+  });
+
+  it("omits the model line for an agent whose model is not resolved yet", () => {
+    render(<DashboardView viewModel={makeViewModel({
+      taskId: "task-1",
+      agents: [{
+        id: "agent-research",
+        handle: "@sage-1",
+        displayName: "Sage",
+        taskId: "task-1",
+        subtaskId: "research",
+        role: "Researcher",
+        modelRole: "worker",
+        status: "working",
+      }],
+    })} />);
+
+    const team = screen.getByLabelText("Mission team");
+    expect(within(team).queryByText(/Anthropic|Google/)).toBeNull();
+  });
+
+  describe("clarifying-question form", () => {
+    const QUESTIONS = "I need a few clarifications:\n\n- What is the deadline?\n- Which format do you want?";
+
+    // Clarifying questions reach the mission channel as an orchestrator log.
+    const renderQuestions = (continueMission = vi.fn()) => {
+      render(<DashboardView viewModel={makeViewModel({
+        taskId: "task-1",
+        continueMission,
+        logs: [
+          { id: "q1", time: "10:00", source: "orchestrator", kind: "response", content: QUESTIONS },
+        ],
+      })} />);
+      return continueMission;
+    };
+
+    it("sends the answers once and then disables the whole form", () => {
+      const continueMission = renderQuestions();
+      const answer = screen.getByPlaceholderText("Type your answer...");
+      fireEvent.change(answer, { target: { value: "Next Friday" } });
+
+      const submit = screen.getByText("Submit answers");
+      fireEvent.click(submit);
+
+      expect(continueMission).toHaveBeenCalledTimes(1);
+      expect(continueMission.mock.calls[0][0]).toContain("Next Friday");
+
+      // Every control is now spent — a second click cannot send a duplicate.
+      const form = screen.getByLabelText("Clarifying questions");
+      expect((within(form).getByText("Answers sent") as HTMLButtonElement).disabled).toBe(true);
+      expect((form.querySelector("textarea") as HTMLTextAreaElement).disabled).toBe(true);
+      expect(within(form).getByText("Back").closest("button")!.disabled).toBe(true);
+      expect(within(form).getByText("Next").closest("button")!.disabled).toBe(true);
+      expect(within(form).getByRole("status").textContent).toContain("Answers sent to YAAA");
+    });
+
+    it("ignores a repeat submit of the form after it was sent", () => {
+      const continueMission = renderQuestions();
+      fireEvent.change(screen.getByPlaceholderText("Type your answer..."), { target: { value: "PDF" } });
+      const form = screen.getByLabelText("Clarifying questions");
+
+      fireEvent.submit(form);
+      fireEvent.submit(form);
+      fireEvent.submit(form);
+
+      // Submitting the form directly bypasses the disabled button, so the
+      // guard has to live in the handler, not just in the markup.
+      expect(continueMission).toHaveBeenCalledTimes(1);
+    });
+
+    it("cannot be submitted before anything is answered", () => {
+      const continueMission = renderQuestions();
+      const submit = screen.getByText("Submit answers") as HTMLButtonElement;
+      expect(submit.disabled).toBe(true);
+      fireEvent.submit(screen.getByLabelText("Clarifying questions"));
+      expect(continueMission).not.toHaveBeenCalled();
+    });
+
+    it("renders suggested options as checkboxes and includes Other text", () => {
+      const continueMission = vi.fn();
+      render(<DashboardView viewModel={makeViewModel({
+        taskId: "task-1",
+        continueMission,
+        logs: [{
+          id: "q-options",
+          time: "10:00",
+          source: "orchestrator",
+          kind: "response",
+          content: "Which format should the deliverable use?\nOptions:\n- PowerPoint\n- PDF",
+        }],
+      })} />);
+
+      fireEvent.click(screen.getByLabelText("PowerPoint"));
+      fireEvent.change(screen.getByPlaceholderText("Type your answer..."), { target: { value: "A branded version" } });
+      fireEvent.click(screen.getByText("Submit answers"));
+
+      expect(continueMission).toHaveBeenCalledWith(expect.stringContaining("PowerPoint"), expect.anything());
+      expect(continueMission.mock.calls[0][0]).toContain("Other: A branded version");
+    });
+
+    it("infers checkbox options when the AI puts an either-or choice in the question", () => {
+      render(<DashboardView viewModel={makeViewModel({
+        taskId: "task-1",
+        logs: [{
+          id: "q-inline-options",
+          time: "10:00",
+          source: "orchestrator",
+          kind: "response",
+          content: "Presentation format: Would you like slide content, or would you prefer a PowerPoint file?",
+        }],
+      })} />);
+
+      expect(screen.getByLabelText("slide content")).toBeTruthy();
+      expect(screen.getByLabelText("a PowerPoint file")).toBeTruthy();
+    });
+  });
+
+  it("no longer renders the Contexts section", () => {
+    render(<DashboardView viewModel={makeViewModel({ taskId: "task-1" })} />);
+    expect(screen.queryByText("Contexts")).toBeNull();
+    expect(screen.queryByText(/^Project: /)).toBeNull();
+    expect(screen.queryByText(/^User: /)).toBeNull();
+  });
+
   it("no longer renders a New Mission back button in the topbar", () => {
     render(<DashboardView viewModel={makeViewModel({ taskId: "task-1" })} />);
     expect(screen.queryByText("← New Mission")).toBeNull();
@@ -657,6 +838,27 @@ describe("DashboardView", () => {
     });
     fireEvent.click(screen.getByText("Accept (addressing comments)"));
     expect(confirmPlan).toHaveBeenCalledWith("tighten the scope");
+  });
+
+  it("shows plan review actions from live awaiting state even if task list status is stale", () => {
+    const tasks = [{
+      id: "task-1",
+      prompt: "Build a thing",
+      status: "planning",
+      created_at: "2026-07-12T05:37:20.135Z",
+    }];
+    render(<DashboardView viewModel={makeViewModel({
+      taskId: "task-1",
+      awaitingConfirmation: true,
+      running: false,
+      tasks,
+      subtasks: [{ id: "s1", title: "Do the thing", capability: "files", dependsOn: [], riskLevel: "low", successCriteria: "", state: "pending" }],
+      logs: [{ id: "plan", time: "10:00", source: "orchestrator", content: "[plan-proposal] Implementation plan ready for review.", kind: "response" }],
+    })} />);
+
+    expect(screen.getByText("Accept plan")).toBeTruthy();
+    expect(screen.getByText("Review plan")).toBeTruthy();
+    expect(screen.getByText("Reject plan")).toBeTruthy();
   });
 
   it("restores an awaiting plan as an actionable proposal message", async () => {

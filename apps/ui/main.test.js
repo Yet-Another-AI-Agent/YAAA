@@ -6,6 +6,7 @@ const ipcHandlers = new Map();
 vi.mock("electron", () => {
   const mockApp = {
     isPackaged: false,
+    setName: vi.fn(),
     whenReady: vi.fn().mockResolvedValue(true),
     on: vi.fn(),
     quit: vi.fn(),
@@ -24,6 +25,17 @@ vi.mock("electron", () => {
     BrowserWindow: mockBrowserWindow,
     ipcMain: {
       handle: vi.fn((channel, handler) => ipcHandlers.set(channel, handler)),
+    },
+    nativeImage: {
+      createFromPath: vi.fn().mockReturnValue({}),
+    },
+    dialog: {
+      showMessageBox: vi.fn().mockResolvedValue({ response: 0 }),
+    },
+    shell: {
+      openPath: vi.fn().mockResolvedValue(""),
+      showItemInFolder: vi.fn(),
+      openExternal: vi.fn().mockResolvedValue(undefined),
     },
   };
 });
@@ -54,6 +66,9 @@ const workspaceInstance = {
   confirmTask: vi
     .fn()
     .mockResolvedValue({ success: true, summary: "ok", plan: null }),
+  continueMission: vi
+    .fn()
+    .mockResolvedValue({ kind: "conversation", reply: "ok" }),
   recordPlanReviewMessage: vi.fn().mockResolvedValue(undefined),
   listTasks: vi.fn().mockReturnValue([]),
   deleteTask: vi.fn(),
@@ -80,6 +95,9 @@ const workspaceInstance = {
   routeUserMessage: vi
     .fn()
     .mockResolvedValue({ kind: "conversation", reply: "Hello!" }),
+  classifyPlanReviewIntent: vi.fn().mockResolvedValue("feedback"),
+  getMissionSnapshot: vi.fn().mockResolvedValue({ task: { id: "task-123" }, agents: [] }),
+  getAgentWorkspace: vi.fn().mockResolvedValue({ agentId: "agent-1", files: {} }),
   saveArtifactAnnotations: vi
     .fn()
     .mockResolvedValue({ annotationPath: "/tmp/a.json", routes: [] }),
@@ -112,6 +130,7 @@ describe("Electron main (in-process, no CLI subprocess)", () => {
     expect(app.whenReady).toHaveBeenCalled();
     for (const channel of [
       "route-user-message",
+      "classify-plan-review-intent",
       "read-artifact-binary",
       "resume-agent",
       "get-paused-agents",
@@ -120,11 +139,15 @@ describe("Electron main (in-process, no CLI subprocess)", () => {
       "save-line-comments",
       "start-task",
       "confirm-task",
+      "continue-task",
       "record-plan-review",
       "resolve-approval",
       "list-tasks",
       "delete-task",
       "get-task-history",
+      "get-recent-task-events",
+      "get-mission-snapshot",
+      "get-agent-workspace",
       "create-public-conversation",
       "get-task-conversations",
       "get-conversation-messages",
@@ -150,6 +173,20 @@ describe("Electron main (in-process, no CLI subprocess)", () => {
     expect(res).toEqual({ kind: "conversation", reply: "Hello!" });
     expect(workspaceInstance.routeUserMessage).toHaveBeenCalledWith("hi");
     expect(workspaceInstance.createTask).not.toHaveBeenCalled();
+  });
+
+  it("exposes persisted mission and agent workspace inspection", async () => {
+    await import("./main.js");
+    const snapshot = ipcHandlers.get("get-mission-snapshot");
+    const workspace = ipcHandlers.get("get-agent-workspace");
+
+    await expect(snapshot({}, "task-123")).resolves.toEqual({ task: { id: "task-123" }, agents: [] });
+    await expect(workspace({}, { taskId: "task-123", agentId: "agent-1" })).resolves.toEqual({
+      agentId: "agent-1",
+      files: {},
+    });
+    expect(workspaceInstance.getMissionSnapshot).toHaveBeenCalledWith("task-123");
+    expect(workspaceInstance.getAgentWorkspace).toHaveBeenCalledWith("task-123", "agent-1");
   });
 
   it("route-user-message falls back to task intent when classification fails", async () => {
@@ -218,6 +255,70 @@ describe("Electron main (in-process, no CLI subprocess)", () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
     finish({ success: true, summary: "ok", plan: null });
+  });
+
+  it("continue-task returns immediately and completes over the event channel", async () => {
+    let finish;
+    workspaceInstance.continueMission.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    await import("./main.js");
+    const continueTask = ipcHandlers.get("continue-task");
+
+    await expect(continueTask({}, { taskId: "task-123", message: "continue" })).resolves.toEqual({
+      status: "started",
+    });
+    expect(workspaceInstance.continueMission).not.toHaveBeenCalled();
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(workspaceInstance.continueMission).toHaveBeenCalledWith(
+      "task-123",
+      "continue",
+      expect.objectContaining({
+        onEvent: expect.any(Function),
+        onApproval: expect.any(Function),
+      }),
+    );
+    finish({
+      kind: "task",
+      plan: { goal: "g", subtasks: [] },
+      result: { success: true, summary: "done", plan: { goal: "g", subtasks: [] } },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
+  it("continue-task accepts a correction while a confirmed task is already running", async () => {
+    let finishConfirm;
+    workspaceInstance.confirmTask.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishConfirm = resolve;
+        }),
+    );
+    await import("./main.js");
+    const confirmTask = ipcHandlers.get("confirm-task");
+    const continueTask = ipcHandlers.get("continue-task");
+
+    await expect(confirmTask({}, "task-123")).resolves.toEqual({ status: "started" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    await expect(
+      continueTask({}, { taskId: "task-123", message: "Actually make the game mobile-first" }),
+    ).resolves.toEqual({ status: "started" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(workspaceInstance.continueMission).toHaveBeenCalledWith(
+      "task-123",
+      "Actually make the game mobile-first",
+      expect.objectContaining({
+        onEvent: expect.any(Function),
+        onApproval: expect.any(Function),
+      }),
+    );
+    finishConfirm({ success: true, summary: "ok", plan: null });
   });
 
   it("delete-task purges the workspace and returns deleted", async () => {

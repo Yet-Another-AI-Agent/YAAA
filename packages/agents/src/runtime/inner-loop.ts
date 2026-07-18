@@ -1,6 +1,6 @@
-import type { IBus, ModelRole, IMeshGateway } from "@yaaa/interfaces";
-import { container, type Container, PermissionEngine, pauseController, agentControl } from "@yaaa/platform";
-import { type ArtifactRef, type ToolCall, isInsufficientFundsError } from "@yaaa/shared";
+import type { IBus, ModelRole, ModelResolver, IMeshGateway } from "@yaaa/interfaces";
+import { container, type Container, PermissionEngine, pauseController, agentControl, orchestratorMailbox } from "@yaaa/platform";
+import { type ArtifactRef, type ToolCall, isInsufficientFundsError, resolveFileRoots } from "@yaaa/shared";
 import { AGENT_REGISTRY } from "../registry.js";
 import { createReactAgent } from "@langchain/langgraph/prebuilt";
 import { AIMessage, HumanMessage, ToolMessage, isAIMessage, type BaseMessage } from "@langchain/core/messages";
@@ -34,7 +34,11 @@ function resolveMaxTurns(): number {
 // timeboxed still-working agents into "incomplete" checkpoints, which the outer
 // loop then churned into failures. Still env-tunable for tighter/looser runs.
 const DEFAULT_AGENT_INVOKE_TIMEOUT_MS = 480_000;
-const DEFAULT_AGENT_FIRST_PROGRESS_TIMEOUT_MS = 30_000;
+// Do not kill a model merely because it has not called a tool yet. Reasoning,
+// structured output, and provider-side queueing can all legitimately precede
+// the first tool observation. Operators may still opt into a shorter watchdog
+// with YAAA_AGENT_FIRST_PROGRESS_TIMEOUT_MS.
+const DEFAULT_AGENT_FIRST_PROGRESS_TIMEOUT_MS = 480_000;
 const DEFAULT_AGENT_CHECKPOINT_TIMEOUT_MS = 15_000;
 
 class AgentInvocationTimeoutError extends Error {
@@ -135,6 +139,7 @@ interface ToolObservation {
   result: string;
   ok: boolean;
   path?: string;
+  metadata?: Record<string, unknown>;
 }
 
 const MIME_BY_EXT: Record<string, string> = {
@@ -166,9 +171,36 @@ function formatToolObservations(observations: ToolObservation[] = []): string {
     .map((observation) => {
       const args = observation.argSummary ? ` (${observation.argSummary})` : "";
       const status = observation.ok ? "ok" : "failed";
-      return `- ${observation.capability}.${observation.method}${args}: ${status} - ${observation.result}`;
+      const metadata = formatToolObservationMetadata(observation.metadata);
+      return `- ${observation.capability}.${observation.method}${args}: ${status} - ${observation.result}${metadata}`;
     })
     .join("\n");
+}
+
+function formatToolObservationMetadata(metadata: Record<string, unknown> | undefined): string {
+  if (!metadata) return "";
+  const details: string[] = [];
+  const keys = ["path", "screenshotPath", "command", "url", "query", "title", "stdout", "stderr", "exitCode"];
+  for (const key of keys) {
+    const value = metadata[key];
+    if (typeof value === "string" && value.trim()) {
+      details.push(`${key}: ${value.trim()}`);
+    } else if (typeof value === "number" || typeof value === "boolean") {
+      details.push(`${key}: ${String(value)}`);
+    }
+  }
+  if (Array.isArray(metadata.results) && metadata.results.length > 0) {
+    const resultTitles = metadata.results
+      .slice(0, 3)
+      .map((item) => {
+        if (!item || typeof item !== "object") return String(item);
+        const record = item as Record<string, unknown>;
+        return [record.title, record.url].filter((part) => typeof part === "string" && part).join(" ");
+      })
+      .filter(Boolean);
+    if (resultTitles.length > 0) details.push(`results: ${resultTitles.join(" | ")}`);
+  }
+  return details.length > 0 ? ` [${details.join("; ")}]` : "";
 }
 
 function promoteReadableDeliverablesFromToolEvidence(
@@ -191,6 +223,60 @@ function promoteReadableDeliverablesFromToolEvidence(
     });
     existing.add(path);
   }
+}
+
+/**
+ * Shell commands can create binary deliverables without going through the
+ * write_file tool, so tool callbacks alone are not a complete artifact ledger.
+ * Reconcile the ledger with the task workspace immediately before publishing
+ * the result. Agent-private handoff files stay private to that agent's record.
+ */
+function collectWorkspaceArtifacts(
+  workspaceRoot: string,
+  artifacts: ArtifactRef[],
+  role: string,
+): void {
+  const existing = new Set(artifacts.map((artifact) => path.normalize(artifact.path)));
+  const ignoredDirectories = new Set(["agent-workspaces", "node_modules", ".git", ".yaaa"]);
+  const deliverableExtensions = new Set([
+    "pptx", "pdf", "png", "jpg", "jpeg", "webp", "gif", "svg",
+    "md", "markdown", "txt", "json", "csv", "tsv", "html", "xlsx", "xls",
+    "js", "mjs", "cjs",
+  ]);
+  const walk = (directory: string): void => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith(".") || ignoredDirectories.has(entry.name)) continue;
+      const absolute = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        walk(absolute);
+        continue;
+      }
+      const extension = path.extname(entry.name).slice(1).toLowerCase();
+      if (!deliverableExtensions.has(extension)) continue;
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(absolute);
+      } catch {
+        continue;
+      }
+      if (!stat.isFile() || stat.size === 0) continue;
+      const relative = path.relative(workspaceRoot, absolute).split(path.sep).join("/");
+      if (relative.startsWith("agent-workspaces/") || existing.has(path.normalize(relative))) continue;
+      artifacts.push({
+        path: relative,
+        mimeType: inferMime(relative),
+        description: `Workspace artifact discovered after ${role} execution.`,
+      });
+      existing.add(path.normalize(relative));
+    }
+  };
+  walk(workspaceRoot);
 }
 
 async function writeIncompleteWorkArtifact(
@@ -217,6 +303,10 @@ The agent gathered tool evidence but did not produce the requested deliverable f
 
 ${checkpointSummary?.trim() || "The agent did not produce a checkpoint response before the checkpoint timeout."}
 
+## Why This Was Not Completed
+
+The deliverable was not completed before the timebox. The checkpoint above and the tool evidence below are the blocker evidence. A future agent must confirm the blocker before repeating any expensive or unsuccessful approach.
+
 ## Tool Evidence
 
 ${formatToolObservations(observations)}
@@ -225,6 +315,7 @@ ${formatToolObservations(observations)}
 
 - Do not restart from a blank slate.
 - Use the tool evidence above as context.
+- Do not repeat an approach shown by the evidence to be blocked or unsuccessful; record the reason before trying an alternative.
 - Create or repair the requested deliverable artifact, then verify it with available tools before handing off.
 `,
   );
@@ -255,7 +346,7 @@ async function requestTimeoutCheckpoint(input: {
         input.model.invoke(
           [
             new HumanMessage(
-              `Your previous agent run reached its timebox after making tool progress. Do not call tools now. Wind up with a concise checkpoint for the orchestrator.\n\nInclude:\n- current status\n- work completed\n- remaining work\n- whether another agent should continue, retry with a fresh timer, or change approach\n- exact artifact paths or evidence already observed\n\nOriginal assignment:\n${input.originalInstruction}\n\nTool evidence:\n${evidence}`,
+              `Your previous agent run reached its timebox after making tool progress. Do not call tools now. Wind up with a concise checkpoint for the orchestrator.\n\nInclude:\n- current status\n- work completed\n- remaining work\n- exactly what could not be completed and why\n- approaches already attempted and what failed or was blocked\n- whether another agent should continue, retry with a fresh timer, or change approach\n- exact artifact paths or evidence already observed\n- explicit instructions about what the next agent should not repeat\n\nOriginal assignment:\n${input.originalInstruction}\n\nTool evidence:\n${evidence}`,
             ),
           ],
           { signal } as any,
@@ -456,6 +547,135 @@ function withNonEmptyContent(message: BaseMessage): BaseMessage {
   return message;
 }
 
+/**
+ * Keep the provider-facing transcript internally consistent. Some
+ * OpenAI-compatible gateways occasionally return a parsed `tool_calls` array
+ * that differs from the raw `additional_kwargs.tool_calls`, or a partial set
+ * of ToolMessages after a model turn is interrupted. Gemini rejects that
+ * history instead of attempting to recover from it.
+ *
+ * Only the input copy is repaired. The LangGraph state remains untouched so
+ * debugging and handoff artifacts still contain the original evidence.
+ */
+function repairToolCallTranscript(messages: BaseMessage[]): BaseMessage[] {
+  const repaired: BaseMessage[] = [];
+  let repairedCalls = 0;
+
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (message.getType() !== "ai") {
+      // A ToolMessage without an immediately preceding AI tool-call turn is
+      // invalid for Gemini and cannot be meaningfully paired later.
+      if (message.getType() !== "tool") repaired.push(message);
+      continue;
+    }
+
+    const ai = message as AIMessage;
+    const calls = Array.isArray(ai.tool_calls) ? ai.tool_calls : [];
+    if (calls.length === 0) {
+      const { tool_calls: rawToolCalls, ...additionalKwargs } = ai.additional_kwargs ?? {};
+      if (Array.isArray(rawToolCalls) && rawToolCalls.length > 0) {
+        repaired.push(new AIMessage({
+          content: isBlank(ai.content) ? EMPTY_CONTENT_PLACEHOLDER : ai.content,
+          tool_calls: [],
+          invalid_tool_calls: [],
+          additional_kwargs: additionalKwargs,
+          response_metadata: ai.response_metadata,
+          id: ai.id,
+          name: ai.name,
+        }));
+      } else {
+        repaired.push(message);
+      }
+      continue;
+    }
+
+    const followingTools: ToolMessage[] = [];
+    let cursor = index + 1;
+    while (cursor < messages.length && messages[cursor].getType() === "tool") {
+      followingTools.push(messages[cursor] as ToolMessage);
+      cursor += 1;
+    }
+    const responseIds = new Set(followingTools.map((toolMessage) => toolMessage.tool_call_id));
+    const validCalls = calls.filter((call) => responseIds.has(call.id));
+    if (validCalls.length !== calls.length) repairedCalls += calls.length - validCalls.length;
+
+    // Do not carry raw provider tool calls alongside the normalized LangChain
+    // calls. Keeping both is what creates the function-call/function-response
+    // count mismatch on the next Gemini request.
+    const { tool_calls: _rawToolCalls, ...additionalKwargs } = ai.additional_kwargs ?? {};
+    repaired.push(new AIMessage({
+      content: isBlank(ai.content) ? EMPTY_CONTENT_PLACEHOLDER : ai.content,
+      tool_calls: validCalls,
+      invalid_tool_calls: [],
+      additional_kwargs: additionalKwargs,
+      response_metadata: ai.response_metadata,
+      id: ai.id,
+      name: ai.name,
+    }));
+    for (const toolMessage of followingTools) {
+      if (validCalls.some((call) => call.id === toolMessage.tool_call_id)) {
+        repaired.push(toolMessage);
+      }
+    }
+    index = cursor - 1;
+  }
+
+  if (repairedCalls > 0) {
+    // Keep this visible in the agent log without exposing tool arguments.
+    console.warn("[YAAA] Repaired incomplete tool-call transcript before Gemini request", {
+      droppedToolCalls: repairedCalls,
+    });
+  }
+  return repaired;
+}
+
+function getAutoCourseCorrection(messages: BaseMessage[]): string | null {
+  // 1. Check for repeated web search
+  const searchMessages = messages.filter(
+    (m) => m.getType() === "tool" && (m as ToolMessage).name === "web_search"
+  );
+  if (searchMessages.length >= 3) {
+    const hasWarned = messages.some(
+      (m) =>
+        m.getType() === "human" &&
+        m.content.toString().includes("System Notice: You have performed")
+    );
+    if (!hasWarned) {
+      return `System Notice: You have performed ${searchMessages.length} web searches. The search tool may not be returning the exact results you expect. If you are not finding the information, stop searching and rely on your own knowledge base to synthesize and draft the deliverables, or look for alternative files/tools. Do not get stuck in a search loop.`;
+    }
+  }
+
+  // 2. Check for repeated tool failures or identical calls
+  const toolMessages = messages.filter((m) => m.getType() === "tool") as ToolMessage[];
+  if (toolMessages.length >= 3) {
+    const lastThree = toolMessages.slice(-3);
+    const first = lastThree[0];
+    const allSameName = lastThree.every((tm) => tm.name === first.name);
+    if (allSameName) {
+      const allFailed = lastThree.every(
+        (tm) =>
+          tm.content.toString().includes("error") ||
+          tm.content.toString().includes("failed") ||
+          tm.content.toString().includes("Permission denied") ||
+          tm.content.toString().length < 50
+      );
+      if (allFailed) {
+        const hasWarned = messages.some(
+          (m) =>
+            m.getType() === "human" &&
+            m.content.toString().includes("System Notice: The tool has repeatedly failed")
+        );
+        if (!hasWarned) {
+          return `System Notice: The tool "${first.name}" has repeatedly failed or returned empty/error results. Please pause, re-evaluate your inputs/parameters, and try a different tool or strategy instead of repeating this call.`;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
 function truncateForLog(value: string, max = 140): string {
   const clean = value.replace(/\s+/g, " ").trim();
   return clean.length > max ? `${clean.slice(0, max)}…` : clean;
@@ -521,6 +741,13 @@ function screenshotDataUrl(screenshotPath: string | undefined): string | undefin
   }
 }
 
+function screenshotLogPath(workspaceRoot: string, agentId: string, requestedPath: string): { relative: string; absolute: string } {
+  const requestedName = path.basename(requestedPath || "browser.png");
+  const safeName = safePathSegment(requestedName) || "browser.png";
+  const relative = `agent-workspaces/${safePathSegment(agentId)}/logs/${safeName}`;
+  return { relative, absolute: path.resolve(workspaceRoot, relative) };
+}
+
 function buildToolMetadata(
   capability: string,
   method: string,
@@ -547,7 +774,8 @@ function buildToolMetadata(
       : undefined) ??
     (method === "screenshot" && typeof output === "string" ? output : undefined);
   if (screenshotPath) metadata.screenshotPath = screenshotPath;
-  const dataUrl = screenshotDataUrl(screenshotPath);
+  const screenshotAbsolutePath = resultString(output, "screenshotAbsolutePath");
+  const dataUrl = screenshotDataUrl(screenshotAbsolutePath ?? screenshotPath);
   if (dataUrl) metadata.screenshotDataUrl = dataUrl;
 
   if (output && typeof output === "object") {
@@ -635,6 +863,7 @@ export class InnerLoop {
   private scope: Container;
   private modelFactory: ChatModelFactory;
   private maxTurns: number;
+  private modelResolver?: ModelResolver;
 
   constructor(scope: Container = container) {
     this.scope = scope;
@@ -642,6 +871,11 @@ export class InnerLoop {
     this.permissions = scope.resolve<PermissionEngine>("PermissionEngine");
     this.modelFactory = scope.resolve<ChatModelFactory>("ChatModelFactory");
     this.maxTurns = resolveMaxTurns();
+    try {
+      this.modelResolver = scope.resolve<ModelResolver>("modelResolver");
+    } catch {
+      // Alternate/test runtimes may not expose Mesh model discovery.
+    }
   }
 
   async run(options: WorkerOptions): Promise<any> {
@@ -670,10 +904,15 @@ export class InnerLoop {
     } catch {
       workspaceRoot = process.cwd();
     }
+    // The workspace is always reachable; the configured roots (full disk by
+    // default) are what let an agent act on the user's own files instead of
+    // failing with a permission error the user cannot do anything about.
+    const fileRoots = resolveFileRoots();
     this.permissions.grantScope(agentId, {
       capabilities: template.capabilities,
-      allowedPaths: [workspaceRoot],
+      allowedPaths: [workspaceRoot, ...fileRoots],
       riskCeiling: template.riskCeiling,
+      workspacePath: workspaceRoot,
     });
     // Start this agent with a clean control mailbox; supervisor/UI directives
     // (extend / redirect / stop) posted during the run are drained in preModelHook.
@@ -681,6 +920,7 @@ export class InnerLoop {
     logInner(agentId, "permission scope granted", {
       capabilities: template.capabilities,
       riskCeiling: template.riskCeiling,
+      fileRoots,
     });
 
     await this.bus.publish(`task.${taskId}.agent.${agentId}.started`, {
@@ -697,8 +937,38 @@ export class InnerLoop {
     const tools = this.buildTools(template.capabilities, template.role, agentId, taskId, artifacts, toolObservations, workspaceRoot, () => {
       sawToolProgress = true;
     });
-    const modelName = options.model ?? template.modelRole;
-    const model = this.modelFactory(modelName);
+    // Resolve against Mesh's catalog again at the final model-factory boundary,
+    // so an agent reaching the inner loop by any path still runs on a model Mesh
+    // offers. Resolution is idempotent and catalog-cached: a requested model
+    // that is available resolves to itself, so this preserves the planner's
+    // choice rather than overriding it.
+    let resolvedModel: string | undefined;
+    if (this.modelResolver) {
+      try {
+        resolvedModel = (await this.modelResolver(options.model)).model;
+      } catch (error) {
+        warnInner(agentId, "Mesh model lookup failed; preserving requested model", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      if (!resolvedModel) {
+        warnInner(agentId, "Mesh returned no eligible model; using configured fallback", {
+          fallbackModel: options.model ?? template.modelRole,
+        });
+      }
+    }
+    const modelName = resolvedModel || options.model || template.modelRole;
+    const rawModel = this.modelFactory(modelName);
+    if (typeof rawModel.bindTools === "function") {
+      const originalBindTools = rawModel.bindTools.bind(rawModel);
+      rawModel.bindTools = (tools: any[], kwargs?: any) => {
+        return originalBindTools(tools, {
+          ...kwargs,
+          parallel_tool_calls: false,
+        });
+      };
+    }
+    const model = rawModel;
     logInner(agentId, "model factory resolved", {
       modelName,
       templateRole: template.role,
@@ -721,8 +991,21 @@ export class InnerLoop {
       // turn — the persisted transcript in `messages` is untouched.
       preModelHook: async (state: { messages: BaseMessage[] }) => {
         await pauseController.waitIfPaused(agentId);
-        const base = state.messages.map(withNonEmptyContent);
+        const base = repairToolCallTranscript(state.messages.map(withNonEmptyContent));
         const injected: BaseMessage[] = [];
+
+        // Automated Loop and Tool Failure Course Correction
+        const autoCorrection = getAutoCourseCorrection(base);
+        if (autoCorrection) {
+          injected.push(new HumanMessage(autoCorrection));
+          await this.bus.publish(`task.${taskId}.agent.${agentId}.thought`, {
+            kind: "thought",
+            from: agentId,
+            content: `🛡️ Agent Loop Guard: Injected course correction warning.`,
+          });
+          warnInner(agentId, "injected loop guard warning", { autoCorrection });
+        }
+
         for (const directive of agentControl.drain(agentId)) {
           if (directive.type === "extend") {
             grantedExtensionMs += Math.max(0, directive.additionalMs);
@@ -837,12 +1120,12 @@ export class InnerLoop {
           status: "INCOMPLETE",
           toolObservations,
         });
-        await this.publishResult(taskId, agentId, handoffArtifacts, summary);
+        await this.publishResult(taskId, agentId, handoffArtifacts, summary, true);
         logInner(agentId, "stopped by supervisor with checkpoint handoff", {
           artifactCount: handoffArtifacts.length,
           toolObservationCount: toolObservations.length,
         });
-        return { artifacts: handoffArtifacts, summary, incomplete: true };
+        return { artifacts: handoffArtifacts, summary, incomplete: true, runtimeEvidence: formatToolObservations(toolObservations) };
       }
       if (!isAgentInvocationTimeoutError(err)) {
         warnInner(agentId, "worker failed; starting self-introspection recovery", {
@@ -934,12 +1217,12 @@ export class InnerLoop {
           status: "INCOMPLETE",
           toolObservations,
         });
-        await this.publishResult(taskId, agentId, handoffArtifacts, summary);
+        await this.publishResult(taskId, agentId, handoffArtifacts, summary, true);
         logInner(agentId, "timeout after progress completed with incomplete work artifact", {
           artifactCount: handoffArtifacts.length,
           toolObservationCount: toolObservations.length,
         });
-        return { artifacts: handoffArtifacts, summary, incomplete: true };
+        return { artifacts: handoffArtifacts, summary, incomplete: true, runtimeEvidence: formatToolObservations(toolObservations) };
       }
       warnInner(agentId, "worker failed before normal completion", {
         error: err instanceof Error ? err.message : String(err),
@@ -1051,6 +1334,11 @@ export class InnerLoop {
       });
     }
 
+    // Reconcile shell-created files before the verifier or orchestrator sees
+    // the result. This is what makes a generated PPTX count even when it was
+    // produced by `node create_presentation.js` rather than write_file.
+    collectWorkspaceArtifacts(workspaceRoot, artifacts, template.role);
+
     if (template.modelRole === "verifier") {
       const verdict = parseVerifierResult(finalText);
       const handoffArtifacts = await this.ensureHandoffArtifacts({
@@ -1067,7 +1355,7 @@ export class InnerLoop {
         },
       });
       await this.publishResult(taskId, agentId, handoffArtifacts, verdict.reason);
-      return { ...verdict, artifacts: handoffArtifacts, summary: verdict.reason };
+      return { ...verdict, artifacts: handoffArtifacts, summary: verdict.reason, runtimeEvidence: formatToolObservations(toolObservations) };
     }
 
     const summary = isSyntheticToolTranscript(finalText)
@@ -1087,7 +1375,7 @@ export class InnerLoop {
       artifactCount: finalArtifacts.length,
       summaryChars: summary.length,
     });
-    return { artifacts: finalArtifacts, summary };
+    return { artifacts: finalArtifacts, summary, runtimeEvidence: formatToolObservations(toolObservations) };
   }
 
   private async ensureHandoffArtifacts(input: {
@@ -1142,9 +1430,14 @@ export class InnerLoop {
         : status === "INCOMPLETE"
           ? "- The assigned work reached a timebox before final completion.\n- The next agent should continue from the listed artifacts and only redo work when the evidence is insufficient."
         : "- None identified by the runtime. Review the proof of work for task-specific caveats.";
+      const blockerSection = input.failure
+        ? `\n## Why This Could Not Be Completed\n\n- Blocker: ${input.failure.message}\n- Timeout before first progress: ${input.failure.timedOut ? "Yes" : "No"}\n- Tool progress observed: ${input.failure.sawToolProgress ? "Yes" : "No"}\n\n## Do Not Repeat\n\n- Do not repeat the same approach without addressing the blocker above. Review the tool evidence and use a materially different approach.\n`
+        : status === "INCOMPLETE"
+          ? `\n## Why This Was Not Completed\n\n- The agent reached its timebox before producing a final deliverable.\n- The exact remaining work and blocker evidence are recorded in the summary and tool evidence above.\n\n## Do Not Repeat\n\n- Do not restart from a blank slate or repeat unsuccessful calls without first addressing the recorded blocker.\n`
+          : "";
       await filesProvider.writeFile(
         handOffPath,
-        `# Agent Handoff\n\n- Task: ${input.taskId}\n- Agent: ${input.agentId}\n- Role: ${input.templateName}\n- Created: ${now}\n- Status: ${status}\n\n## Work Done\n\n${input.summary.trim() || "No summary was provided."}\n${failureSection}## Observations\n\n- Review the proof of work and produced artifacts listed below before deciding whether to continue, revise, or spin another agent.\n\n## Tool Evidence\n\n${formatToolObservations(input.toolObservations)}\n\n## Suggestions\n\n- Continue from the concrete artifacts and evidence, not from assumptions.\n- If follow-up work is needed, create a fresh handsOn.md that cites this handOff.md and the relevant artifacts.\n\n## Asset Metadata\n\n${formatArtifactList(artifacts)}\n\n## Residual Risks\n\n${residualRisks}\n\n## Continuation Instructions\n\n- Start by reading this handOff.md and proofOfWork.md.\n- Inspect any listed artifacts before modifying them.\n- Preserve useful outputs from this agent and only redo work when evidence shows a gap.\n`,
+        `# Agent Handoff\n\n- Task: ${input.taskId}\n- Agent: ${input.agentId}\n- Role: ${input.templateName}\n- Created: ${now}\n- Status: ${status}\n\n## Work Done\n\n${input.summary.trim() || "No summary was provided."}\n${failureSection}${blockerSection}## Observations\n\n- Review the proof of work and produced artifacts listed below before deciding whether to continue, revise, or spin another agent.\n\n## Tool Evidence\n\n${formatToolObservations(input.toolObservations)}\n\n## Suggestions\n\n- Continue from the concrete artifacts and evidence, not from assumptions.\n- If follow-up work is needed, create a fresh handsOn.md that cites this handOff.md and the relevant artifacts.\n\n## Asset Metadata\n\n${formatArtifactList(artifacts)}\n\n## Residual Risks\n\n${residualRisks}\n\n## Continuation Instructions\n\n- Start by reading this handOff.md and proofOfWork.md.\n- Inspect any listed artifacts before modifying them.\n- Preserve useful outputs from this agent and only redo work when evidence shows a gap.\n- If work remains incomplete, address the recorded blocker before attempting the same approach again.\n`,
       );
       logInner(input.agentId, "wrote handOff.md", {
         path: handOffPath,
@@ -1205,6 +1498,7 @@ export class InnerLoop {
     agentId: string,
     artifacts: ArtifactRef[],
     summary: string,
+    incomplete = false,
   ): Promise<void> {
     await this.bus.publish(`task.${taskId}.agent_message`, {
       kind: "result",
@@ -1212,6 +1506,7 @@ export class InnerLoop {
       taskId,
       artifacts,
       summary,
+      ...(incomplete ? { incomplete: true } : {}),
     });
   }
 
@@ -1233,6 +1528,7 @@ export class InnerLoop {
     markToolProgress: () => void,
   ): StructuredToolInterface[] {
     const filesProvider = capabilities.includes("files") ? this.scope.resolve<any>("capability:files") : undefined;
+    const agentWorkspace = `agent-workspaces/${safePathSegment(agentId)}`;
     const verifierFileReadOnly = ["VerifierAgent", "QaTesterAgent", "CvTesterAgent"].includes(role);
     const bus = this.bus;
     const permissions = this.permissions;
@@ -1300,6 +1596,7 @@ export class InnerLoop {
             const output = await permissions.executeWithApproval(agentId, call, () => invoke(args));
             onSuccess?.(args);
             const resultSummary = summarizeToolResult(output);
+            const metadata = buildToolMetadata(capability, method, args, output);
             toolObservations.push({
               capability,
               method,
@@ -1307,12 +1604,13 @@ export class InnerLoop {
               result: resultSummary,
               ok: true,
               path: typeof args?.path === "string" ? args.path : undefined,
+              metadata,
             });
             await bus.publish(`task.${taskId}.agent.${agentId}.tool_requested`, {
               kind: "thought",
               from: agentId,
               content: `✓ ${capability}.${method}: ${resultSummary}`,
-              metadata: buildToolMetadata(capability, method, args, output),
+              metadata,
             });
             logInner(agentId, "tool completed", {
               capability,
@@ -1322,6 +1620,10 @@ export class InnerLoop {
             return capOutput(safeSerialize(output));
           } catch (err: any) {
             const errorSummary = truncateForLog(err?.message ?? String(err));
+            const metadata = {
+              ...buildToolMetadata(capability, method, args),
+              error: errorSummary,
+            };
             toolObservations.push({
               capability,
               method,
@@ -1329,15 +1631,13 @@ export class InnerLoop {
               result: errorSummary,
               ok: false,
               path: typeof args?.path === "string" ? args.path : undefined,
+              metadata,
             });
             await bus.publish(`task.${taskId}.agent.${agentId}.tool_requested`, {
               kind: "thought",
               from: agentId,
               content: `✗ ${capability}.${method} failed: ${errorSummary}`,
-              metadata: {
-                ...buildToolMetadata(capability, method, args),
-                error: errorSummary,
-              },
+              metadata,
             });
             warnInner(agentId, "tool failed", {
               capability,
@@ -1405,6 +1705,35 @@ export class InnerLoop {
       result = result.filter((tool) => !blockedFileWriters.has(tool.name));
     }
 
+    // A worker can explicitly ask the orchestrator for clarification without
+    // leaving LangGraph or spawning a replacement agent. The request is
+    // queued for the outer event loop and surfaced to the UI immediately.
+    result.push(
+      tool(
+        async ({ question }: { question: string }) => {
+          orchestratorMailbox.post({
+            id: `agent-question-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            taskId,
+            from: "agent",
+            content: question,
+            createdAt: new Date().toISOString(),
+          });
+          await bus.publish(`task.${taskId}.agent_message`, {
+            kind: "help_request",
+            from: agentId,
+            to: "orchestrator",
+            problem: question,
+          });
+          return "Your question has been queued for the orchestrator. Continue with the safest evidence-based path while waiting for guidance.";
+        },
+        {
+          name: "ask_orchestrator",
+          description: "Queue one concise, self-contained question or blocker for the orchestrator and continue with safe work. The question must make sense without prior conversation: name the subject, state the exact decision or missing information, avoid fragments or vague references, and do not assume multiple-choice options unless you list and explain every option.",
+          schema: z.object({ question: z.string().min(1) }),
+        },
+      ),
+    );
+
     if (capabilities.includes("shell")) {
       const shell = optionalProvider("capability:shell");
       if (shell) {
@@ -1456,7 +1785,11 @@ export class InnerLoop {
         gated("browser_forward", "forward", "Navigate forward.", z.object({ id: z.string() }), (a) => browser.forward(a.id), undefined, "browser"),
         gated("browser_wait", "waitFor", "Wait for an element to appear.", z.object({ id: z.string(), selector: z.string(), timeoutMs: z.number().positive().default(30000) }), (a) => browser.waitFor(a.id, a.selector, a.timeoutMs), undefined, "browser"),
         gated("browser_content", "content", "Get rendered text and HTML from an element.", z.object({ id: z.string(), selector: z.string().default("body") }), (a) => browser.content(a.id, a.selector), undefined, "browser"),
-        gated("browser_screenshot", "screenshot", "Capture a page, full page, or element screenshot.", z.object({ id: z.string(), outputPath: z.string(), fullPage: z.boolean().default(false), selector: z.string().optional() }), (a) => browser.screenshot(a.id, a.outputPath, a), undefined, "browser"),
+        gated("browser_screenshot", "screenshot", "Capture a page, full page, or element screenshot. Screenshots are stored in the agent logs folder.", z.object({ id: z.string(), outputPath: z.string(), fullPage: z.boolean().default(false), selector: z.string().optional() }), async (a) => {
+          const target = screenshotLogPath(workspaceRoot, agentId, a.outputPath);
+          const savedPath = await browser.screenshot(a.id, target.absolute, a);
+          return { screenshotPath: target.relative, screenshotAbsolutePath: savedPath };
+        }, undefined, "browser"),
         gated("close_browser", "close", "Close a Chromium session.", z.object({ id: z.string() }), (a) => browser.close(a.id), undefined, "browser"),
       );
       }

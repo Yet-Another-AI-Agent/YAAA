@@ -19,6 +19,9 @@ export interface IntentRouterContext {
   userName?: string;
 }
 
+export type PlanReviewIntent = "approve" | "reject" | "feedback";
+export type MissionFollowupIntent = "resume" | "correction";
+
 const FALLBACK_GREETING =
   "Hello! I'm the YAAA orchestrator. What are we building or working on today?";
 
@@ -66,6 +69,65 @@ function sanitizeReply(raw: string | undefined | null): string | null {
 
 export class IntentRouter {
   constructor(private readonly gateway: IMeshGateway) {}
+
+  async classifyPlanReview(message: string): Promise<PlanReviewIntent> {
+    const messages: ChatMessage[] = [
+      {
+        role: "system",
+        content: `Classify the user's response to an implementation plan awaiting approval.
+Return exactly one JSON object with intent "approve", "reject", or "feedback".
+approve means the user clearly authorizes starting the proposed plan.
+reject means the user clearly refuses the plan.
+feedback means the user asks a question, requests changes, gives comments, or is ambiguous.
+Do not treat status questions like "what is happening?" as approval.
+Only clearly intended approval counts; use feedback for uncertainty.
+Respond only with {"intent":"approve"|"reject"|"feedback"}.`,
+      },
+      { role: "user", content: message },
+    ];
+    try {
+      const raw = (await this.gateway.chat(messages, {
+        modelRole: "utility",
+        temperature: 0,
+        jsonMode: true,
+      })).content;
+      const parsed = JSON.parse(raw.trim());
+      if (parsed?.intent === "approve" || parsed?.intent === "reject" || parsed?.intent === "feedback") {
+        return parsed.intent;
+      }
+    } catch {
+      // An uncertain answer must never auto-approve a plan.
+    }
+    return "feedback";
+  }
+
+  async classifyMissionFollowup(message: string): Promise<MissionFollowupIntent> {
+    const messages: ChatMessage[] = [
+      {
+        role: "system",
+        content: `Classify a user's message sent to a mission that was interrupted or is currently running.
+Return exactly one JSON object with intent "resume" or "correction".
+resume means the user wants the approved mission to continue from its saved checkpoint.
+correction means the user changes requirements, adds context, asks for a different approach, or is ambiguous.
+Respond only with {"intent":"resume"|"correction"}.`,
+      },
+      { role: "user", content: message },
+    ];
+    try {
+      const raw = (await this.gateway.chat(messages, {
+        modelRole: "utility",
+        temperature: 0,
+        jsonMode: true,
+      })).content;
+      const parsed = JSON.parse(raw.trim());
+      if (parsed?.intent === "resume" || parsed?.intent === "correction") {
+        return parsed.intent;
+      }
+    } catch {
+      // Ambiguous or unavailable classification must not silently resume.
+    }
+    return "correction";
+  }
 
   async route(
     message: string,

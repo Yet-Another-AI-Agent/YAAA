@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Workspace, buildPlanAcknowledgement } from "./workspace.js";
+import { Workspace, buildStrategyAcknowledgement } from "./workspace.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -21,14 +21,14 @@ afterEach(() => {
 describe("Workspace", () => {
   it("builds a concise pre-plan acknowledgement that honors explicit agent count", () => {
     expect(
-      buildPlanAcknowledgement(
+      buildStrategyAcknowledgement(
         "spin 2 agents and one to write Python code and another to test",
       ),
     ).toBe(
-      "Got it — I’ll prepare a plan using exactly 2 agents, preserving the roles you requested. You can review it before any agent starts.",
+      "Got it — I’ll prepare a strategy using exactly 2 agents, preserving the roles you requested. You can review it before any agent starts.",
     );
-    expect(buildPlanAcknowledgement("Build a Python tool")).toContain(
-      "implementation plan",
+    expect(buildStrategyAcknowledgement("Build a Python tool")).toContain(
+      "implementation strategy",
     );
   });
 
@@ -42,6 +42,9 @@ describe("Workspace", () => {
       reply: "",
       action: "prepare_plan",
     });
+    vi.spyOn(workspace as any, "generateStrategyAcknowledgement").mockResolvedValue(
+      buildStrategyAcknowledgement(goal)
+    );
     vi.spyOn(workspace, "prepareTask").mockResolvedValue({ goal, subtasks: [] });
     const events: any[] = [];
 
@@ -151,7 +154,7 @@ describe("Workspace", () => {
     });
     await expect(workspace.getTaskAgents(task.taskId)).resolves.toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ handle: "@researcher-1", status: "completed" }),
+        expect.objectContaining({ handle: expect.stringMatching(/^@[a-z0-9-]+-1$/), status: "completed" }),
       ]),
     );
   });
@@ -551,7 +554,7 @@ describe("Workspace", () => {
     await workspace.confirmTask(task.taskId);
 
     const agents = await workspace.getTaskAgents(task.taskId);
-    const worker = agents.find((agent) => agent.handle === "@researcher-1");
+    const worker = agents.find((agent) => agent.handle.endsWith("-1"));
     expect(worker).toBeDefined();
 
     const conversation = await workspace.createPublicConversation(task.taskId);

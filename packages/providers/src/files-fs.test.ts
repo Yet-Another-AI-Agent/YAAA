@@ -50,14 +50,81 @@ describe("FilesFs", () => {
     expect(search).toContain(path.normalize("sub/folder/nested.txt"));
   });
 
-  it("should block directory traversal outside base directory", async () => {
-    await expect(filesFs.readFile("../package.json")).rejects.toThrow(
-      "Directory traversal violation"
-    );
+  // YAAA drives the user's own machine, so by default an agent can reach files
+  // outside its task workspace. `allowedRoots: []` restores the strict,
+  // workspace-only confinement for deployments that want it.
+  describe("workspace-only mode (allowedRoots: [])", () => {
+    let confined: FilesFs;
+
+    beforeAll(() => {
+      confined = new FilesFs(testDir, { allowedRoots: [] });
+    });
+
+    it("blocks traversal outside the base directory", async () => {
+      await expect(confined.readFile("../package.json")).rejects.toThrow(/outside the task workspace/);
+    });
+
+    it("does not confuse a sibling with a shared path prefix for the workspace", async () => {
+      await expect(confined.readFile(`../${path.basename(testDir)}-evil/file.txt`)).rejects.toThrow(
+        /outside the task workspace/,
+      );
+    });
+
+    it("blocks an absolute path outside the workspace", async () => {
+      await expect(confined.readFile(path.join(os.tmpdir(), "somewhere-else.txt"))).rejects.toThrow(
+        /outside the task workspace/,
+      );
+    });
   });
 
-  it("does not confuse a sibling with a shared path prefix for the workspace", async () => {
-    await expect(filesFs.readFile(`../${path.basename(testDir)}-evil/file.txt`)).rejects.toThrow("Directory traversal violation");
+  describe("full access mode (the default)", () => {
+    const outsideDir = path.join(os.tmpdir(), `yaaa-test-outside-${Date.now()}`);
+    const outsideFile = path.join(outsideDir, "user-file.txt");
+
+    beforeAll(async () => {
+      await fs.mkdir(outsideDir, { recursive: true });
+      await fs.writeFile(outsideFile, "the user's own file", "utf-8");
+    });
+
+    afterAll(async () => {
+      await fs.rm(outsideDir, { recursive: true, force: true });
+    });
+
+    it("reads a file outside the workspace by absolute path", async () => {
+      expect(await filesFs.readFile(outsideFile)).toBe("the user's own file");
+    });
+
+    it("writes a file outside the workspace by absolute path", async () => {
+      const target = path.join(outsideDir, "written-by-agent.txt");
+      await filesFs.writeFile(target, "agent output");
+      expect(await fs.readFile(target, "utf-8")).toBe("agent output");
+    });
+
+    it("still anchors a relative path to the task workspace", async () => {
+      await filesFs.writeFile("relative-stays-home.txt", "in workspace");
+      expect(fsSync.existsSync(path.join(testDir, "relative-stays-home.txt"))).toBe(true);
+    });
+
+    // A raw "EACCES: permission denied" tells the user nothing they can act on.
+    it("explains an OS permission failure instead of surfacing a bare errno", async () => {
+      const unreadable = path.join(outsideDir, "unreadable.txt");
+      await fs.writeFile(unreadable, "secret", "utf-8");
+      await fs.chmod(unreadable, 0o000);
+      try {
+        // Root ignores file modes, so this check is meaningless when run as root.
+        if (typeof process.getuid === "function" && process.getuid() === 0) return;
+        await expect(filesFs.readFile(unreadable)).rejects.toThrow(/root-owned|Full Disk Access/);
+        await expect(filesFs.readFile(unreadable)).rejects.toMatchObject({ code: "EACCES" });
+      } finally {
+        await fs.chmod(unreadable, 0o600);
+      }
+    });
+
+    it("honours explicit roots, rejecting anything outside them", async () => {
+      const scoped = new FilesFs(testDir, { allowedRoots: [outsideDir] });
+      expect(await scoped.readFile(outsideFile)).toBe("the user's own file");
+      await expect(scoped.readFile("/etc/hosts")).rejects.toThrow(/every allowed root/);
+    });
   });
 
   it("reads, replaces, and deletes inclusive line ranges", async () => {

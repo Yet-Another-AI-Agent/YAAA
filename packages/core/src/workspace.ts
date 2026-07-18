@@ -4,7 +4,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import Database from "better-sqlite3";
 import { SqliteStore, MeshGateway } from "@yaaa/providers";
-import { pauseController } from "@yaaa/platform";
+import { orchestratorMailbox, pauseController } from "@yaaa/platform";
 import { IntentRouter, getRequestedAgentCount } from "@yaaa/orchestrator";
 import { VIEWER_PROTOCOL } from "@yaaa/agents";
 import type { ChatMessage } from "@yaaa/interfaces";
@@ -13,12 +13,14 @@ import {
   buildMissionSummary,
   type AgentMessage,
   type AgentRun,
+  type AgentWorkspaceSnapshot,
   type Conversation,
   type ConversationAuthorKind,
   type ConversationMessage,
   type DependencyOutput,
   type MentionRoute,
   type TaskPlan,
+  type MissionSnapshot,
 } from "@yaaa/shared";
 import { ConversationCoordinator } from "./conversations.js";
 import {
@@ -75,12 +77,16 @@ export interface ResumeProfile {
 }
 
 /** Concise chat response shown immediately before a draft plan is generated. */
-export function buildPlanAcknowledgement(goal: string): string {
+export function buildStrategyAcknowledgement(goal: string): string {
   const requestedAgentCount = getRequestedAgentCount(goal);
   if (requestedAgentCount !== null) {
-    return `Got it — I’ll prepare a plan using exactly ${requestedAgentCount} agents, preserving the roles you requested. You can review it before any agent starts.`;
+    return `Got it — I’ll prepare a strategy using exactly ${requestedAgentCount} agents, preserving the roles you requested. You can review it before any agent starts.`;
   }
-  return "Got it — I’ll prepare a concise implementation plan for your review. No agents will start until you approve it.";
+  return "Got it — I’ll prepare a concise implementation strategy for your review. No agents will start until you approve it.";
+}
+
+function hasIncompletePlanWork(plan: TaskPlan): boolean {
+  return plan.subtasks.some((subtask) => subtask.state !== "completed");
 }
 
 interface McpIntegrationRow {
@@ -247,6 +253,18 @@ export class Workspace {
     try {
       db.prepare("UPDATE tasks SET status = ? WHERE id = ?").run(
         status,
+        taskId,
+      );
+    } finally {
+      db.close();
+    }
+  }
+
+  private updateTaskPrompt(taskId: string, prompt: string): void {
+    const db = this.openMainDb();
+    try {
+      db.prepare("UPDATE tasks SET prompt = ? WHERE id = ?").run(
+        prompt,
         taskId,
       );
     } finally {
@@ -529,6 +547,71 @@ export class Workspace {
     }
   }
 
+  async getMissionSnapshot(taskId: string): Promise<MissionSnapshot> {
+    const task = this.requireTask(taskId);
+    const store = new SqliteStore(this.tasksDir);
+    try {
+      const [plan, agents, ledgers, messages] = await Promise.all([
+        store.getPlan(taskId),
+        store.getAgents(taskId),
+        store.getLedgerEntries(taskId),
+        store.getMessages(taskId),
+      ]);
+      const checkpoints = messages
+        .filter((message: any) => message.kind === "result" && message.incomplete)
+        .map((message: any) => ({
+          from: String(message.from ?? "agent"),
+          summary: String(message.summary ?? ""),
+          artifacts: message.artifacts ?? [],
+        }));
+      const hasPendingWork = Boolean(plan?.subtasks.some((subtask) => subtask.state !== "completed"));
+      const nextAction = task.status === "awaiting_confirmation"
+        ? "review_plan"
+        : task.status === "running" && checkpoints.length > 0
+          ? "resume_checkpoint"
+          : task.status === "running" && hasPendingWork
+            ? "continue_work"
+            : task.status === "success" || task.status === "failed"
+              ? "review_results"
+              : "none";
+      return {
+        task: { id: task.id, prompt: task.prompt, status: task.status, createdAt: task.created_at, topic: task.topic },
+        plan,
+        agents,
+        latestLedger: ledgers.at(-1) ?? null,
+        checkpoints,
+        nextAction,
+      };
+    } finally {
+      store.closeAll();
+    }
+  }
+
+  async getAgentWorkspace(taskId: string, agentId: string): Promise<AgentWorkspaceSnapshot> {
+    const task = this.requireTask(taskId);
+    const agents = await this.getTaskAgents(taskId);
+    if (!agents.some((agent) => agent.id === agentId)) throw new Error("Agent not found for this mission.");
+    const directory = path.resolve(task.path, "working", "agent-workspaces", agentId);
+    const read = (fileName: string): string | null => {
+      const filePath = path.resolve(directory, fileName);
+      if (!filePath.startsWith(`${directory}${path.sep}`)) return null;
+      try {
+        return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf-8") : null;
+      } catch {
+        return null;
+      }
+    };
+    return {
+      agentId,
+      files: {
+        handsOn: read("handsOn.md"),
+        handOff: read("handOff.md"),
+        proofOfWork: read("proofOfWork.md"),
+        incompleteWork: read("incompleteWork.md"),
+      },
+    };
+  }
+
   /** Persist a plan-review action into the mission's durable chat history. */
   async recordPlanReviewMessage(
     taskId: string,
@@ -707,6 +790,28 @@ export class Workspace {
     return { kind: "task" };
   }
 
+  async classifyPlanReviewIntent(
+    message: string,
+  ): Promise<"approve" | "reject" | "feedback"> {
+    const config = this.loadConfig();
+    const gateway = new MeshGateway({
+      apiKey: config.accessToken ?? process.env.MESH_API_KEY ?? undefined,
+      modelMapping: config.preferredModels as any,
+    });
+    return new IntentRouter(gateway).classifyPlanReview(message);
+  }
+
+  private async classifyMissionFollowup(
+    message: string,
+  ): Promise<"resume" | "correction"> {
+    const config = this.loadConfig();
+    const gateway = new MeshGateway({
+      apiKey: config.accessToken ?? process.env.MESH_API_KEY ?? undefined,
+      modelMapping: config.preferredModels as any,
+    });
+    return new IntentRouter(gateway).classifyMissionFollowup(message);
+  }
+
   /** Read a supported binary artifact as a local data URL for the renderer. */
   readArtifactBinary(
     taskId: string,
@@ -879,7 +984,7 @@ export class Workspace {
 
     fs.writeFileSync(
       path.join(taskDir, "orchestrator.md"),
-      `${ORCHESTRATOR_MD_HEADERS.TITLE}\n\n* **Task ID**: ${taskId}\n* **Prompt**: ${goal}\n* **Status**: pending\n* **Created At**: ${new Date().toISOString()}\n\n${ORCHESTRATOR_MD_HEADERS.PLAN}\n*(Generating plan...)*\n`,
+      `${ORCHESTRATOR_MD_HEADERS.TITLE}\n\n* **Task ID**: ${taskId}\n* **Prompt**: ${goal}\n* **Status**: pending\n* **Created At**: ${new Date().toISOString()}\n\n${ORCHESTRATOR_MD_HEADERS.PLAN}\n*(Generating strategy...)*\n`,
       "utf-8",
     );
 
@@ -1010,7 +1115,7 @@ export class Workspace {
       );
       await this.appendOrchestratorReplyToMission(
         task.taskId,
-        "[plan-proposal] Implementation plan ready for review.",
+        "[plan-proposal] Implementation strategy ready for review.",
       );
       return plan;
     } catch (err) {
@@ -1055,7 +1160,7 @@ export class Workspace {
     hooks.onEvent?.({
       type: "status",
       from: "orchestrator",
-      note: "⟳ Incorporating your feedback and generating a revised plan…",
+      note: "⟳ Incorporating your feedback and generating a revised strategy…",
     });
 
     // Re-generate the plan with feedback injected as prior context
@@ -1064,7 +1169,7 @@ export class Workspace {
       task,
       hooks,
       {
-        priorSummary: `The user reviewed the initial plan and provided the following feedback to address:\n\n${feedback}\n\nIncorporate this feedback into a revised, improved plan.`,
+        priorSummary: `${await this.buildMissionPriorSummary(taskId)}\n\nThe user reviewed the mission and provided the following correction to address:\n\n${feedback}\n\nIncorporate this correction into a revised, improved strategy. Preserve completed work and continue from checkpoint evidence.`,
       },
     );
 
@@ -1084,12 +1189,54 @@ export class Workspace {
     taskId: string,
     message: string,
     hooks: RunTaskHooks = {},
-  ): Promise<{ kind: "conversation" | "direct_execute"; reply: string } | { kind: "task"; plan: TaskPlan }> {
+  ): Promise<
+    | { kind: "conversation" | "direct_execute"; reply: string }
+    | { kind: "task"; plan: TaskPlan; result?: TaskRunResult }
+  > {
     const task = this.requireTask(taskId);
     if (this.activeTaskRuns.has(taskId)) {
-      throw new Error(
-        "This mission is still running. Wait for it to finish before sending a follow-up.",
-      );
+      await this.appendUserMessageToMission(taskId, message);
+      orchestratorMailbox.post({
+        id: crypto.randomUUID(),
+        taskId,
+        from: "user",
+        content: message,
+        createdAt: new Date().toISOString(),
+      });
+      const reply = "Queued — the orchestrator will review this message on its next event-loop tick and route it to the active work.";
+      await this.appendOrchestratorReplyToMission(taskId, reply);
+      hooks.onEvent?.({ type: "status", from: "orchestrator", note: reply });
+      return { kind: "task", plan: (await this.getStoredPlan(taskId)) ?? { goal: task.prompt, subtasks: [] } };
+    }
+
+    // A process restart can leave the durable task row as `running` even
+    // though this Workspace instance has no in-memory run to redirect. Treat
+    // the user's message as a recovery/correction and rebuild the same
+    // mission on this task instead of rejecting it as already running.
+    if (task.status === "running") {
+      await this.appendUserMessageToMission(taskId, message);
+      if (await this.classifyMissionFollowup(message) === "resume") {
+        const existingPlan = await this.getStoredPlan(taskId);
+        if (!existingPlan) {
+          throw new Error("Saved mission plan is missing; cannot resume this mission.");
+        }
+        const reply = "Resuming the approved mission from its saved checkpoint.";
+        await this.appendOrchestratorReplyToMission(taskId, reply);
+        hooks.onEvent?.({ type: "status", from: "orchestrator", note: reply });
+        this.updateTaskStatus(taskId, "running");
+        const result = await this.runTask(
+          task.prompt,
+          { taskId, taskDir: task.path, workingDir: path.join(task.path, "working") },
+          hooks,
+          existingPlan,
+        );
+        return { kind: "task", plan: result.plan ?? existingPlan, result };
+      }
+      const reply = "The previous run was interrupted. I’m resuming this mission from its saved state and applying your correction.";
+      await this.appendOrchestratorReplyToMission(taskId, reply);
+      hooks.onEvent?.({ type: "status", from: "orchestrator", note: reply });
+      const result = await this.rePlanWithFeedback(taskId, message, hooks);
+      return { kind: "task", plan: result.plan ?? { goal: task.prompt, subtasks: [] }, result };
     }
     await this.appendUserMessageToMission(taskId, message);
 
@@ -1097,12 +1244,18 @@ export class Workspace {
       const decision = await this.evaluateConversationalOnboarding(taskId, message, hooks);
       if (decision.action === "prepare_plan") {
         this.updateTaskStatus(taskId, "planning");
-        const acknowledgement = buildPlanAcknowledgement(message);
+        const acknowledgement = await this.generateStrategyAcknowledgement(message);
         await this.appendOrchestratorReplyToMission(taskId, acknowledgement);
         hooks.onEvent?.({ type: "status", from: "orchestrator", note: acknowledgement });
 
+        const goal = decision.synthesizedGoal || task.prompt;
+        if (decision.synthesizedGoal) {
+          this.updateTaskPrompt(taskId, decision.synthesizedGoal);
+          task.prompt = decision.synthesizedGoal;
+        }
+
         const plan = await this.prepareTask(
-          task.prompt,
+          goal,
           {
             taskId,
             taskDir: task.path,
@@ -1126,6 +1279,26 @@ export class Workspace {
       }
     }
 
+    const existingPlan = await this.getStoredPlan(taskId);
+    if (existingPlan && await this.classifyMissionFollowup(message) === "resume" && hasIncompletePlanWork(existingPlan)) {
+      const acknowledgement = "Continuing from the last checkpoint instead of starting over.";
+      await this.appendOrchestratorReplyToMission(taskId, acknowledgement);
+      hooks.onEvent?.({ type: "status", from: "orchestrator", note: acknowledgement });
+      this.resetIncompletePlanWork(existingPlan);
+      this.updateTaskStatus(taskId, "running");
+      const result = await this.runTask(
+        task.prompt,
+        {
+          taskId,
+          taskDir: task.path,
+          workingDir: path.join(task.path, "working"),
+        },
+        hooks,
+        existingPlan,
+      );
+      return { kind: "task", plan: result.plan ?? existingPlan, result };
+    }
+
     // Route the follow-up: small talk ("thanks", "what did you do?") gets a
     // lightweight in-channel reply; an actionable request re-plans on the same
     // task with prior context. Either way, no new channel is created.
@@ -1139,12 +1312,15 @@ export class Workspace {
       return { kind: "conversation", reply };
     }
 
-    const acknowledgement = buildPlanAcknowledgement(message);
+    const acknowledgement = await this.generateStrategyAcknowledgement(message);
     await this.appendOrchestratorReplyToMission(taskId, acknowledgement);
     hooks.onEvent?.({ type: "status", from: "orchestrator", note: acknowledgement });
     const priorSummary = await this.buildMissionPriorSummary(taskId);
+    const goal = await this.synthesizeFollowupGoal(taskId, message);
+    this.updateTaskPrompt(taskId, goal);
+    task.prompt = goal;
     const plan = await this.prepareTask(
-      message,
+      goal,
       {
         taskId,
         taskDir: task.path,
@@ -1154,6 +1330,23 @@ export class Workspace {
       { priorSummary },
     );
     return { kind: "task", plan };
+  }
+
+  private async getStoredPlan(taskId: string): Promise<TaskPlan | null> {
+    const store = new SqliteStore(this.tasksDir);
+    try {
+      return await store.getPlan(taskId);
+    } finally {
+      store.closeAll();
+    }
+  }
+
+  private resetIncompletePlanWork(plan: TaskPlan): void {
+    for (const subtask of plan.subtasks) {
+      if (subtask.state !== "completed") {
+        subtask.state = "pending";
+      }
+    }
   }
 
   async startConversationalOnboarding(
@@ -1176,7 +1369,7 @@ export class Workspace {
 
     if (decision.action === "prepare_plan") {
       this.updateTaskStatus(taskId, "planning");
-      const acknowledgement = buildPlanAcknowledgement(goal);
+      const acknowledgement = await this.generateStrategyAcknowledgement(goal);
       await this.appendOrchestratorReplyToMission(taskId, acknowledgement);
       hooks.onEvent?.({ type: "status", from: "orchestrator", note: acknowledgement });
 
@@ -1208,11 +1401,36 @@ export class Workspace {
     }
   }
 
+  private async generateStrategyAcknowledgement(goal: string): Promise<string> {
+    try {
+      const config = this.loadConfig();
+      const gateway = new MeshGateway({
+        apiKey: config.accessToken ?? process.env.MESH_API_KEY ?? undefined,
+        modelMapping: config.preferredModels as any,
+      });
+      const messages: ChatMessage[] = [
+        {
+          role: "system",
+          content: `You are the YAAA team lead. Generate a friendly, concise, single-sentence response acknowledging the user's task request and stating that you will now prepare an implementation strategy for their review, and that no agents will start until they approve it. Use the term "strategy" or "implementation strategy". Do not include any other conversational filler.`,
+        },
+        { role: "user", content: `Goal: ${goal}` },
+      ];
+      const res = await gateway.chat(messages, {
+        modelRole: "utility",
+        temperature: 0.7,
+      });
+      const text = res.content.trim();
+      return text || buildStrategyAcknowledgement(goal);
+    } catch (err) {
+      return buildStrategyAcknowledgement(goal);
+    }
+  }
+
   async evaluateConversationalOnboarding(
     taskId: string,
     message: string,
     hooks: RunTaskHooks = {},
-  ): Promise<{ thought: string; reply: string; action: "chat" | "prepare_plan" | "direct_execute" }> {
+  ): Promise<{ thought: string; reply: string; action: "chat" | "prepare_plan" | "direct_execute"; synthesizedGoal?: string }> {
     const history = await this.getTaskHistory(taskId);
     const chatMessages: ChatMessage[] = history
       .filter((msg) => msg.kind === "thought" || msg.kind === "status" || msg.from === "user" || msg.kind === "result")
@@ -1252,11 +1470,18 @@ export class Workspace {
 The user's original task goal is: "${task.prompt}".
 You are chatting with the user to clarify details before deciding how to proceed.
 Analyze the conversation history. Decide if:
-1. You need more details or clarification -> Choose action "chat" and write a reply asking the user follow-up questions about:
-   - The intent/goal.
-   - Clarifications/details.
-   - Plan necessity.
-   - Sub-agent requirements.
+	1. You need more details or clarification -> Choose action "chat" and write a reply asking the user follow-up questions about:
+	   - The intent/goal.
+	   - Clarifications/details.
+	   - Plan necessity.
+	   - Sub-agent requirements.
+	   - Every question must be complete and make sense on its own when read without the conversation history. Name the subject and the decision being requested; do not write fragments such as "Which one?", "What about that?", or "Should it continue?".
+	   - Do not assume the user is choosing from multiple-choice options. Ask an open question unless you explicitly provide the complete options and explain what each option changes.
+	   - When a question is a bounded decision with useful alternatives, suggest 2-5 concrete options immediately below it using this exact Markdown shape: "Options:" followed by one option per line, each beginning with "- ". The options must be mutually understandable, and the user may select more than one when that is sensible.
+	   - Do not hide choices only inside a long sentence. Put every suggested choice on its own "- " line after "Options:".
+	   - Always leave room for an "Other" answer; never make the suggested options exhaustive unless you explicitly say that selecting Other is allowed.
+	   - Do not refer vaguely to "the previous one", "that", or "continue" without identifying exactly what it refers to. Ask only questions whose answers materially affect the plan.
+	   - If asking multiple questions, number them and ensure each one is independently answerable.
 2. You have a solid understanding and the request needs any real work to be carried out -> Choose action "prepare_plan" and reply stating you are preparing the plan. This is REQUIRED whenever fulfilling the request depends on an external action or live data: web search, browsing, reading/writing files, running commands, or any tool use. A single-step request (e.g. "find the cheapest flight") still needs an agent to run the tools, so it is "prepare_plan", NOT "direct_execute".
 3. You can FULLY answer the request right now, purely from your own knowledge, with no external action, no tool, and no live/current data -> Choose action "direct_execute" and write the complete answer in the "reply" field. You have no tools in this step, so never promise to "search", "look up", "gather", or "fetch" anything under this action — if you would need to, choose "prepare_plan" instead.
 
@@ -1267,7 +1492,8 @@ You must respond with ONLY a JSON object:
 {
   "thought": "Your step-by-step reasoning about the request complexity, what details are missing, whether a plan is needed, and if you are ready.",
   "reply": "Your message to the user (embed a yaaa-viewer block here when the answer includes code or other renderable content).",
-  "action": "chat" | "prepare_plan" | "direct_execute"
+  "action": "chat" | "prepare_plan" | "direct_execute",
+  "synthesizedGoal": "If action is 'prepare_plan', provide a consolidated task goal synthesized from the entire conversation history (incorporating both original goal context and the new instructions). For other actions, keep this empty."
 }`,
       },
       ...chatMessages,
@@ -1414,6 +1640,64 @@ ${VIEWER_PROTOCOL}`,
     return replyRes.content;
   }
 
+  private async synthesizeFollowupGoal(
+    taskId: string,
+    message: string,
+  ): Promise<string> {
+    const history = await this.getTaskHistory(taskId);
+    const chatMessages: ChatMessage[] = history
+      .filter((msg) => msg.kind === "thought" || msg.kind === "status" || msg.from === "user" || msg.kind === "result")
+      .map((msg) => {
+        let role: "user" | "assistant" | "system" = "user";
+        if (msg.from === "user") role = "user";
+        else if (msg.from === "system") role = "system";
+        else role = "assistant";
+
+        let content = "";
+        if (msg.kind === "thought") content = msg.content;
+        else if (msg.kind === "status") content = msg.note || "";
+        else if (msg.kind === "result") content = msg.summary;
+        else if (msg.kind === "info_request") content = msg.question;
+        else if (msg.kind === "info_reply") content = msg.answer;
+
+        return { role, content };
+      });
+
+    const task = this.requireTask(taskId);
+    const config = this.loadConfig();
+    const gateway = new MeshGateway({
+      apiKey: config.accessToken ?? process.env.MESH_API_KEY ?? undefined,
+      modelMapping: config.preferredModels as any,
+    });
+
+    const messages: ChatMessage[] = [
+      {
+        role: "system",
+        content: `You are the YAAA orchestrator.
+The user is providing follow-up instructions on an existing task.
+Your job is to synthesize a single, clear, comprehensive task goal that incorporates:
+1. The original mission goal (which was: "${task.prompt}").
+2. The context of what has already been done or discussed in the conversation history.
+3. The user's latest follow-up request (which is: "${message}").
+
+Analyze the conversation history. Return a consolidated description of the task goal we should now plan and execute. Be specific, clear, and include all relevant context from the previous turns.
+Do not output any conversational text or JSON. Respond with ONLY the raw synthesized goal text.`,
+      },
+      ...chatMessages,
+    ];
+
+    try {
+      const res = await gateway.chat(messages, {
+        modelRole: "utility",
+        temperature: 0.3,
+      });
+      return res.content.trim() || message;
+    } catch (err) {
+      console.error("Synthesize followup goal failed, falling back to message:", err);
+      return message;
+    }
+  }
+
   /** Condense the stored plan + agent results into a prior-mission summary. */
   private async buildMissionPriorSummary(taskId: string): Promise<string> {
     const store = new SqliteStore(this.tasksDir);
@@ -1421,13 +1705,16 @@ ${VIEWER_PROTOCOL}`,
       const plan = await store.getPlan(taskId);
       const messages = await store.getMessages(taskId);
       const completedResults: DependencyOutput[] = messages
-        .filter((m: any) => m.kind === "result" && m.summary)
+        .filter((m: any) => m.kind === "result" && m.summary && !m.incomplete)
         .map((m: any) => ({
           id: String(m.from ?? "agent"),
           title: String(m.from ?? "agent"),
           summary: String(m.summary),
         }));
-      return buildMissionSummary({
+      const checkpointResults = messages
+        .filter((m: any) => m.kind === "result" && m.incomplete)
+        .map((m: any) => `Checkpoint from ${String(m.from ?? "agent")}: ${String(m.summary ?? "")}`);
+      const summary = buildMissionSummary({
         goal: plan?.goal ?? "",
         subtasks: (plan?.subtasks ?? []).map((s) => ({
           id: s.id,
@@ -1436,6 +1723,9 @@ ${VIEWER_PROTOCOL}`,
         })),
         completedResults,
       });
+      return checkpointResults.length > 0
+        ? `${summary}\n\nThe following work was checkpointed but is NOT complete. Treat it as evidence for resuming, not as a completed result:\n${checkpointResults.join("\n")}`
+        : summary;
     } finally {
       store.closeAll();
     }

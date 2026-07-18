@@ -26,12 +26,12 @@ export class Supervisor {
     const activeTaskId = taskId || crypto.randomUUID();
     await this.store.initTaskDb(activeTaskId);
 
-    console.log(`[Orchestrator] Generating plan for goal: "${goal}"`);
+    console.log(`[Orchestrator] Generating strategy for goal: "${goal}"`);
     const plan = await this.planner.plan(goal, activeTaskId, context);
     await this.store.savePlan(activeTaskId, plan);
     await this.bus.publish( `task.${activeTaskId}.plan_updated`, plan);
 
-    console.log("\n[Orchestrator] Task Plan Generated:");
+    console.log("\n[Orchestrator] Task Strategy Generated:");
     for (const subtask of plan.subtasks) {
       console.log(` - [${subtask.id}] ${subtask.title} (Capability: ${subtask.capability}, Depends: [${subtask.dependsOn.join(", ")}])`);
     }

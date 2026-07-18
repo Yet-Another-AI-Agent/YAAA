@@ -52,7 +52,33 @@ to boot the app. It runs `scripts/start-ui.sh`, which:
 file provider under the current process user. If the app is elevated, every
 agent-written file (task workspaces, generated PPTX, `agent-workspaces/…`) ends up
 owned by `root`, which then blocks later non-root writes and produces spurious
-"permission" failures. Run `npm start` as your normal user.
+"permission" failures. Run `npm start` as your normal user. The app warns at
+startup if it detects it is running as root. To repair a workspace that a past
+`sudo` run left root-owned:
+
+```
+sudo chown -R "$(whoami)" ~/.yaaa
+```
+
+### Agent file access
+
+Agents reach the **whole filesystem** by default: YAAA drives the user's own
+machine, and confining agents to the task workspace made ordinary requests
+("summarise ~/Documents/report.pdf") fail as permission errors. Two env vars
+narrow this (see `packages/shared/src/file-roots.ts`):
+
+- `YAAA_FILE_ACCESS` — `full` (default) | `home` | `workspace` (the old,
+  strictest behaviour).
+- `YAAA_FILE_ROOTS` — a `:`-separated list of absolute roots. Overrides the mode.
+
+Two rules hold regardless: a **relative** path is always anchored to the task
+workspace, so deliverables still land there; and a file **write** outside the
+workspace needs user confirmation, while reads do not (`PermissionEngine`).
+
+On macOS the OS gates `~/Desktop`, `~/Documents`, `~/Downloads` and iCloud Drive
+behind TCC independently of all this. If reads there fail with `EPERM`, grant
+Full Disk Access to whatever launches YAAA (your terminal in dev) under System
+Settings → Privacy & Security → Full Disk Access, then restart it.
 
 ### Why: the recurring "NODE_MODULE_VERSION mismatch" crash
 

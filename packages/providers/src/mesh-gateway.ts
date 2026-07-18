@@ -43,12 +43,69 @@ function rejectsTemperature(err: unknown): boolean {
   return /temperature/i.test(message) && /deprecated|not supported|unsupported/i.test(message);
 }
 
+const MIN_API_ATTEMPTS = 3;
+
+function retryDelay(attempt: number): number {
+  const configured = Number(process.env.YAAA_API_RETRY_DELAY_MS);
+  const base = Number.isFinite(configured) && configured >= 0 ? configured : 250;
+  return base * 2 ** (attempt - 1);
+}
+
+async function retryApiCall<T>(label: string, operation: () => Promise<T>): Promise<T> {
+  let lastError: unknown;
+  let attemptsMade = 0;
+  for (let attempt = 1; attempt <= MIN_API_ATTEMPTS; attempt++) {
+    attemptsMade = attempt;
+    try {
+      return await operation();
+    } catch (err) {
+      lastError = err;
+      const message = err instanceof Error ? err.message : String(err);
+      // Deterministic request/schema errors will not improve on retry. API
+      // availability failures (timeouts, transport, 429/5xx) still receive
+      // the required three attempts.
+      if (isInsufficientFundsError(err) || /validationexception|bad request|\b400\b/i.test(message) || attempt === MIN_API_ATTEMPTS) break;
+      console.warn(`[MeshGateway] ${label} failed; retrying`, {
+        attempt,
+        nextAttempt: attempt + 1,
+        error: err instanceof Error ? err.message : String(err),
+        delayMs: retryDelay(attempt),
+      });
+      await new Promise((resolve) => setTimeout(resolve, retryDelay(attempt)));
+    }
+  }
+  console.error(`[MeshGateway] ${label} exhausted ${attemptsMade} API attempt(s)`, {
+    error: lastError instanceof Error ? lastError.message : String(lastError),
+  });
+  throw lastError;
+}
+
 export interface MeshGatewayConfig {
   apiKey?: string;
   baseURL?: string;
   modelMapping?: Record<ModelRole, string>;
   timeout?: number;
   maxRetries?: number;
+}
+
+export interface MeshModelCatalogEntry {
+  id: string;
+  /** Human-facing name, e.g. "Anthropic: Claude Sonnet 4.5". */
+  name?: string;
+  /** Vendor slug, e.g. "anthropic". Mirrors the id's prefix. */
+  brand?: string;
+  /** Context window in tokens. */
+  context_length?: number;
+  model_type?: string;
+  supports_tools?: boolean;
+  supports_completions_api?: boolean;
+  pricing?: {
+    prompt_usd_per_1k?: number;
+    completion_usd_per_1k?: number;
+    prompt_usd_per_1m?: number;
+    completion_usd_per_1m?: number;
+  };
+  is_free?: boolean;
 }
 
 export class MeshGateway implements IMeshGateway {
@@ -72,16 +129,45 @@ export class MeshGateway implements IMeshGateway {
       maxRetries,
     });
 
-    // Default Mesh API routing mapping for various agent roles. Keep defaults
-    // cost-aware; the planner can still explicitly assign Sonnet to complex
-    // subtasks that need it.
+    // Default Mesh API routing mapping for various agent roles. The planner can
+    // assign any supported provider/company model per subtask, while these are
+    // only fallback role mappings when no explicit model was selected.
     this.modelMapping = {
-      planner: "google/gemini-2.5-flash",
+      planner: "google/gemini-2.5-pro",
       worker: "google/gemini-2.5-flash",
-      verifier: "anthropic/claude-haiku-4.5",
-      utility: "anthropic/claude-haiku-4.5",
+      verifier: "google/gemini-2.5-flash",
+      utility: "google/gemini-2.5-flash",
       ...config.modelMapping,
     };
+  }
+
+  /** Read Mesh's live, cross-provider catalog. Pricing and availability are
+   * intentionally not duplicated in YAAA; Mesh is the source of truth.
+   *
+   * This deliberately does not go through the OpenAI SDK's `models.list()`.
+   * Mesh answers `GET /models` with a **bare JSON array**, not OpenAI's
+   * `{object: "list", data: [...]}` envelope, so the SDK finds no `data` and
+   * yields an empty catalog — silently, which made every catalog-driven
+   * decision fall back to its hardcoded default. Both shapes are accepted here
+   * so the gateway keeps working if Mesh ever adopts the envelope.
+   */
+  async listModels(): Promise<MeshModelCatalogEntry[]> {
+    if (this.isMockMode) return [];
+    const payload = await retryApiCall("models.list", async () => {
+      const response = await this.openai.get("/models", {}) as unknown;
+      return response;
+    });
+    return MeshGateway.parseModelCatalog(payload);
+  }
+
+  /** Accept either a bare array or an OpenAI-style `{data: [...]}` envelope. */
+  static parseModelCatalog(payload: unknown): MeshModelCatalogEntry[] {
+    const list = Array.isArray(payload)
+      ? payload
+      : Array.isArray((payload as { data?: unknown })?.data)
+        ? (payload as { data: unknown[] }).data
+        : [];
+    return (list as MeshModelCatalogEntry[]).filter((model) => Boolean(model?.id));
   }
 
   async chat(messages: ChatMessage[], options: ChatOptions): Promise<ChatResult> {
@@ -131,13 +217,14 @@ export class MeshGateway implements IMeshGateway {
           tools: oaiTools,
         });
 
-      let response;
-      try {
-        response = await createCompletion(true);
-      } catch (err) {
-        if (!rejectsTemperature(err)) throw err;
-        response = await createCompletion(false);
-      }
+      const response = await retryApiCall(`chat(${options.modelRole})`, async () => {
+        try {
+          return await createCompletion(true);
+        } catch (err) {
+          if (!rejectsTemperature(err)) throw err;
+          return await createCompletion(false);
+        }
+      });
 
       const message = response.choices[0]?.message as
         | (typeof response.choices[0]["message"] & {
@@ -189,13 +276,14 @@ export class MeshGateway implements IMeshGateway {
           stream: true,
         });
 
-      let stream;
-      try {
-        stream = await createStream(true);
-      } catch (err) {
-        if (!rejectsTemperature(err)) throw err;
-        stream = await createStream(false);
-      }
+      const stream = await retryApiCall(`chatStream(${options.modelRole})`, async () => {
+        try {
+          return await createStream(true);
+        } catch (err) {
+          if (!rejectsTemperature(err)) throw err;
+          return await createStream(false);
+        }
+      });
 
       for await (const chunk of stream) {
         const delta = chunk.choices[0]?.delta as
@@ -224,12 +312,14 @@ export class MeshGateway implements IMeshGateway {
     // image endpoint Mesh exposes without a code change; defaults to imagen-3.
     const model = options.model || process.env.YAAA_IMAGE_MODEL?.trim() || "google/imagen-3";
     try {
-      const response = await this.openai.images.generate({
-        model,
-        prompt,
-        n: 1,
-        size: "1024x1024",
-      });
+      const response = await retryApiCall(`generateImage(${model})`, () =>
+        this.openai.images.generate({
+          model,
+          prompt,
+          n: 1,
+          size: "1024x1024",
+        }),
+      );
       const item = response.data?.[0];
       if (!item) {
         throw new Error("No image data returned from Mesh API.");
