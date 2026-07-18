@@ -2,6 +2,8 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("electronAPI", {
   routeUserMessage: (message) => ipcRenderer.invoke("route-user-message", message),
+  classifyPlanReviewIntent: (message) =>
+    ipcRenderer.invoke("classify-plan-review-intent", message),
   startTask: (goal) => ipcRenderer.invoke("start-task", goal),
   continueTask: (taskId, message) =>
     ipcRenderer.invoke("continue-task", { taskId, message }),
@@ -27,7 +29,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
   saveLineComments: (taskId, artifactPath, comments) =>
     ipcRenderer.invoke("save-line-comments", { taskId, artifactPath, comments }),
   getTaskHistory: (taskId) => ipcRenderer.invoke("get-task-history", taskId),
+  getRecentTaskEvents: (taskId) => ipcRenderer.invoke("get-recent-task-events", taskId),
   getTaskAgents: (taskId) => ipcRenderer.invoke("get-task-agents", taskId),
+  getMissionSnapshot: (taskId) => ipcRenderer.invoke("get-mission-snapshot", taskId),
+  getAgentWorkspace: (taskId, agentId) =>
+    ipcRenderer.invoke("get-agent-workspace", { taskId, agentId }),
   createPublicConversation: (taskId, title) =>
     ipcRenderer.invoke("create-public-conversation", { taskId, title }),
   getTaskConversations: (taskId) => ipcRenderer.invoke("get-task-conversations", taskId),

@@ -1,7 +1,13 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
 import type { UIAgent } from "../models/TaskModel";
-import { formatAgentLifecycleNotice, getAgentActivity, isActiveAgent } from "./agentWorkspace";
+import type { UILog } from "../viewmodels/useLogState";
+import {
+  formatAgentLifecycleNotice,
+  getAgentActivity,
+  getAgentMessageOrderIndex,
+  isActiveAgent,
+} from "./agentWorkspace";
 
 const agent: UIAgent = {
   id: "agent-research",
@@ -42,5 +48,25 @@ describe("agentWorkspace", () => {
     ]);
 
     expect(activity.map((log) => log.id)).toEqual(["1"]);
+  });
+
+  it("orders working agents by their lifecycle message position", () => {
+    const agents = [
+      { id: "agent-c", handle: "@third-3", displayName: "Third", status: "working", role: "FilesAgent" },
+      { id: "agent-a", handle: "@first-1", displayName: "First", status: "working", role: "FilesAgent" },
+      { id: "agent-b", handle: "@second-2", displayName: "Second", status: "working", role: "FilesAgent" },
+    ] as UIAgent[];
+    const logs = [
+      { id: "1", time: "10:00", source: "system", kind: "system", content: "[agent-lifecycle] @first-1 joined", createdAt: 1 },
+      { id: "2", time: "10:01", source: "orchestrator", kind: "system", content: "Starting work", createdAt: 2 },
+      { id: "3", time: "10:02", source: "system", kind: "system", content: "[agent-lifecycle] agent-b joined", createdAt: 3 },
+      { id: "4", time: "10:03", source: "system", kind: "system", content: "[agent-lifecycle] Third joined", createdAt: 4 },
+    ] as UILog[];
+
+    const ordered = [...agents].sort(
+      (a, b) => getAgentMessageOrderIndex(a, logs) - getAgentMessageOrderIndex(b, logs),
+    );
+
+    expect(ordered.map((agent) => agent.id)).toEqual(["agent-a", "agent-b", "agent-c"]);
   });
 });

@@ -16,6 +16,65 @@ describe("PermissionEngine", () => {
     };
   });
 
+  // Agents can reach the user's whole disk, so the workspace boundary no longer
+  // makes every file write safe to auto-run. Writes outside the workspace ask
+  // first; reads, and anything inside the workspace, do not.
+  describe("file writes outside the task workspace", () => {
+    const workspace = path.join(path.parse(process.cwd()).root, "tmp", "yaaa-task", "working");
+    const userFile = path.join(path.parse(process.cwd()).root, "tmp", "user-docs", "report.md");
+    const fullDiskScope = (): AgentScope => ({
+      capabilities: ["files"],
+      allowedPaths: [workspace, path.parse(process.cwd()).root],
+      riskCeiling: "medium",
+      workspacePath: workspace,
+    });
+
+    const call = (method: string, args: Record<string, unknown>): ToolCall => ({
+      id: `c-${method}`,
+      capability: "files",
+      method,
+      args,
+    });
+
+    beforeEach(() => engine.grantScope("agent-1", fullDiskScope()));
+
+    it("confirms before writing over one of the user's own files", async () => {
+      expect(await engine.checkCall("agent-1", call("writeFile", { path: userFile }))).toBe("confirm");
+    });
+
+    it("confirms before deleting outside the workspace", async () => {
+      expect(await engine.checkCall("agent-1", call("delete", { path: userFile }))).toBe("confirm");
+    });
+
+    it("confirms when only the destination of a move escapes the workspace", async () => {
+      const decision = await engine.checkCall(
+        "agent-1",
+        call("move", { source: path.join(workspace, "out.md"), destination: userFile }),
+      );
+      expect(decision).toBe("confirm");
+    });
+
+    it("reads the user's files without prompting", async () => {
+      expect(await engine.checkCall("agent-1", call("readFile", { path: userFile }))).toBe("auto");
+      expect(await engine.checkCall("agent-1", call("listFiles", { dirPath: path.dirname(userFile) }))).toBe("auto");
+    });
+
+    it("does not prompt for the agent's own deliverables in the workspace", async () => {
+      expect(await engine.checkCall("agent-1", call("writeFile", { path: path.join(workspace, "deck.pptx") }))).toBe("auto");
+      expect(await engine.checkCall("agent-1", call("writeFile", { path: "relative/notes.md" }))).toBe("auto");
+    });
+
+    it("still lets an explicit policy override the prompt", async () => {
+      engine.savePolicy({ scope: "agent", agentId: "agent-1", capability: "files", method: "writeFile", decision: "auto" });
+      expect(await engine.checkCall("agent-1", call("writeFile", { path: userFile }))).toBe("auto");
+    });
+
+    it("keeps auto-running writes when no workspace is declared, preserving old scopes", async () => {
+      engine.grantScope("agent-2", { capabilities: ["files"], allowedPaths: [path.parse(process.cwd()).root], riskCeiling: "medium" });
+      expect(await engine.checkCall("agent-2", call("writeFile", { path: userFile }))).toBe("auto");
+    });
+  });
+
   it("should deny everything if no scope is granted for the agent", async () => {
     const call: ToolCall = {
       id: "c-1",

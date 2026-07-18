@@ -11,6 +11,9 @@ export const ORCHESTRATOR_DISPLAY = "YAAA";
 /** The mention users type to address the orchestrator. */
 export const ORCHESTRATOR_MENTION = "@yaaa";
 
+/** The role line shown under YAAA's name in the mission team. */
+export const ORCHESTRATOR_ROLE_LABEL = "Orchestrator";
+
 const ORCHESTRATOR_RE = /^@?(orchestrator|supervisor|yaaa)(-\d+)?$/i;
 
 /** True when a raw sender label refers to the orchestrator persona. */
@@ -92,14 +95,14 @@ function roleLabelFor(rawId: string, role?: string): string {
  * Resolve a machine agent id/handle into a human identity. The name is chosen
  * deterministically from the id so it never changes between renders.
  */
-export function agentIdentity(rawId: string, role?: string): AgentIdentity {
+export function agentIdentity(rawId: string, role?: string, pokemonName?: string, handle?: string): AgentIdentity {
   const seed = (rawId || "agent").toLowerCase();
-  const firstName = FIRST_NAMES[hashString(seed) % FIRST_NAMES.length];
+  const firstName = pokemonName || FIRST_NAMES[hashString(seed) % FIRST_NAMES.length];
   const roleLabel = roleLabelFor(rawId, role);
   return {
     firstName,
     roleLabel,
-    mention: `@${firstName.toLowerCase()}`,
+    mention: handle || `@${firstName.toLowerCase()}`,
     display: `${firstName} (${roleLabel})`,
   };
 }

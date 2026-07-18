@@ -95,7 +95,7 @@ describe("Supervisor", () => {
       "state": "pending",
       "agentTemplate": "FilesAgent",
       "routingReason": "General file work.",
-      "model": "anthropic/claude-sonnet-5"
+      "model": "anthropic/claude-sonnet-4.5"
     }
   ]
 }
@@ -154,7 +154,7 @@ describe("Supervisor", () => {
       "state": "pending",
       "agentTemplate": "FilesAgent",
       "routingReason": "General file work.",
-      "model": "anthropic/claude-sonnet-5"
+      "model": "anthropic/claude-sonnet-4.5"
     }
   ]
 }

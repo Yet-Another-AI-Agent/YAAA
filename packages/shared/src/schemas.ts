@@ -56,6 +56,7 @@ export const SubtaskSchema = z.object({
   ]).optional(),
   routingReason: z.string().min(1).optional(),
   model: z.string().optional(),
+  modelReason: z.string().min(1).optional(),
   artifacts: z.array(ArtifactRefSchema).optional(),
   state: z.enum(["pending", "running", "completed", "failed"]).default("pending"),
   assignedTo: z.string().optional(),
@@ -122,7 +123,7 @@ export const AgentMessageSchema = z.discriminatedUnion("kind", [
 
 export const ORCHESTRATOR_MD_HEADERS = {
   TITLE: "# Task Orchestration Ledger",
-  PLAN: "## Plan",
+  PLAN: "## Strategy",
   EXECUTION: "## Execution Ledger",
   STEP: "### Step",
   STRATEGY: "* **Strategy**:",

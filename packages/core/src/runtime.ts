@@ -6,10 +6,13 @@ import type {
   IMeshGateway,
   IStore,
   ModelRole,
+  ModelResolver,
   ChatResult,
 } from "@yaaa/interfaces";
 import { Container, MessageBus, PermissionEngine } from "@yaaa/platform";
 import { SqliteStore, FilesFs, MeshGateway, CmdTool, WebSearchTool, ChromiumTool } from "@yaaa/providers";
+import type { MeshModelCatalogEntry } from "@yaaa/providers";
+import { buildPlannerModelMenu, isEligible, renderPlannerModelMenu, resolveModelFromCatalog } from "./model-catalog.js";
 import { ChatOpenAI } from "@langchain/openai";
 import { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { AIMessage, type BaseMessage } from "@langchain/core/messages";
@@ -122,34 +125,6 @@ function writeAgentLifecycleDocument(
   fs.mkdirSync(legacyAgentDir, { recursive: true });
   fs.mkdirSync(workspaceAgentDir, { recursive: true });
 
-  if (agent.status === "working") {
-    const handsOn = `# handsOn
-
-- Task: ${agent.taskId}
-- Agent: ${agent.handle} (${agent.displayName})
-- Role: ${agent.role}
-- Subtask: ${agent.subtaskId}
-- Started: ${agent.startedAt ?? "Not recorded"}
-
-## Orchestrator Assignment
-
-- Assigned objective: ${subtask?.title ?? "Complete the assigned subtask."}
-- Success criteria: ${subtask?.successCriteria ?? "Meet the reviewed plan's success criteria."}
-- Capability: ${subtask?.capability ?? agent.role}
-- Dependency subtasks: ${subtask?.dependsOn?.length ? subtask.dependsOn.join(", ") : "None"}
-
-## Working Contract
-
-- Work only inside the task workspace and request approval for gated actions.
-- Create proof of work in agent-workspaces/${safePathSegment(agent.id)}/proofOfWork.md.
-- Create the final continuation handoff in agent-workspaces/${safePathSegment(agent.id)}/handOff.md.
-- Include work done, observations, suggestions, asset metadata, residual risks, and instructions for the orchestrator or a future agent.
-`;
-    fs.writeFileSync(path.join(workspaceAgentDir, "handsOn.md"), handsOn, "utf-8");
-    fs.writeFileSync(path.join(legacyAgentDir, "HANDS_ON.md"), handsOn, "utf-8");
-    return;
-  }
-
   if (["completed", "failed", "exited"].includes(agent.status)) {
     const handsOff = `# handOff
 
@@ -180,7 +155,10 @@ ${agent.summary?.trim() || "No summary was provided."}
 
 - _Record follow-up work or write None._
 `;
-    fs.writeFileSync(path.join(legacyAgentDir, "HANDS_OFF.md"), handsOff, "utf-8");
+    const legacyHandoffPath = path.join(legacyAgentDir, "HANDS_OFF.md");
+    if (!fs.existsSync(legacyHandoffPath)) {
+      fs.writeFileSync(legacyHandoffPath, handsOff, "utf-8");
+    }
   }
 }
 
@@ -240,9 +218,45 @@ export function createRuntime(config: RuntimeConfig): Runtime {
       assertActive();
       return filesProvider.readFile(targetPath);
     },
+    async readLines(targetPath: string, startLine?: number, endLine?: number): Promise<{ content: string; startLine: number; endLine: number; totalLines: number }> {
+      assertActive();
+      return filesProvider.readLines(targetPath, startLine, endLine);
+    },
     async writeFile(targetPath: string, content: string | Buffer): Promise<void> {
       assertActive();
       return filesProvider.writeFile(targetPath, content);
+    },
+    async writeLines(targetPath: string, startLine: number, endLine: number, content: string): Promise<void> {
+      assertActive();
+      return filesProvider.writeLines(targetPath, startLine, endLine, content);
+    },
+    async delete(targetPath: string, recursive?: boolean): Promise<void> {
+      assertActive();
+      return filesProvider.delete(targetPath, recursive);
+    },
+    async deleteLines(targetPath: string, startLine: number, endLine: number): Promise<void> {
+      assertActive();
+      return filesProvider.deleteLines(targetPath, startLine, endLine);
+    },
+    async createDirectory(targetPath: string): Promise<void> {
+      assertActive();
+      return filesProvider.createDirectory(targetPath);
+    },
+    async move(source: string, destination: string): Promise<void> {
+      assertActive();
+      return filesProvider.move(source, destination);
+    },
+    async copy(source: string, destination: string): Promise<void> {
+      assertActive();
+      return filesProvider.copy(source, destination);
+    },
+    async stat(targetPath: string): Promise<{ size: number; isFile: boolean; isDirectory: boolean; createdAt: string; modifiedAt: string }> {
+      assertActive();
+      return filesProvider.stat(targetPath);
+    },
+    async screenshot(targetPath: string, outputPath: string, startLine?: number, endLine?: number): Promise<unknown> {
+      assertActive();
+      return filesProvider.screenshot(targetPath, outputPath, startLine, endLine);
     },
     async listFiles(dirPath: string): Promise<string[]> {
       assertActive();
@@ -268,16 +282,67 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   // mismatch previously denied legitimate task-relative writes.
   scope.register("workingDir", config.workingDir);
 
-  // Chat-model factory for worker/verifier ReAct agents. LangGraph's
-  // createReactAgent needs a LangChain chat model; Mesh is OpenAI-compatible, so
-  // ChatOpenAI is pointed at the Mesh base URL. (The planner/synthesizer/intent
-  // paths keep using MeshGateway above; only the inner worker loop uses this.)
+  // Role defaults, used both by the chat-model factory below and as the model
+  // resolver's fallback when the planner's choice is unavailable.
   const WORKER_MODEL_DEFAULTS: Record<ModelRole, string> = {
-    planner: "google/gemini-2.5-flash",
+    planner: "google/gemini-2.5-pro",
     worker: "google/gemini-2.5-flash",
-    verifier: "anthropic/claude-haiku-4.5",
-    utility: "anthropic/claude-haiku-4.5",
+    verifier: "google/gemini-2.5-flash",
+    utility: "google/gemini-2.5-flash",
   };
+
+  // YAAA reads Mesh's live catalog once per runtime, then resolves every agent's
+  // model against it. Availability and pricing stay Mesh's knowledge; YAAA only
+  // decides whether the model the planner asked for is actually on offer and,
+  // when it is not, what to fall back to.
+  let catalogLookup: Promise<MeshModelCatalogEntry[]> | undefined;
+  const loadCatalog = (): Promise<MeshModelCatalogEntry[]> => {
+    if (!catalogLookup) {
+      catalogLookup = (async () => {
+        try {
+          const catalog = await meshGateway.listModels();
+          console.log("[YAAA] Mesh model catalog loaded", {
+            catalogModels: catalog.length,
+            eligibleModels: catalog.filter(isEligible).length,
+          });
+          return catalog;
+        } catch (error) {
+          console.warn("[YAAA] Mesh model catalog unavailable; using planner/model-role routing", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return [];
+        }
+      })();
+    }
+    return catalogLookup;
+  };
+  const modelResolver: ModelResolver = async (requested) => {
+    // Fall back to the configured role defaults before the catalog's cheapest
+    // entry: the cheapest of hundreds of tool-capable models is a free or tiny
+    // one, which is not a sane model to run an unattended agent on.
+    const resolution = resolveModelFromCatalog(await loadCatalog(), requested, [
+      ...new Set(Object.values({ ...WORKER_MODEL_DEFAULTS, ...(config.modelMapping ?? {}) })),
+    ]);
+    console.log("[YAAA] Mesh model resolution", {
+      requestedModel: requested ?? null,
+      selectedModel: resolution.model ?? null,
+    });
+    return resolution;
+  };
+  scope.register("modelResolver", modelResolver);
+  // The planner picks a model per subtask from Mesh's live catalog rather than a
+  // hardcoded rubric, so newly released models become selectable on their own.
+  // It receives the menu already rendered: the orchestrator package cannot
+  // import this one without a dependency cycle.
+  scope.register("modelCatalogProvider", loadCatalog);
+  scope.register("modelMenuProvider", async (): Promise<string> => {
+    // Keep the planner on the cost-safe Gemini lane by default. Other brands
+    // remain available through an explicit model/config override.
+    const menu = buildPlannerModelMenu(await loadCatalog(), { brands: ["google"] });
+    console.log("[YAAA] Planner model menu", { options: menu.length });
+    return menu.length ? renderPlannerModelMenu(menu) : "";
+  });
+
   const hasApiKey = Boolean(config.apiKey || process.env.MESH_API_KEY);
   const timeout = config.timeout ?? (process.env.YAAA_TIMEOUT ? Number(process.env.YAAA_TIMEOUT) : (process.env.MESH_TIMEOUT ? Number(process.env.MESH_TIMEOUT) : 60000));
   const maxRetries = config.maxRetries ?? (process.env.YAAA_MAX_RETRIES ? Number(process.env.YAAA_MAX_RETRIES) : (process.env.MESH_MAX_RETRIES ? Number(process.env.MESH_MAX_RETRIES) : 3));
@@ -297,16 +362,20 @@ export function createRuntime(config: RuntimeConfig): Runtime {
       rawTemperature && Number.isFinite(Number(rawTemperature))
         ? Number(rawTemperature)
         : undefined;
-    return hasApiKey
-      ? new ChatOpenAI({
-          apiKey: config.apiKey || process.env.MESH_API_KEY,
-          model,
-          temperature,
-          configuration: { baseURL: process.env.MESH_BASE_URL || "https://api.meshapi.ai/v1" },
-          timeout,
-          maxRetries,
-        })
-      : new MockWorkerChatModel(roleOrModel);
+    if (!hasApiKey) {
+      return new MockWorkerChatModel(roleOrModel);
+    }
+
+    const rawChatModel = new ChatOpenAI({
+      apiKey: config.apiKey || process.env.MESH_API_KEY,
+      model,
+      temperature,
+      configuration: { baseURL: process.env.MESH_BASE_URL || "https://api.meshapi.ai/v1" },
+      timeout,
+      maxRetries,
+    });
+
+    return rawChatModel;
   };
   scope.register("ChatModelFactory", chatModelFactory);
 

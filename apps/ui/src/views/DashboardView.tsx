@@ -1,7 +1,7 @@
-import { useRef, useEffect, useState, useMemo } from "react";
+import { useRef, useEffect, useState, useMemo, type FormEvent } from "react";
 import logoImg from "../assets/logo.jpg";
 import type { TaskViewModel } from "../viewmodels/useTaskViewModel";
-import { TaskModel, type UIAgent } from "../models/TaskModel";
+import { TaskModel, type UIAgent, type UIAgentWorkspaceSnapshot, type UIMissionSnapshot } from "../models/TaskModel";
 import { AnnotationOverlay } from "../components/AnnotationOverlay";
 import { ArchitectureViewer, getMediaKind } from "../components/ArchitectureViewer";
 import { ApiKeyModal } from "../components/ApiKeyModal";
@@ -16,6 +16,7 @@ import {
 } from "../components/UniversalViewer";
 import {
   getAgentActivity,
+  getAgentMessageOrderIndex,
   getVisibleLogContent,
   isActiveAgent,
   isAgentLifecycleLog,
@@ -25,11 +26,14 @@ import { renderMarkdown } from "../utils/simpleMarkdown";
 import { buildArtifactExplorer, groupEntriesByAgent, type ArtifactExplorerEntry } from "../utils/artifactExplorer";
 import {
   ORCHESTRATOR_DISPLAY,
+  ORCHESTRATOR_MENTION,
+  ORCHESTRATOR_ROLE_LABEL,
   agentIdentity,
   displaySender,
   humanizeChannelName,
   isOrchestratorSender,
 } from "../utils/displayNames";
+import { formatModelLabel } from "../utils/modelLabel";
 import * as shared from "@yaaa/shared";
 const { ORCHESTRATOR_MD_HEADERS } = shared;
 
@@ -139,6 +143,173 @@ function AgentWorkingStatus({ agent, activity }: { agent: UIAgent; activity: UIL
       <span className="thread-live-muted">{latestLabel}</span>
       <span className="thread-live-action">{latestText}</span>
     </div>
+  );
+}
+
+interface ClarifyingQuestion {
+  question: string;
+  options: string[];
+}
+
+function inferInlineOptions(question: string): string[] {
+  // Gracefully handle older/model-generated questions that put a bounded
+  // choice in prose instead of emitting the explicit Options: block.
+  const match = question.match(/^(?:[^:]+:\s*)?(?:would\s+you\s+like|do\s+you\s+want)\s+(.+?),\s+or\s+(?:would\s+you\s+prefer|do\s+you\s+prefer|would\s+you\s+rather|would\s+you\s+choose)\s+(.+?)(?:\?\s*)$/i);
+  if (!match) return [];
+  const first = match[1].trim();
+  const second = match[2].trim();
+  return first && second ? [first, second] : [];
+}
+
+function extractClarifyingQuestions(content: string): ClarifyingQuestion[] {
+  const lines = content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const questions: ClarifyingQuestion[] = [];
+  for (const line of lines) {
+    const text = line.replace(/^\s*(?:[-*]|\d+[.)])\s+/, "").trim();
+    if (/\?\s*$/.test(text)) {
+      questions.push({ question: text, options: [] });
+      continue;
+    }
+    if (questions.length === 0 || /^options?\s*:/i.test(text)) continue;
+    const option = line.match(/^\s*(?:[-*]|[A-D][.)]|\d+[.)])\s+(.+)$/i)?.[1]?.trim();
+    if (option && !/\?\s*$/.test(option)) {
+      const current = questions[questions.length - 1];
+      if (current.options.length < 6 && !current.options.includes(option)) current.options.push(option);
+    }
+  }
+  const seen = new Set<string>();
+  return questions.filter((item) => {
+    if (seen.has(item.question)) return false;
+    seen.add(item.question);
+    if (item.options.length === 0) item.options = inferInlineOptions(item.question);
+    return true;
+  }).slice(0, 8);
+}
+
+function extractQuestionItems(content: string): string[] {
+  return extractClarifyingQuestions(content).map((item) => item.question);
+}
+
+function QuestionCarousel({
+  content,
+  onSubmit,
+}: {
+  content: string;
+  onSubmit: (message: string) => void;
+}) {
+  const questions = useMemo(() => extractClarifyingQuestions(content), [content]);
+  const [index, setIndex] = useState(0);
+  const [selectedOptions, setSelectedOptions] = useState<Record<number, string[]>>({});
+  const [otherAnswers, setOtherAnswers] = useState<Record<number, string>>({});
+  // Answers go to the orchestrator as a chat message, which cannot be recalled.
+  // Once sent, the form is spent: it stays visible as a record of what was
+  // answered, but every control is disabled so a second click (or an Enter in
+  // the textarea) cannot send a duplicate set of answers.
+  const [submitted, setSubmitted] = useState(false);
+
+  if (questions.length === 0) return null;
+
+  const currentOptions = selectedOptions[index] ?? [];
+  const currentOther = otherAnswers[index] ?? "";
+  const answeredCount = questions.filter((_, questionIndex) =>
+    (selectedOptions[questionIndex]?.length ?? 0) > 0 || Boolean(otherAnswers[questionIndex]?.trim()),
+  ).length;
+  const canSubmit = answeredCount > 0 && !submitted;
+  const currentQuestion = questions[index];
+
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!canSubmit) return;
+    const body = questions
+      .map((question, questionIndex) => {
+        const answer = [
+          ...(selectedOptions[questionIndex] ?? []),
+          otherAnswers[questionIndex]?.trim() ? `Other: ${otherAnswers[questionIndex].trim()}` : "",
+        ].filter(Boolean).join("; ");
+        return answer ? `Q: ${question.question}\nA: ${answer}` : "";
+      })
+      .filter(Boolean)
+      .join("\n\n");
+    setSubmitted(true);
+    onSubmit(`Answers to your questions:\n\n${body}`);
+  };
+
+  return (
+    <form
+      className={`question-carousel${submitted ? " question-carousel-submitted" : ""}`}
+      onSubmit={submit}
+      aria-label="Clarifying questions"
+    >
+      <div className="question-carousel-topline">
+        <span>Question {index + 1} of {questions.length}</span>
+        <span>{submitted ? `${answeredCount} sent` : `${answeredCount} answered`}</span>
+      </div>
+      <div className="question-carousel-question">{renderMarkdown(currentQuestion.question)}</div>
+      {currentQuestion.options.length > 0 && (
+        <fieldset className="question-carousel-options" disabled={submitted}>
+          <legend>Select one or more options</legend>
+          {currentQuestion.options.map((option) => (
+            <label className="question-carousel-option" key={option}>
+              <input
+                type="checkbox"
+                checked={currentOptions.includes(option)}
+                onChange={() => setSelectedOptions((prev) => ({
+                  ...prev,
+                  [index]: currentOptions.includes(option)
+                    ? currentOptions.filter((value) => value !== option)
+                    : [...currentOptions, option],
+                }))}
+              />
+              <span>{option}</span>
+            </label>
+          ))}
+        </fieldset>
+      )}
+      <label className="question-carousel-other-label">
+        Other (optional)
+        <textarea
+          className="question-carousel-answer"
+          value={currentOther}
+          placeholder={submitted ? "" : "Type your answer..."}
+          disabled={submitted}
+          readOnly={submitted}
+          onChange={(event) => setOtherAnswers((prev) => ({ ...prev, [index]: event.target.value }))}
+        />
+      </label>
+      <div className="question-carousel-actions">
+        <button
+          type="button"
+          className="question-carousel-nav"
+          disabled={submitted || index === 0}
+          onClick={() => setIndex((value) => Math.max(0, value - 1))}
+        >
+          Back
+        </button>
+        <button
+          type="button"
+          className="question-carousel-nav"
+          disabled={submitted || index >= questions.length - 1}
+          onClick={() => setIndex((value) => Math.min(questions.length - 1, value + 1))}
+        >
+          Next
+        </button>
+        <button
+          type="submit"
+          className="question-carousel-submit"
+          disabled={!canSubmit}
+        >
+          {submitted ? "Answers sent" : "Submit answers"}
+        </button>
+      </div>
+      {submitted ? (
+        <div className="question-carousel-sent" role="status">
+          Answers sent to {ORCHESTRATOR_DISPLAY}. Add anything else in the message box below.
+        </div>
+      ) : null}
+    </form>
   );
 }
 
@@ -365,6 +536,50 @@ function getAvatarColor(sender: string): string {
   return "#707070";
 }
 
+/**
+ * The picture shown next to a chat sender: YAAA's fixed brand thumbnail for the
+ * orchestrator, the agent's generated avatar for a spawned agent, and a colored
+ * initial for anyone else (the user, system notices, an agent whose avatar asset
+ * is missing).
+ */
+function SenderAvatar({ sender, agent }: { sender: string; agent?: { pokemonImage?: string } }) {
+  const image = isOrchestratorSender(sender) || sender === ORCHESTRATOR_DISPLAY
+    ? logoImg
+    : agent?.pokemonImage;
+  if (image) {
+    return <img className="sender-avatar-image" src={image} alt={sender} />;
+  }
+  return (
+    <div className="sender-avatar-initial" style={{ backgroundColor: getAvatarColor(sender) }}>
+      {sender.charAt(0).toUpperCase()}
+    </div>
+  );
+}
+
+function estimateUsedTokens(agent: any, logs: any[], workspaceSnapshot?: any): number {
+  let totalChars = 4000; // Base for system prompt and tools definitions
+  if (workspaceSnapshot?.files?.handsOn) {
+    totalChars += workspaceSnapshot.files.handsOn.length;
+  }
+  if (workspaceSnapshot?.files?.handOff) {
+    totalChars += workspaceSnapshot.files.handOff.length;
+  }
+  const agentActivity = getAgentActivity(agent, logs);
+  for (const log of agentActivity) {
+    totalChars += log.content.length;
+  }
+  return Math.max(1200, Math.round(totalChars / 4));
+}
+
+function estimateOrchestratorUsedTokens(logs: any[], goal: string): number {
+  let totalChars = 8000; // Base for orchestrator prompt + schema
+  totalChars += goal.length;
+  for (const log of logs) {
+    totalChars += log.content.length;
+  }
+  return Math.max(2500, Math.round(totalChars / 4));
+}
+
 const CAPABILITY_LABELS: Record<string, string> = {
   docs: "Docs",
   browser: "Web Browser",
@@ -420,6 +635,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     summary,
     success,
     channelTopic,
+    queuedMessages = [],
     chatMessages = [],
     startTask,
     continueMission,
@@ -440,6 +656,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
 
   // Past task selected states
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [selectedMissionSnapshot, setSelectedMissionSnapshot] = useState<UIMissionSnapshot | null>(null);
   // Channel id currently showing its inline "confirm delete?" affordance.
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   // Global Delete Workspace button showing its inline confirm affordance.
@@ -484,6 +701,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
 
   // Sub-agent thread currently expanded into the full-screen thread view.
   const [openThreadAgentId, setOpenThreadAgentId] = useState<string | null>(null);
+  const [agentWorkspaces, setAgentWorkspaces] = useState<Record<string, UIAgentWorkspaceSnapshot>>({});
 
   // User's name from onboarding profile
   const [userName, setUserName] = useState("");
@@ -502,6 +720,12 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     }
   };
 
+  // Reopened missions use the durable snapshot for identity resolution too.
+  // The live view-model agent list is intentionally empty after an app
+  // restart, so using it here caused historical messages to fall back to old
+  // generic names and made the right-hand team appear empty.
+  const persistedAgents = selectedTaskId ? (selectedMissionSnapshot?.agents || []) : agents;
+
   // Registered MCP servers for the Active Integrations panel.
   const [mcpIntegrations, setMcpIntegrations] = useState<
     Array<{ definition: { id: string; displayName: string }; state: { trust: string; enabled: boolean } }>
@@ -513,6 +737,53 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
       .then((list) => setMcpIntegrations(list || []))
       .catch(() => setMcpIntegrations([]));
   }, [selectedTaskId, taskId]);
+
+  // Reopened missions are hydrated from the durable backend snapshot. This
+  // keeps the UI from inferring execution state from the prose transcript.
+  useEffect(() => {
+    let active = true;
+    if (!selectedTaskId) {
+      setSelectedMissionSnapshot(null);
+      setAgentWorkspaces({});
+      return () => {
+        active = false;
+      };
+    }
+    TaskModel.getMissionSnapshot(selectedTaskId)
+      .then(async (snapshot) => {
+        if (!active) return;
+        const hydratedSnapshot = snapshot.agents?.length
+          ? snapshot
+          : { ...snapshot, agents: await TaskModel.getTaskAgents(selectedTaskId) };
+        setSelectedMissionSnapshot(hydratedSnapshot);
+        void Promise.all(
+          hydratedSnapshot.agents.map(async (agent) => [agent.id, await TaskModel.getAgentWorkspace(selectedTaskId, agent.id)] as const),
+        ).then((entries) => {
+          if (active) setAgentWorkspaces(Object.fromEntries(entries));
+        }).catch(() => {});
+      })
+      .catch((err) => {
+        console.error("Failed to load mission snapshot:", err);
+        if (active) setSelectedMissionSnapshot(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [selectedTaskId]);
+
+  useEffect(() => {
+    let active = true;
+    const agentId = openThreadAgentId;
+    if (!agentId || !selectedTaskId) return () => { active = false; };
+    TaskModel.getAgentWorkspace(selectedTaskId, agentId)
+      .then((workspace) => {
+        if (active) setAgentWorkspaces((current) => ({ ...current, [agentId]: workspace }));
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [openThreadAgentId, selectedTaskId]);
 
   // Fetch user's name from onboarding profile on mount
   useEffect(() => {
@@ -600,19 +871,20 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   // render as the same person. Names are always seeded on the canonical id.
   const resolveAgent = useMemo(() => {
     const byKey: Record<string, (typeof agents)[number]> = {};
-    for (const a of agents) {
+    for (const a of persistedAgents) {
       if (a?.id) byKey[a.id] = a;
       if (a?.handle) byKey[a.handle] = a;
+      if (a?.displayName) byKey[a.displayName] = a;
     }
-    return (raw: string) => byKey[raw];
-  }, [agents]);
+    return (raw: string) => byKey[raw] || byKey[raw.replace(/^@/, "")];
+  }, [persistedAgents]);
 
   const labelForSender = (raw: string): string => {
     if (isOrchestratorSender(raw)) return ORCHESTRATOR_DISPLAY;
     if (raw.toLowerCase() === "user") return "User";
     if (raw === "User" || raw === "System" || raw === "Agent") return raw;
     const a = resolveAgent(raw);
-    if (a) return agentIdentity(a.id, a.role).display;
+    if (a) return agentIdentity(a.id, a.role, a.pokemonName, a.handle).display;
     return displaySender(raw);
   };
 
@@ -641,11 +913,14 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   const handleSelectTask = (id: string) => {
     if (id === taskId) {
       setSelectedTaskId(null);
+      setSelectedMissionSnapshot(null);
       setShowTaskView(true);
       setSidebarOpen(false); // Collapse sidebar
     } else {
       setResumedHistoryMessages([]);
       setSelectedTaskId(id);
+      setSelectedMissionSnapshot(null);
+      setAgentWorkspaces({});
       setShowTaskView(false);
       setSidebarOpen(false); // Collapse sidebar
 
@@ -891,7 +1166,9 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
         if (msg.kind === "thought") {
           content = msg.content;
         } else if (msg.kind === "result") {
-          content = msg.summary;
+          content = msg.incomplete
+            ? `⏸️ Checkpoint saved — work is incomplete and must be continued.\n\n${msg.summary}`
+            : msg.summary;
         } else if (msg.kind === "status") {
           content = msg.note || `State update: ${msg.state}`;
         } else if (msg.kind === "approval_request") {
@@ -937,11 +1214,10 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
         // Add live logs. System status logs are rendered inline
         // and cleared upon completion.
         logs.forEach((log) => {
-          // Sub-agent execution activity belongs to that agent's channel, not
-          // the main mission chat. It still reaches the thread view through
-          // getAgentActivity(agent, logs), so dropping it here only stops it
-          // from pinning to the bottom of the main conversation.
-          if (log.source === "agent") return;
+          // Sub-agent tool activity belongs to that agent's channel, but
+          // lightweight thinking should still stream into the mission so the
+          // user can see progress while a long run is active.
+          if (log.source === "agent" && log.kind !== "thinking") return;
 
           let sender = "Agent";
           if (log.source === "system") sender = "System";
@@ -974,7 +1250,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
       }
 
       const planIsAwaiting = selectedTaskId
-        ? selectedTask?.status === "awaiting_confirmation"
+        ? (selectedMissionSnapshot?.task.status || selectedTask?.status) === "awaiting_confirmation"
         : awaitingConfirmation;
       if (
         planIsAwaiting &&
@@ -984,7 +1260,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
           id: `plan-proposal-${selectedTaskId || taskId || "active"}`,
           sender: "Orchestrator",
           time: "",
-          content: "Implementation plan ready for review.",
+          content: "Implementation strategy ready for review.",
           kind: "plan_proposal",
           artifacts: [],
           isHistorical: Boolean(selectedTaskId),
@@ -992,60 +1268,38 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
       }
     }
 
-    const displaySubtasks = selectedTaskId ? parsedOrchestrator.subtasks : subtasks;
+    const displaySubtasks = selectedTaskId
+      ? (selectedMissionSnapshot?.plan?.subtasks || parsedOrchestrator.subtasks)
+      : subtasks;
     
-    const displayArtifacts = selectedTaskId 
-      ? historyMessages.reduce((acc: any[], m) => {
+    const displayArtifacts = selectedTaskId
+      ? [
+          ...(selectedMissionSnapshot?.plan?.subtasks || []).flatMap((subtask: any) => subtask.artifacts || []),
+          ...historyMessages.reduce((acc: any[], m) => {
           if (m.kind === "result" && m.artifacts) {
             acc.push(...m.artifacts);
           }
           return acc;
-        }, [])
+          }, []),
+        ].filter((artifact, index, all) => all.findIndex((candidate) => candidate.path === artifact.path) === index)
       : artifacts;
 
-    const contextChips = [];
-    const prjName = yaaaDir ? yaaaDir.split(/[/\\]/).pop() : "yaaa";
-    contextChips.push(`Project: ${prjName}`);
-
-    const extensions = new Set(
-      displayArtifacts
-        .map((a) => {
-          const ext = a.path.split(".").pop()?.toLowerCase();
-          return ext;
-        })
-        .filter(Boolean)
-    );
-
-    if (extensions.has("py")) contextChips.push("Language: Python");
-    if (extensions.has("ts") || extensions.has("tsx")) contextChips.push("Language: TypeScript");
-    if (extensions.has("js") || extensions.has("jsx")) contextChips.push("Language: JavaScript");
-    if (extensions.has("html")) contextChips.push("Language: HTML");
-    if (extensions.has("css")) contextChips.push("Language: CSS");
-    if (extensions.has("pptx")) contextChips.push("Format: PowerPoint (PPTX)");
-    if (extensions.has("png") || extensions.has("jpg") || extensions.has("jpeg")) contextChips.push("Media: Images");
-
-    if (userName) {
-      contextChips.push(`User: ${userName}`);
-    }
-
-    if (contextChips.length === 1) {
-      contextChips.push("Language: TypeScript", "Runtime: Electron");
-    }
-
-    const currentStatus = selectedTaskId 
-      ? (selectedTask?.status || parsedOrchestrator.status) 
-      : (liveTask?.status || (awaitingConfirmation ? "awaiting_confirmation" : (running ? "running" : (success ? "success" : (success === false ? "failed" : "pending")))));
+    const currentStatus = selectedTaskId
+      ? (selectedMissionSnapshot?.task.status || selectedTask?.status || parsedOrchestrator.status)
+      : (awaitingConfirmation
+          ? "awaiting_confirmation"
+          : (running ? "running" : (liveTask?.status || (success ? "success" : (success === false ? "failed" : "pending")))));
 
     return {
       displayMessages,
       displaySubtasks,
       displayArtifacts,
-      contextChips,
       currentStatus
     };
   }, [
     selectedTaskId,
     selectedTask,
+    selectedMissionSnapshot,
     orchestratorMd,
     historyMessages,
     resumedHistoryMessages,
@@ -1059,14 +1313,13 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     awaitingConfirmation,
     success,
     inConversationView,
-    chatMessages,
-    yaaaDir,
-    userName
+    chatMessages
   ]);
 
-  const { displayMessages, displaySubtasks, displayArtifacts, contextChips, currentStatus } = memoizedData;
+  const { displayMessages, displaySubtasks, displayArtifacts, currentStatus } = memoizedData;
   const artifactGroups = useMemo(() => buildArtifactExplorer(displayArtifacts), [displayArtifacts]);
-  const activeAgentCount = agents.filter(isActiveAgent).length;
+  const visibleAgents = persistedAgents;
+  const activeAgentCount = visibleAgents.filter(isActiveAgent).length;
   // Real capabilities this plan actually uses, replacing what used to be a
   // hardcoded fake Slack/GitHub/Web-Search "connected" list.
   const activeCapabilities = Array.from(new Set(displaySubtasks.map((st) => st.capability).filter(Boolean)));
@@ -1075,7 +1328,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   // the main card shows YAAA's hands-on assignment; the agent-authored handoff
   // only appears after the agent has produced completion evidence.
   const missionThreads = useMemo(() => {
-    return agents.map((agent) => {
+    return visibleAgents.map((agent) => {
       const subtask = displaySubtasks.find((s: any) => s.id === agent.subtaskId);
       const activity = getAgentActivity(agent, logs);
       const assignmentParts: string[] = [];
@@ -1094,10 +1347,12 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
       const handOffArtifact = artifacts.find((artifact) => /(?:^|\/)handOff\.md$/i.test(String(artifact.path || "")));
       const proofArtifact = artifacts.find((artifact) => /(?:^|\/)proofOfWork\.md$/i.test(String(artifact.path || "")));
       const handoffReady = ["completed", "failed", "exited"].includes(agent.status) && Boolean(agent.summary || handOffArtifact);
-      const handoff = agent.summary || (handOffArtifact ? `${handOffArtifact.path}\n\n${handOffArtifact.description || "Agent handoff artifact ready."}` : "");
-      return { agent, subtask, activity, assignment, handoff, handoffReady, handsOnArtifact, handOffArtifact, proofArtifact };
-    });
-  }, [agents, displaySubtasks, displayArtifacts, logs]);
+      const workspace = agentWorkspaces[agent.id];
+      const handoff = agent.summary || workspace?.files.handOff || (handOffArtifact ? `${handOffArtifact.path}\n\n${handOffArtifact.description || "Agent handoff artifact ready."}` : "");
+      const handsOn = workspace?.files.handsOn || assignment;
+      return { agent, subtask, activity, assignment: handsOn, handoff, handoffReady, handsOnArtifact, handOffArtifact, proofArtifact };
+    }).sort((a, b) => getAgentMessageOrderIndex(a.agent, logs) - getAgentMessageOrderIndex(b.agent, logs));
+  }, [visibleAgents, displaySubtasks, displayArtifacts, logs, agentWorkspaces]);
 
   const openThread = openThreadAgentId
     ? missionThreads.find((t) => t.agent.id === openThreadAgentId) || null
@@ -1198,11 +1453,8 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     const documentArtifact = handoffReady ? handOffArtifact : handsOnArtifact;
     return (
       <div className="mission-thread-card" key={`card-${agent.id}`}>
-        <div
-          className="slack-message-avatar mission-thread-avatar"
-          style={{ backgroundColor: getAvatarColor(identity) }}
-        >
-          {identity.charAt(0).toUpperCase()}
+        <div className="slack-message-avatar mission-thread-avatar">
+          <SenderAvatar sender={identity} agent={agent} />
         </div>
         <div className="mission-thread-body">
           <div className="mission-thread-header">
@@ -1488,6 +1740,22 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
               </div>
 
               <div className="slack-chat-messages">
+                {queuedMessages.length > 0 && (
+                  <div className="slack-queued-messages" role="status" aria-live="polite">
+                    <div className="slack-queued-messages-header">
+                      <span className="slack-queued-dot" aria-hidden="true" />
+                      <strong>Queued for YAAA</strong>
+                      <span>{queuedMessages.length} {queuedMessages.length === 1 ? "message" : "messages"}</span>
+                    </div>
+                    {queuedMessages.map((message) => (
+                      <div className="slack-queued-message" key={message.id}>
+                        <span className="slack-queued-message-icon" aria-hidden="true">↳</span>
+                        <span className="slack-queued-message-text">{message.content}</span>
+                        <span className="slack-queued-message-time">{message.time}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
                 {/* Loading state for past task */}
                 {selectedTaskId && loadingHistory && (
                   <div className="panel-empty">
@@ -1529,16 +1797,24 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                     if (missionThreads.length > 0 && !selectedTaskId) return null;
                   }
                   const senderLabel = labelForSender(msg.sender);
+                  const questionItems = senderLabel !== "User" ? extractQuestionItems(msg.content) : [];
+                  const looksLikeClarification =
+                    msg.kind === "info_request" ||
+                    questionItems.length >= 2 ||
+                    /\b(?:clarify|clarification|need a few|quick questions|follow-up questions)\b/i.test(msg.content);
+                  const canAnswerQuestions =
+                    !msg.isHistorical &&
+                    msg.kind !== "plan_proposal" &&
+                    questionItems.length > 0 &&
+                    looksLikeClarification &&
+                    Boolean(selectedTaskId || taskId);
                   if (msg.kind === "plan_proposal") {
                     const canReview =
                       currentStatus === "awaiting_confirmation" && !running;
                     return (
                       <div className="slack-message" key={msg.id} data-testid="plan-proposal-message">
-                        <div
-                          className="slack-message-avatar"
-                          style={{ backgroundColor: getAvatarColor(senderLabel) }}
-                        >
-                          {senderLabel.charAt(0).toUpperCase()}
+                        <div className="slack-message-avatar">
+                          <SenderAvatar sender={senderLabel} agent={resolveAgent(msg.sender)} />
                         </div>
                         <div className="slack-message-content">
                           <div className="slack-message-header">
@@ -1547,12 +1823,15 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                           </div>
                           <div className="slack-message-bubble slack-message-response">
                             <div className="slack-message-text">
-                              <strong>Implementation plan proposed</strong>
+                              <strong>Implementation strategy proposed</strong>
                               <p>{msg.content}</p>
                               {displaySubtasks.length > 0 && (
                                 <ol>
                                   {displaySubtasks.map((subtask: any) => (
-                                    <li key={subtask.id}>{subtask.title}</li>
+                                    <li key={subtask.id}>
+                                      <div>{subtask.title}</div>
+                                      {subtask.model ? <small>{formatModelLabel(subtask.model)}{subtask.modelReason ? ` — ${subtask.modelReason}` : ""}</small> : null}
+                                    </li>
                                   ))}
                                 </ol>
                               )}
@@ -1583,11 +1862,8 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                     </div>
                   ) : (
                   <div className="slack-message" key={msg.id}>
-                    <div
-                      className="slack-message-avatar"
-                      style={{ backgroundColor: getAvatarColor(senderLabel) }}
-                    >
-                      {senderLabel.charAt(0).toUpperCase()}
+                    <div className="slack-message-avatar">
+                      <SenderAvatar sender={senderLabel} agent={resolveAgent(msg.sender)} />
                     </div>
                     <div className="slack-message-content">
                       <div className="slack-message-header">
@@ -1596,7 +1872,12 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                       </div>
                       <div className={`slack-message-bubble ${senderLabel === 'User' ? 'slack-message-sender-user' : ''} ${msg.kind === 'response' ? 'slack-message-response' : ''} ${msg.kind === 'activity' ? 'slack-message-activity' : ''}`}>
                         <div className="slack-message-text">
-                          {(msg.id === displayMessages.filter(m => m.sender !== 'User' && m.kind === 'response').pop()?.id && !selectedTaskId && !msg.isHistorical && !typedMessageIds.has(msg.id) && !msg.content.includes("```yaaa-viewer") && !isLargeMarkdown(msg.content)) ? (
+                          {canAnswerQuestions ? (
+                            <QuestionCarousel
+                              content={msg.content}
+                              onSubmit={(message) => continueMission(message, selectedTaskId || taskId || undefined)}
+                            />
+                          ) : (msg.id === displayMessages.filter(m => m.sender !== 'User' && m.kind === 'response').pop()?.id && !selectedTaskId && !msg.isHistorical && !typedMessageIds.has(msg.id) && !msg.content.includes("```yaaa-viewer") && !isLargeMarkdown(msg.content)) ? (
                             <TypingText text={msg.content} onComplete={() => handleTypeComplete(msg.id)} />
                           ) : (
                             <RichMessageContent
@@ -1726,30 +2007,68 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   <div className="agent-space-note">
                     Confirm the plan to create the specialist agents assigned to this mission.
                   </div>
-                ) : agents.map((agent) => {
-                  const agentActivity = getAgentActivity(agent, logs);
-                  const identity = agentIdentity(agent.id, agent.role);
-                  return (
-                  <details className="agent-space-block" key={agent.id}>
-                    <summary className="agent-space-block-label">
-                      <span>{identity.display} · {identity.mention}</span>
-                      <span className={`detail-status-pill ${agent.status}`}>{agent.status}</span>
-                    </summary>
-                    <div className="agent-space-block-text">Model role: {agent.modelRole}</div>
-                    <div className="agent-space-block-text">Assigned to: {agent.subtaskId}</div>
-                    {agent.summary && <div className="agent-space-block-text">{agent.summary}</div>}
-                    <div className="agent-space-activity-heading">Activity ({agentActivity.length})</div>
-                    {agentActivity.length === 0 ? (
-                      <div className="agent-space-block-text">No execution activity reported yet.</div>
-                    ) : agentActivity.map((log) => (
-                      <div className="agent-space-action-row" key={log.id}>
-                        <span className="agent-space-action-icon" aria-hidden="true">💭</span>
-                        <span className="agent-space-action-text">{log.content}</span>
-                      </div>
-                    ))}
-                  </details>
-                  );
-                })}
+                ) : (
+                  <>
+                    <details className="agent-space-block" key="yaaa-orchestrator">
+                      <summary className="agent-space-block-label" style={{ fontWeight: "bold" }}>
+                        <div style={{ display: "flex", alignItems: "center" }}>
+                          <img
+                            src={logoImg}
+                            alt={ORCHESTRATOR_DISPLAY}
+                            style={{ width: "16px", height: "16px", borderRadius: "2px", marginRight: "6px" }}
+                          />
+                          <span>{ORCHESTRATOR_DISPLAY} · {ORCHESTRATOR_MENTION}</span>
+                        </div>
+                        <span className="detail-status-pill completed">completed</span>
+                      </summary>
+                      <div className="agent-space-block-text">Model: {formatModelLabel("google/gemini-2.5-pro")} (planner)</div>
+                      <div className="agent-space-block-text agent-space-block-note">Gemini Pro coordinates the mission plan; bounded agent work defaults to the lower-cost Gemini Flash model.</div>
+                      <div className="agent-space-block-text">Assigned to: Lead Orchestration</div>
+                      <div className="agent-space-block-text">Context window: {estimateOrchestratorUsedTokens(logs, goal).toLocaleString()} / 1,000,000 tokens used</div>
+                    </details>
+                    {agents.map((agent) => {
+                      const agentActivity = getAgentActivity(agent, logs);
+                      const identity = agentIdentity(agent.id, agent.role, agent.pokemonName, agent.handle);
+                      return (
+                      <details className="agent-space-block" key={agent.id}>
+                        <summary className="agent-space-block-label">
+                          <div style={{ display: "flex", alignItems: "center" }}>
+                            {agent.pokemonImage ? (
+                              <img src={agent.pokemonImage} alt={identity.firstName} style={{ width: "16px", height: "16px", borderRadius: "2px", marginRight: "6px", objectFit: "cover" }} />
+                            ) : null}
+                            <span>{identity.display} · {identity.mention}</span>
+                          </div>
+                          <span className={`detail-status-pill ${agent.status}`}>{agent.status}</span>
+                        </summary>
+                        <div className="agent-space-block-text">
+                          Model: {agent.model ? formatModelLabel(agent.model) : agent.modelRole}
+                        </div>
+                        {agent.modelReason ? (
+                          <div className="agent-space-block-text agent-space-block-note">{agent.modelReason}</div>
+                        ) : null}
+                        <div className="agent-space-block-text">Assigned to: {agent.subtaskId}</div>
+                        {agent.initialGoal ? (
+                          <div className="agent-space-block-text">Initial goal: {agent.initialGoal}</div>
+                        ) : null}
+                        {agent.activeAssignment && agent.activeAssignment !== agent.initialGoal ? (
+                          <div className="agent-space-block-text agent-space-block-note">YAAA assignment: {agent.activeAssignment}</div>
+                        ) : null}
+                        <div className="agent-space-block-text">Context window: {estimateUsedTokens(agent, logs, agentWorkspaces[agent.id]).toLocaleString()} / 1,000,000 tokens used</div>
+                        {agent.summary && <div className="agent-space-block-text">{agent.summary}</div>}
+                        <div className="agent-space-activity-heading">Activity ({agentActivity.length})</div>
+                        {agentActivity.length === 0 ? (
+                          <div className="agent-space-block-text">No execution activity reported yet.</div>
+                        ) : agentActivity.map((log) => (
+                          <div className="agent-space-action-row" key={log.id}>
+                            <span className="agent-space-action-icon" aria-hidden="true">💭</span>
+                            <span className="agent-space-action-text">{log.content}</span>
+                          </div>
+                        ))}
+                      </details>
+                      );
+                    })}
+                  </>
+                )}
                 <details className="agent-space-block" data-testid="execution-activity">
                   <summary className="agent-space-block-label">Execution activity</summary>
                   {logs.length === 0 ? (
@@ -1773,24 +2092,45 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
               <div className="slack-details-content">
                 <div className="slack-details-section" aria-label="Mission team">
                   <div className="slack-section-title">Mission team</div>
-                  {agents.length === 0 ? (
-                    <div className="slack-section-empty">Agents will join after the plan is confirmed.</div>
-                  ) : (
-                    <div className="mission-team-list">
-                      {agents.map((agent) => {
-                        const identity = agentIdentity(agent.id, agent.role);
-                        return (
-                        <div className="mission-team-member" key={agent.id}>
-                          <span className={`mission-team-status ${agent.status}`} aria-label={agent.status} />
-                          <div className="mission-team-identity">
-                            <span className="mission-team-handle">{identity.firstName} · {identity.mention}</span>
-                            <span className="mission-team-role">{identity.roleLabel}</span>
-                          </div>
-                        </div>
-                        );
-                      })}
+                  {/* YAAA is the mission's constant: it is present and active from
+                      the first message, before any agent is planned, so the team
+                      list always leads with it rather than rendering empty. */}
+                  <div className="mission-team-list">
+                    <div className="mission-team-member" key="yaaa-orchestrator">
+                      <span className="mission-team-status completed" aria-label="active" />
+                      <img
+                        className="mission-team-avatar"
+                        src={logoImg}
+                        alt={ORCHESTRATOR_DISPLAY}
+                      />
+                      <div className="mission-team-identity">
+                        <span className="mission-team-handle">{ORCHESTRATOR_DISPLAY} · {ORCHESTRATOR_MENTION}</span>
+                        <span className="mission-team-role">{ORCHESTRATOR_ROLE_LABEL} · {estimateOrchestratorUsedTokens(logs, goal).toLocaleString()} / 1M tokens</span>
+                        <span className="mission-team-model">{formatModelLabel("google/gemini-2.5-pro")}</span>
+                      </div>
                     </div>
-                  )}
+                    {agents.map((agent) => {
+                      const identity = agentIdentity(agent.id, agent.role, agent.pokemonName, agent.handle);
+                      return (
+                      <div className="mission-team-member" key={agent.id}>
+                        <span className={`mission-team-status ${agent.status}`} aria-label={agent.status} />
+                        {agent.pokemonImage ? (
+                          <img className="mission-team-avatar" src={agent.pokemonImage} alt={identity.firstName} />
+                        ) : null}
+                        <div className="mission-team-identity">
+                          <span className="mission-team-handle">{identity.firstName} · {identity.mention}</span>
+                          <span className="mission-team-role">{identity.roleLabel} · {estimateUsedTokens(agent, logs, agentWorkspaces[agent.id]).toLocaleString()} / 1M tokens</span>
+                          {agent.model ? (
+                            <span className="mission-team-model" title={agent.modelReason}>{formatModelLabel(agent.model)}</span>
+                          ) : null}
+                        </div>
+                      </div>
+                      );
+                    })}
+                  </div>
+                  {agents.length === 0 ? (
+                    <div className="slack-section-empty">Specialist agents will join after the plan is confirmed.</div>
+                  ) : null}
                 </div>
 
                 {/* ── 1. Artifacts (REAL) ── */}
@@ -1903,17 +2243,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   )}
                 </div>
 
-                {/* ── 4. Contexts ── */}
-                <div className="slack-details-section">
-                  <div className="slack-section-title">Contexts</div>
-                  <div className="context-chips">
-                    {contextChips.map((chip, idx) => (
-                      <span className="context-chip" key={idx}>{chip}</span>
-                    ))}
-                  </div>
-                </div>
-
-                {/* ── 5. Active Integrations: the plan's real capabilities, not a fake fixed list ── */}
+                {/* ── 4. Active Integrations: the plan's real capabilities, not a fake fixed list ── */}
                 <div className="slack-details-section">
                   <div className="slack-section-title">Active Integrations</div>
                   {activeCapabilities.length === 0 && mcpIntegrations.length === 0 ? (
@@ -2104,16 +2434,17 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                     className="plan-review-textarea"
                     placeholder="Tell YAAA what's wrong so it can re-plan…"
                     value={rejectReason}
+                    disabled={running || !awaitingConfirmation}
                     onChange={(e) => setRejectReason(e.target.value)}
                   />
                   <div className="plan-review-actions">
-                    <button type="button" className="btn-reject" onClick={() => setRejecting(false)}>
+                    <button type="button" className="btn-reject" disabled={running || !awaitingConfirmation} onClick={() => setRejecting(false)}>
                       Back
                     </button>
                     <button
                       type="button"
                       className="btn-approve"
-                      disabled={!rejectReason.trim()}
+                      disabled={running || !awaitingConfirmation || !rejectReason.trim()}
                       onClick={handleSubmitReject}
                     >
                       Submit rejection
@@ -2130,13 +2461,14 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                     className="plan-review-textarea"
                     placeholder="Leave comments for YAAA to address before starting…"
                     value={planComment}
+                    disabled={running || !awaitingConfirmation}
                     onChange={(e) => setPlanComment(e.target.value)}
                   />
                   <div className="plan-review-actions">
-                    <button type="button" className="btn-reject" onClick={() => setRejecting(true)}>
+                    <button type="button" className="btn-reject" disabled={running || !awaitingConfirmation} onClick={() => setRejecting(true)}>
                       Reject
                     </button>
-                    <button type="button" className="btn-approve" onClick={handleAcceptPlan}>
+                    <button type="button" className="btn-approve" disabled={running || !awaitingConfirmation} onClick={handleAcceptPlan}>
                       {planComment.trim() ? "Accept (addressing comments)" : "Accept plan"}
                     </button>
                   </div>

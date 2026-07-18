@@ -14,7 +14,7 @@ export type RuntimeEvent =
   | { type: "tool-requested"; from: string; content: string; metadata?: Record<string, unknown> }
   | { type: "agent-status"; agent: AgentRun }
   | { type: "status"; from: string; note: string }
-  | { type: "result"; from: string; summary: string; artifacts: ArtifactRef[] }
+  | { type: "result"; from: string; summary: string; artifacts: ArtifactRef[]; incomplete?: boolean }
   | { type: "complete"; result: TaskRunResult }
   | { type: "topic-updated"; taskId: string; topic: string };
 
@@ -48,6 +48,7 @@ export function mapBusEvent(
         from: msg.from,
         summary: msg.summary,
         artifacts: msg.artifacts ?? [],
+        ...(msg.incomplete ? { incomplete: true } : {}),
       };
     }
     return null;

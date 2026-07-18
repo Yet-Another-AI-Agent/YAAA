@@ -123,7 +123,7 @@ export function buildAgentBrief(input: AgentBriefInput): string {
         ? `- Create proof of work at \`${proofOfWorkPath}\` with text evidence, test output, screenshots/images, or artifact references.`
         : "",
       handOffPath
-        ? `- Create the final handoff at \`${handOffPath}\` with work done, observations, suggestions, asset metadata, residual risks, and continuation instructions for the orchestrator or another agent.`
+        ? `- Create the final handoff at \`${handOffPath}\` with work done, observations, suggestions, asset metadata, residual risks, and continuation instructions for the orchestrator or another agent. If anything was not completed, explicitly state what was blocked, why it was blocked, what was attempted, what evidence proves the blocker, and what the next agent should not repeat.`
         : "",
     ].filter(Boolean);
     sections.push(`## Handoff contract\n${lines.join("\n")}`);

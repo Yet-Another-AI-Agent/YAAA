@@ -51,6 +51,24 @@ describe("AGENT_REGISTRY", () => {
     it("has a non-empty systemPrompt", () => {
       expect(agent.systemPrompt.trim().length).toBeGreaterThan(0);
     });
+
+    it("documents the full writable file tool surface exposed by the runtime", () => {
+      for (const toolName of [
+        "read_file",
+        "read_file_lines",
+        "write_file",
+        "write_file_lines",
+        "delete_path",
+        "delete_file_lines",
+        "create_directory",
+        "move_path",
+        "copy_path",
+        "path_metadata",
+        "file_screenshot",
+      ]) {
+        expect(agent.systemPrompt).toContain(toolName);
+      }
+    });
   });
 
   describe("blueprint roster", () => {
@@ -146,6 +164,14 @@ describe("AGENT_REGISTRY", () => {
 
     it("has a non-empty systemPrompt", () => {
       expect(agent.systemPrompt.trim().length).toBeGreaterThan(0);
+    });
+
+    it("documents only read/inspect file tools for verification", () => {
+      expect(agent.systemPrompt).toContain("read_file_lines");
+      expect(agent.systemPrompt).toContain("path_metadata");
+      expect(agent.systemPrompt).toContain("file_screenshot");
+      expect(agent.systemPrompt).not.toContain("delete_path");
+      expect(agent.systemPrompt).not.toContain("write_file_lines");
     });
   });
 });

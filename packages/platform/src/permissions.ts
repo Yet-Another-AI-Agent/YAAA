@@ -6,6 +6,12 @@ export interface AgentScope {
   capabilities: string[];
   allowedPaths: string[]; // only relevant for files
   riskCeiling: "low" | "medium" | "high";
+  /**
+   * The agent's own task workspace, when it is narrower than `allowedPaths`.
+   * File writes inside it are the agent's normal business and never prompt;
+   * writes outside it touch the user's own files and ask first.
+   */
+  workspacePath?: string;
 }
 
 const HIGH_RISK_EXECUTABLES = new Set([
@@ -255,11 +261,46 @@ export class PermissionEngine {
     "outputPath",
   ] as const;
 
-  private isResourceAllowed(scope: AgentScope, call: ToolCall): boolean {
-    if (call.capability !== "files") return true;
-    const targetPaths = PermissionEngine.FILE_PATH_ARG_KEYS
+  /**
+   * File methods that create, change, or remove something on disk. Everything
+   * else the files capability exposes only reads.
+   */
+  private static readonly MUTATING_FILE_METHODS = new Set([
+    "writeFile",
+    "writeLines",
+    "deleteLines",
+    "delete",
+    "createDirectory",
+    "move",
+    "copy",
+    "screenshot",
+  ]);
+
+  private filePathArgs(call: ToolCall): string[] {
+    return PermissionEngine.FILE_PATH_ARG_KEYS
       .map((key) => call.args[key])
       .filter((value): value is string => typeof value === "string");
+  }
+
+  /**
+   * True when a file call would change something outside the agent's own task
+   * workspace — i.e. one of the user's real files rather than a deliverable.
+   * A relative path is workspace-relative, so it can never qualify.
+   */
+  private isMutatingOutsideWorkspace(scope: AgentScope, call: ToolCall): boolean {
+    if (call.capability !== "files") return false;
+    if (!scope.workspacePath) return false;
+    if (!PermissionEngine.MUTATING_FILE_METHODS.has(call.method)) return false;
+    const workspace = path.resolve(scope.workspacePath);
+    return this.filePathArgs(call).some((targetPath) => {
+      if (!path.isAbsolute(targetPath)) return false;
+      return !this.isWithinPath(path.resolve(targetPath), workspace);
+    });
+  }
+
+  private isResourceAllowed(scope: AgentScope, call: ToolCall): boolean {
+    if (call.capability !== "files") return true;
+    const targetPaths = this.filePathArgs(call);
     if (targetPaths.length === 0) return true;
 
     // Every path-bearing argument must resolve inside one of the granted roots.
@@ -327,12 +368,16 @@ export class PermissionEngine {
     scope: AgentScope,
     call: ToolCall,
   ): PermissionDecision {
-    // File operations inside the agent's granted workspace never prompt. The
-    // workspace boundary is already enforced by isResourceAllowed/allowedPaths
-    // (a denied scope short-circuits before this runs in checkCall), so a
-    // path-scoped file write is safe to auto-run. An explicit user policy can
-    // still override this to "confirm"/"deny" per capability+method.
-    if (call.capability === "files") return "auto";
+    // File operations inside the agent's own workspace never prompt: the
+    // boundary is enforced by isResourceAllowed/allowedPaths (a denied scope
+    // short-circuits before this runs in checkCall), and those files are the
+    // agent's own deliverables. Agents can now reach the user's whole disk, so
+    // a write outside the workspace is a different matter — it can overwrite or
+    // delete something the user cares about, and asks first. Reads stay
+    // automatic. An explicit user policy can still override either way.
+    if (call.capability === "files") {
+      return this.isMutatingOutsideWorkspace(scope, call) ? "confirm" : "auto";
+    }
     if (this.isRiskyShellCall(call)) return "confirm";
     if (scope.riskCeiling === "low" && call.capability === "shell")
       return "confirm";

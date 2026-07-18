@@ -171,4 +171,25 @@ describe("IntentRouter", () => {
     expect(reply.length).toBeLessThanOrEqual(1201);
     expect(reply.endsWith("…")).toBe(true);
   });
+
+  it.each([
+    ['{"intent":"approve"}', "Yes, go ahead and execute the plan."],
+    ['{"intent":"reject"}', "No, do not start this plan."],
+    ['{"intent":"feedback"}', "Can you simplify the second step?"],
+  ])("classifies plan review response %j", async (response, message) => {
+    const router = new IntentRouter(makeGateway([response]));
+    await expect(router.classifyPlanReview(message)).resolves.toBe(JSON.parse(response).intent);
+  });
+
+  it("conservatively treats invalid plan review output as feedback", async () => {
+    const router = new IntentRouter(makeGateway(["not json"]));
+    await expect(router.classifyPlanReview("what is happening?")).resolves.toBe("feedback");
+  });
+
+  it("uses the model to distinguish resume from a mission correction", async () => {
+    const resumeRouter = new IntentRouter(makeGateway(['{"intent":"resume"}']));
+    const correctionRouter = new IntentRouter(makeGateway(['{"intent":"correction"}']));
+    await expect(resumeRouter.classifyMissionFollowup("continue from where you left off")).resolves.toBe("resume");
+    await expect(correctionRouter.classifyMissionFollowup("I am in India, use Amazon India")).resolves.toBe("correction");
+  });
 });

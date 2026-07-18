@@ -597,4 +597,42 @@ describe("InnerLoop Worker Loop (ReAct)", () => {
       }),
     ).rejects.toThrow("Agent template NonExistentTemplate not found in registry.");
   });
+
+  it("injects loop guard warnings in preModelHook when tools loop or fail", async () => {
+    const mockWebProvider = {
+      search: vi.fn().mockResolvedValue([]),
+    };
+    container.register("capability:web", mockWebProvider);
+
+    const responses = [
+      toolCall("web_search", { query: "q1" }, "c1"),
+      toolCall("web_search", { query: "q2" }, "c2"),
+      toolCall("web_search", { query: "q3" }, "c3"),
+      new AIMessage({
+        content: "I will stop searching now.",
+      })
+    ];
+    install(responses);
+
+    const result = await innerLoop.run({
+      agentId: "loop-guard-agent",
+      taskId: "task-123",
+      templateName: "ResearcherAgent",
+      instruction: "Find information on something",
+    });
+
+    expect(result.summary).toContain("I will stop searching now.");
+    // Verify that the thought topic was published for loop guard
+    expect(mockBus.publish).toHaveBeenCalledWith(
+      "task.task-123.agent.loop-guard-agent.thought",
+      expect.objectContaining({ content: expect.stringContaining("Agent Loop Guard") }),
+    );
+
+    // Verify that the last turn model input messages actually contain the system notice
+    const lastTurnMessages = scripted.seenTurns[3];
+    const hasNotice = lastTurnMessages.some(
+      (m) => m.content.toString().includes("System Notice: You have performed")
+    );
+    expect(hasNotice).toBe(true);
+  });
 });

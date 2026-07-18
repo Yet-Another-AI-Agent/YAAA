@@ -19,7 +19,10 @@ export function formatAgentLifecycleNotice(
   if (previous?.status === agent.status) return null;
 
   if (!previous) {
-    return `🟢 ${name} joined the mission as ${agent.role}.`;
+    const modelNote = agent.model
+      ? ` Model: ${agent.model}${agent.modelReason ? ` — ${agent.modelReason}` : ""}.`
+      : "";
+    return `🟢 ${name} joined the mission as ${agent.role}.${modelNote}`;
   }
 
   switch (agent.status) {
@@ -55,4 +58,16 @@ export function getVisibleLogContent(content: string): string {
 
 export function isAgentLifecycleLog(log: UILog): boolean {
   return log.source === "system" && log.content.startsWith("[agent-lifecycle]");
+}
+
+export function getAgentMessageOrderIndex(agent: UIAgent, logs: UILog[]): number {
+  const needles = [agent.id, agent.handle?.replace(/^@/, ""), agent.displayName]
+    .filter(Boolean)
+    .map((value) => String(value).toLowerCase());
+  const index = logs.findIndex(
+    (log) => isAgentLifecycleLog(log) && needles.some((needle) => log.content.toLowerCase().includes(needle)),
+  );
+  if (index >= 0) return index;
+  const startedAt = agent.startedAt ? Date.parse(agent.startedAt) : NaN;
+  return Number.isFinite(startedAt) ? 10_000_000 + startedAt : Number.MAX_SAFE_INTEGER;
 }

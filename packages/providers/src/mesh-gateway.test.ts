@@ -4,10 +4,12 @@ import { MeshGateway } from "./mesh-gateway.js";
 // Mock the openai package
 const mockCreate = vi.fn();
 const mockCreateStream = vi.fn();
+const mockGet = vi.fn();
 
 vi.mock("openai", () => {
   return {
     default: class MockOpenAI {
+      get = (path: string, opts: any) => mockGet(path, opts);
       chat = {
         completions: {
           create: (args: any) => {
@@ -25,6 +27,40 @@ vi.mock("openai", () => {
 describe("MeshGateway", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  // Mesh answers GET /models with a bare JSON array, not OpenAI's
+  // {object:"list", data:[...]} envelope. Reading it through the SDK's
+  // models.list() found no `data` and produced an empty catalog — silently, so
+  // every catalog-driven model choice fell back to a hardcoded default.
+  describe("listModels", () => {
+    const entry = (id: string) => ({ id, supports_tools: true });
+
+    it("reads Mesh's bare-array response", async () => {
+      mockGet.mockResolvedValue([entry("anthropic/claude-sonnet-4.5"), entry("google/gemini-3.1-pro")]);
+      const models = await new MeshGateway({ apiKey: "k" }).listModels();
+      expect(models.map((m) => m.id)).toEqual(["anthropic/claude-sonnet-4.5", "google/gemini-3.1-pro"]);
+    });
+
+    it("still reads an OpenAI-style envelope, should Mesh ever adopt one", async () => {
+      mockGet.mockResolvedValue({ object: "list", data: [entry("anthropic/claude-haiku-4.5")] });
+      const models = await new MeshGateway({ apiKey: "k" }).listModels();
+      expect(models.map((m) => m.id)).toEqual(["anthropic/claude-haiku-4.5"]);
+    });
+
+    it("returns nothing for an unrecognised payload rather than throwing", () => {
+      expect(MeshGateway.parseModelCatalog({ unexpected: true })).toEqual([]);
+      expect(MeshGateway.parseModelCatalog(null)).toEqual([]);
+    });
+
+    it("drops entries with no id", () => {
+      expect(MeshGateway.parseModelCatalog([entry("a/b"), { supports_tools: true }])).toHaveLength(1);
+    });
+
+    it("returns an empty catalog in mock mode without calling the API", async () => {
+      expect(await new MeshGateway({ apiKey: "" }).listModels()).toEqual([]);
+      expect(mockGet).not.toHaveBeenCalled();
+    });
   });
 
   it("should run in Mock Mode if no API key is provided", async () => {

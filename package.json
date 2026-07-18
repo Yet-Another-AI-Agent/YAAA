@@ -7,7 +7,7 @@
   ],
   "scripts": {
     "start": "bash scripts/start-ui.sh",
-    "build": "tsc -b",
+    "build": "node scripts/update-architecture-doc.js && tsc -b",
     "lint": "biome lint .",
     "format": "biome format . --write",
     "test": "vitest run --coverage",

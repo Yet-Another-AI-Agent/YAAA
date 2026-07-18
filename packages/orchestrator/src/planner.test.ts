@@ -23,6 +23,45 @@ describe("Planner", () => {
     planner = new Planner();
   });
 
+  // A hardcoded rubric of four ids is why every plan picked the same model,
+  // however many hundreds the account could actually reach.
+  describe("model rubric", () => {
+    const planStub = `\`\`\`json
+{"goal":"g","subtasks":[{"id":"task-1","title":"t","capability":"files","dependsOn":[],"riskLevel":"low","successCriteria":"s","agentTemplate":"FilesAgent","routingReason":"r","model":"anthropic/claude-haiku-4.5"}]}
+\`\`\``;
+    const systemPromptOf = () => (mockGateway.chat as any).mock.calls[0][0][0].content as string;
+
+    beforeEach(() => {
+      (mockGateway.chat as any).mockResolvedValue({ content: planStub });
+    });
+
+    it("offers the planner Mesh's live menu when the catalog is readable", async () => {
+      container.register("modelMenuProvider", async () => '- "anthropic/claude-opus-4.8" ($30.00/1M tokens, 1000K context)');
+      await new Planner().plan("do a thing");
+      const prompt = systemPromptOf();
+      expect(prompt).toContain("anthropic/claude-opus-4.8");
+      expect(prompt).toContain("models this account can actually reach right now");
+      // The static tier list must not leak in alongside the live menu.
+      expect(prompt).not.toContain("(strongest, default)");
+    });
+
+    it("falls back to the static rubric when no catalog is wired up", async () => {
+      await new Planner().plan("do a thing");
+      expect(systemPromptOf()).toContain(MODEL_TIERS.complex);
+    });
+
+    it("falls back to the static rubric when the catalog is empty or unreadable", async () => {
+      container.register("modelMenuProvider", async () => "");
+      await new Planner().plan("do a thing");
+      expect(systemPromptOf()).toContain(MODEL_TIERS.simple);
+
+      (mockGateway.chat as any).mockClear();
+      container.register("modelMenuProvider", async () => { throw new Error("Mesh down"); });
+      await new Planner().plan("do a thing");
+      expect(systemPromptOf()).toContain(MODEL_TIERS.simple);
+    });
+  });
+
   it("should successfully generate and validate a TaskPlan", async () => {
     const mockResponse = `\`\`\`json
 {
@@ -158,7 +197,7 @@ describe("Planner", () => {
           successCriteria: "Role assignment completed",
           agentTemplate: index === 0 ? "PrincipalSweAgent" : "QaTesterAgent",
           routingReason: index === 0 ? "Implementation role selected by planner." : "Independent verification role selected by planner.",
-          model: index === 0 ? "anthropic/claude-sonnet-5" : "anthropic/claude-haiku-4.5",
+          model: index === 0 ? "anthropic/claude-sonnet-4.5" : "anthropic/claude-haiku-4.5",
         })),
       })}\n\`\`\``,
     });

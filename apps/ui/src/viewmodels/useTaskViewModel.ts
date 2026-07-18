@@ -4,6 +4,12 @@ import { useLogState } from "./useLogState";
 import { useApprovalState } from "./useApprovalState";
 import { formatAgentLifecycleNotice } from "../utils/agentWorkspace";
 
+export interface UIQueuedMessage {
+  id: string;
+  content: string;
+  time: string;
+}
+
 export function useTaskViewModel() {
   const [goal, setGoal] = useState("");
   // The mission text actually submitted for the active channel. Kept separate
@@ -20,6 +26,7 @@ export function useTaskViewModel() {
   const [success, setSuccess] = useState<boolean | null>(null);
   const [tasks, setTasks] = useState<UITask[]>([]);
   const [channelTopic, setChannelTopic] = useState<string | null>(null);
+  const [queuedMessages, setQueuedMessages] = useState<UIQueuedMessage[]>([]);
   // Casual conversation state is no longer used since chats are unified.
   const chatMessages: any[] = [];
 
@@ -37,6 +44,16 @@ export function useTaskViewModel() {
 
   const unsubscribeRef = useRef<(() => void) | null>(null);
   const agentsRef = useRef<UIAgent[]>([]);
+  const awaitingConfirmationRef = useRef(false);
+  const restorePlanReviewAfterFollowupRef = useRef(false);
+  const planProposalLoggedRef = useRef<Set<string>>(new Set());
+  const queuedMessagesRef = useRef<UIQueuedMessage[]>([]);
+  const pickedUpMessageIdsRef = useRef<Set<string>>(new Set());
+  const pickedUpMessageContentsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    awaitingConfirmationRef.current = awaitingConfirmation;
+  }, [awaitingConfirmation]);
 
   const loadTasks = async () => {
     try {
@@ -61,12 +78,14 @@ export function useTaskViewModel() {
    * state. Shared by startTask (new mission) and continueMission (follow-up on
    * an existing mission), since a completed mission tears its subscription down.
    */
-  const attachTaskEventStream = () => {
+  const attachTaskEventStream = (
+    streamTaskId: string | null = taskId,
+    options: { replayRecent?: boolean } = {},
+  ) => {
     if (unsubscribeRef.current) {
       unsubscribeRef.current();
     }
-    unsubscribeRef.current = TaskModel.subscribeEvents(
-      (eventData) => {
+    const handleEvent = (eventData: { topic: string; data: any }) => {
         const { topic, data } = eventData;
 
         if (topic.endsWith("agent_status")) {
@@ -99,11 +118,15 @@ export function useTaskViewModel() {
             if (!hasStarted) {
               setRunning(false);
               setAwaitingConfirmation(true);
-              addLog(
-                "orchestrator",
-                "[plan-proposal] Implementation plan ready for review.",
-                "response",
-              );
+              const planTaskId = topic.match(/^task\.([^.]+)\./)?.[1] ?? streamTaskId ?? "active";
+              if (!planProposalLoggedRef.current.has(planTaskId)) {
+                planProposalLoggedRef.current.add(planTaskId);
+                addLog(
+                  "orchestrator",
+                  "[plan-proposal] Implementation strategy ready for review.",
+                  "response",
+                );
+              }
             }
           }
         }
@@ -115,6 +138,9 @@ export function useTaskViewModel() {
               const newArtifacts = data.artifacts.filter((a: any) => !existingPaths.has(a.path));
               return [...prev, ...newArtifacts];
             });
+          }
+          if (data?.incomplete && data.summary) {
+            addLog("system", `⏸️ Checkpoint saved — work is incomplete and will continue from this evidence.\n\n${data.summary}`);
           }
         }
 
@@ -144,21 +170,52 @@ export function useTaskViewModel() {
 
         else if (topic.includes("started") || topic.includes("completed") || topic.includes("failed")) {
           if (data && data.note) {
-            clearThoughts();
-            addLog("orchestrator", data.note, "response");
+            const queuedPickup = String(data.note).match(/^📬 Processing queued user message:\s*(.*)$/s);
+            if (queuedPickup) {
+              const content = queuedPickup[1].trim();
+              const queued = queuedMessagesRef.current.find((message) => message.content === content);
+              if (queued && !pickedUpMessageIdsRef.current.has(queued.id)) {
+                pickedUpMessageIdsRef.current.add(queued.id);
+                pickedUpMessageContentsRef.current.add(content);
+                queuedMessagesRef.current = queuedMessagesRef.current.filter((message) => message.id !== queued.id);
+                setQueuedMessages(queuedMessagesRef.current);
+                addLog("user", queued.content, "response");
+              } else if (!queued && !pickedUpMessageContentsRef.current.has(content)) {
+                // Reopened missions may receive the pickup event without the
+                // local optimistic queue state. Still render the user turn.
+                addLog("user", content, "response");
+              }
+              addLog("orchestrator", data.note, "response");
+            } else if (!String(data.note).startsWith("Queued —")) {
+              // The sticky queue strip owns the queued acknowledgement; do not
+              // duplicate it as another chat bubble.
+              addLog("orchestrator", data.note, "response");
+            }
           }
         }
-      },
+      };
+    unsubscribeRef.current = TaskModel.subscribeEvents(
+      handleEvent,
       (approvalData) => {
         const { agentId, toolCall } = approvalData;
         addLog("system", `⚠️ Action paused. Approval required for ${toolCall.capability}.${toolCall.method}`);
         setPendingApproval({ agentId, toolCall });
       },
       (resultData) => {
+        const restorePlanReview =
+          restorePlanReviewAfterFollowupRef.current &&
+          resultData.success &&
+          !resultData.summary;
+        restorePlanReviewAfterFollowupRef.current = false;
         setSuccess(resultData.success);
         setSummary(resultData.summary);
         setRunning(false);
-        setAwaitingConfirmation(false);
+        setAwaitingConfirmation(restorePlanReview);
+        // A queued follow-up is only a transient optimistic UI state. If the
+        // backend has finished (or returned to conversation), there is no
+        // remaining mailbox item that should keep the strip on screen.
+        queuedMessagesRef.current = [];
+        setQueuedMessages([]);
         // Surface the final answer as an assistant chat message. On failure
         // the recovery banner carries the error instead, so skip it here.
         if (resultData.success && resultData.summary) {
@@ -177,6 +234,13 @@ export function useTaskViewModel() {
         }
       }
     );
+    if (options.replayRecent && streamTaskId) {
+      TaskModel.getRecentTaskEvents(streamTaskId)
+        .then((events) => {
+          for (const event of events || []) handleEvent(event);
+        })
+        .catch(() => {});
+    }
   };
 
   const startTask = async (e?: React.FormEvent) => {
@@ -196,15 +260,19 @@ export function useTaskViewModel() {
     setSummary(null);
     setSuccess(null);
     setChannelTopic(null);
+    queuedMessagesRef.current = [];
+    pickedUpMessageIdsRef.current.clear();
+    pickedUpMessageContentsRef.current.clear();
+    setQueuedMessages([]);
     setAwaitingConfirmation(false);
+    restorePlanReviewAfterFollowupRef.current = false;
+    planProposalLoggedRef.current.clear();
 
     // Render immediately by setting states and adding user message to logs
     setSubmittedPrompt(submitted);
     setRunning(true);
     setGoal("");
     addLog("user", submitted, "response");
-
-    addLog("system", `Submitting task to YAAA: "${submitted}"`);
 
     try {
       if (unsubscribeRef.current) {
@@ -218,7 +286,7 @@ export function useTaskViewModel() {
       loadTasks(); // Update list immediately once startTask runs and task gets created
 
       // 2. Subscribe to Model events and delegate actions
-      attachTaskEventStream();
+      attachTaskEventStream(newTaskId, { replayRecent: true });
 
     } catch (err: any) {
       addLog("system", `Error: ${err.message}`);
@@ -230,6 +298,47 @@ export function useTaskViewModel() {
     const text = (message ?? goal).trim();
     const targetTaskId = taskIdOverride ?? taskId;
     if (!targetTaskId || !text) return;
+    if (awaitingConfirmationRef.current) {
+      let planReviewIntent: "approve" | "reject" | "feedback" = "feedback";
+      try {
+        planReviewIntent = await TaskModel.classifyPlanReviewIntent(text);
+      } catch {
+        // Keep the conservative default: uncertain text is plan feedback.
+      }
+      if (planReviewIntent === "approve") {
+        if (targetTaskId !== taskId) setTaskId(targetTaskId);
+        restorePlanReviewAfterFollowupRef.current = false;
+        setGoal("");
+        setSubmittedPrompt(text);
+        setAwaitingConfirmation(false);
+        setRunning(true);
+        addLog("user", "Accepted the implementation plan.", "response");
+        addLog("system", "Mission confirmed. YAAA is starting the approved plan.");
+        try {
+          attachTaskEventStream(targetTaskId);
+          await TaskModel.recordPlanReview(targetTaskId, "Accepted the implementation plan.", "user");
+          await TaskModel.confirmTask(targetTaskId);
+          loadTasks();
+        } catch (err: any) {
+          addLog("system", `Unable to start approved mission: ${err.message}`);
+          setRunning(false);
+          setAwaitingConfirmation(true);
+        }
+        return;
+      }
+      if (planReviewIntent === "reject") {
+        const rejection = `Rejected the implementation plan:\n${text}`;
+        addLog("user", rejection, "response");
+        addLog("orchestrator", "Understood — I won't start this plan. Send a revised mission or more detail and I'll re-plan.", "response");
+        await TaskModel.recordPlanReview(targetTaskId, rejection, "user");
+        await TaskModel.recordPlanReview(targetTaskId, "Understood — I won't start this plan. Send a revised mission or more detail and I'll re-plan.", "orchestrator");
+        setRunning(false);
+        setAwaitingConfirmation(true);
+        return;
+      }
+    }
+    const preservePlanReview = awaitingConfirmationRef.current;
+    restorePlanReviewAfterFollowupRef.current = preservePlanReview;
 
     // A task selected after an app restart exists in persistent storage but is
     // not yet the view model's active task. Reactivate that exact mission so
@@ -240,30 +349,53 @@ export function useTaskViewModel() {
       setArtifacts([]);
     }
 
-    // A follow-up produces a fresh plan; clear the prior plan/agents but keep
-    // accumulated artifacts so the mission's outputs persist across turns.
-    setSubtasks([]);
-    setAgents([]);
-    agentsRef.current = [];
+    // Clarification-form submissions belong to planning/replanning. They must
+    // not be held behind the worker mailbox when the orchestrator is still
+    // gathering requirements and no workers have started yet.
+    const isQuestionAnswer = /^Answers\s+to\s+your\s+questions\s*:/i.test(text.trim());
+    const isActiveMissionFollowUp = running && targetTaskId === taskId && !preservePlanReview && !isQuestionAnswer;
+
+    // A follow-up can be a simple status question while a plan is awaiting
+    // review. Keep that plan visible until we know the backend is actually
+    // replacing it with a new one.
+    if (!preservePlanReview && !isActiveMissionFollowUp) {
+      setSubtasks([]);
+      setAgents([]);
+      agentsRef.current = [];
+    }
     setPendingApproval(null);
     setSubmittedPrompt(text);
     setGoal("");
     setSuccess(null);
     setSummary(null);
     setRunning(true);
-    setAwaitingConfirmation(false);
+    setAwaitingConfirmation(preservePlanReview);
 
-    // Immediately render user follow-up message in UI logs
-    addLog("user", text, "response");
-    addLog("system", `Following up on this mission: "${text}"`);
+    if (isActiveMissionFollowUp) {
+      const queuedMessage = {
+        id: `queued-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        content: text,
+        time: new Date().toLocaleTimeString(),
+      };
+      queuedMessagesRef.current = [...queuedMessagesRef.current, queuedMessage];
+      setQueuedMessages(queuedMessagesRef.current);
+    } else {
+      // A new/reopened mission can render its user turn immediately. Active
+      // runs wait until the orchestrator pickup event so queued work is not
+      // shown twice or out of order.
+      addLog("user", text, "response");
+      addLog("system", "YAAA is reviewing your follow-up and continuing this mission in the same channel.");
+    }
 
     try {
-      attachTaskEventStream();
+      attachTaskEventStream(targetTaskId);
       const result = await TaskModel.continueTask(targetTaskId, text);
       loadTasks();
       if (result?.status === "conversation") {
+        queuedMessagesRef.current = queuedMessagesRef.current.filter((message) => message.content !== text);
+        setQueuedMessages(queuedMessagesRef.current);
         setRunning(false);
-        setAwaitingConfirmation(false);
+        setAwaitingConfirmation(preservePlanReview);
       }
     } catch (err: any) {
       addLog("system", `Error: ${err.message}`);
@@ -383,6 +515,7 @@ export function useTaskViewModel() {
     summary,
     success,
     channelTopic,
+    queuedMessages,
     chatMessages,
     startTask,
     continueMission,
