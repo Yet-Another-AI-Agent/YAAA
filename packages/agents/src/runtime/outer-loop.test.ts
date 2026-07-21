@@ -157,6 +157,34 @@ describe("OuterLoop Manager", () => {
     orchestratorMailbox.clear(taskId);
   });
 
+  it("picks up an agent question and sends the answer back to that agent", async () => {
+    const taskId = "task-agent-question-roundtrip";
+    mockStore.getAgents = vi.fn().mockResolvedValue([
+      { id: "sub-agent-1", handle: "@researcher-1", status: "working", taskId },
+    ]);
+    orchestratorMailbox.post({
+      id: "agent-question-1",
+      taskId,
+      from: "agent",
+      agentId: "sub-agent-1",
+      content: "Which compatibility path should I verify?",
+      createdAt: new Date().toISOString(),
+    });
+
+    await outerLoop.run(taskId, singleSubtaskPlan());
+
+    expect(mockBus.publish).toHaveBeenCalledWith(
+      `task.${taskId}.agent_message`,
+      expect.objectContaining({
+        kind: "info_reply",
+        from: "orchestrator",
+        to: "sub-agent-1",
+        answer: expect.stringContaining("@researcher-1"),
+      }),
+    );
+    orchestratorMailbox.clear(taskId);
+  });
+
   it("injects persisted checkpoint evidence when a run is resumed after restart", async () => {
     const plan = singleSubtaskPlan();
     mockStore.getMessages = vi.fn().mockResolvedValue([
@@ -214,6 +242,17 @@ describe("OuterLoop Manager", () => {
         "task.task-negotiate.started",
         expect.objectContaining({ note: expect.stringMatching(/sending it back to a worker to fix/i) }),
       );
+      expect(plan.verificationFindings).toEqual([
+        expect.objectContaining({
+          subtaskId: "task-2",
+          status: "resolved",
+          findings: ["only 2 of 3 facts present"],
+        }),
+      ]);
+      expect(mockBus.publish).toHaveBeenCalledWith(
+        "task.task-negotiate.started",
+        expect.objectContaining({ note: expect.stringMatching(/received verification bugs/i) }),
+      );
     } finally {
       delete process.env.YAAA_MAX_VERIFICATION_ROUNDS;
     }
@@ -238,6 +277,9 @@ describe("OuterLoop Manager", () => {
       await expect(outerLoop.run("task-negotiate-fail", plan)).rejects.toThrow(
         "Task execution failed due to subtask failure.",
       );
+      expect(plan.verificationFindings).toEqual([
+        expect.objectContaining({ subtaskId: "task-2", status: "open", findings: ["fact missing"] }),
+      ]);
     } finally {
       delete process.env.YAAA_MAX_VERIFICATION_ROUNDS;
     }
@@ -301,10 +343,14 @@ describe("OuterLoop Manager", () => {
     const instructions = captured.map((c) => c.messages.map((m) => String(m.content)).join("\n"));
     expect(instructions.some((text) => text.includes("COMPLETELY DIFFERENT"))).toBe(true);
 
-    // 3 identical failures + 1 different-approach attempt = 4 agents, all failed.
+    // 3 identical failures + 1 different-approach attempt = 4 attempts. The
+    // recoverable attempts are exited so the UI does not falsely show a
+    // terminal failure before YAAA has exhausted correction options.
     const savedAgents = (mockStore.saveAgent as any).mock.calls.map((c: any[]) => c[1]);
     const failedAgents = savedAgents.filter((agent: any) => agent.status === "failed");
-    expect(failedAgents).toHaveLength(4);
+    const exitedAgents = savedAgents.filter((agent: any) => agent.status === "exited");
+    expect(failedAgents).toHaveLength(1);
+    expect(exitedAgents).toHaveLength(3);
   });
 
   it("runs independent ready subtasks concurrently", async () => {

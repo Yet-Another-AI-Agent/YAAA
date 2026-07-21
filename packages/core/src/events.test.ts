@@ -28,7 +28,15 @@ describe("mapBusEvent", () => {
     });
   });
 
-  it("ignores non-result agent_message payloads", () => {
+  it("maps agent collaboration messages to chat events", () => {
+    const msg = { kind: "help_request", from: "agent-1", to: "orchestrator", problem: "Need a decision" } as const;
+    expect(mapBusEvent(TASK, `task.${TASK}.agent_message`, msg)).toEqual({
+      type: "chat-message",
+      message: msg,
+    });
+  });
+
+  it("ignores unrelated agent_message payloads", () => {
     const msg = { kind: "status", from: "agent-1", taskId: TASK, state: "working" };
     expect(mapBusEvent(TASK, `task.${TASK}.agent_message`, msg)).toBeNull();
   });

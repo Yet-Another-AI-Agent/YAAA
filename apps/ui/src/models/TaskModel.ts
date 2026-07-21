@@ -262,6 +262,24 @@ export class TaskModel {
     return this.getElectronAPI().getYaaaDir();
   }
 
+  static async getSettings(): Promise<{
+    name: string;
+    profession: string;
+    description: string;
+    hasApiKey: boolean;
+    modelPreference: "sota" | "balanced" | "cost-effective";
+  }> {
+    return this.getElectronAPI().getSettings();
+  }
+
+  static async saveModelPreference(preference: "sota" | "balanced" | "cost-effective"): Promise<{ success: boolean }> {
+    return this.getElectronAPI().saveModelPreference(preference);
+  }
+
+  static async openExternal(url: string): Promise<boolean> {
+    return this.getElectronAPI().openExternal(url);
+  }
+
   /**
    * Checks the onboarding status (Mesh API keys and user profile details existence).
    */

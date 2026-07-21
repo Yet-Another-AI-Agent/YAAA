@@ -1,23 +1,31 @@
 import type { IBus, IStore, ModelResolution, ModelResolver } from "@yaaa/interfaces";
-import { agentControl, container, orchestratorMailbox, type Container } from "@yaaa/platform";
-import { type AgentRun, type Subtask, type TaskPlan, type LedgerEntry, type DependencyOutput, buildAgentBrief, getErrorFingerprint, isInsufficientFundsError } from "@yaaa/shared";
+import { agentControl, container, orchestratorMailbox, type Container, type IEventQueue } from "@yaaa/platform";
+import { type AgentRun, type Subtask, type TaskPlan, type LedgerEntry, type DependencyOutput, type VerificationFinding, buildAgentBrief, getErrorFingerprint, isInsufficientFundsError } from "@yaaa/shared";
 import { AGENT_REGISTRY, selectAgentTemplate } from "../registry.js";
 import { InnerLoop } from "./inner-loop.js";
 import { SupervisorAssessor } from "./supervisor-assessor.js";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Gender-neutral display names for generalist agents without a roster handle.
-const AGENT_DISPLAY_NAMES = ["Sage", "Quill", "Harbor", "Nova", "Rowan", "Cedar"];
-
 // The retry decision is driven by the *shape of the failure*, not a fixed
 // attempt count: when the same error fingerprint recurs this many times the
 // agent is demonstrably stuck, so we stop and escalate to a different approach.
 const MAX_IDENTICAL_ERRORS = 3;
+
+// Provider rate limits are shared by all workers in a mission. Keep this hard
+// capped at two even if an old plan asks for more agents; callers may lower it
+// for local/test runs, but can never raise it accidentally.
+export function resolveMaxParallelAgents(): number {
+  const configured = Number(process.env.YAAA_MAX_PARALLEL_AGENTS);
+  return Number.isFinite(configured) && configured > 0
+    ? Math.min(2, Math.floor(configured))
+    : 2;
+}
 
 // A pure safety backstop so an agent that fails a *different* way every single
 // time (and so never trips the recurrence detector above) still terminates.
@@ -96,6 +104,71 @@ export class OuterLoop {
   private supervisor: SupervisorAssessor;
   private scope: Container;
   private modelResolver?: ModelResolver;
+  private durableQueue?: IEventQueue;
+
+  private async recordPlanCorrection(
+    taskId: string,
+    plan: TaskPlan,
+    correction: { subtaskId: string; agentId?: string; action: string; reason: string; nextAgentTemplate?: string; nextModel?: string },
+  ): Promise<void> {
+    plan.corrections = [
+      ...(plan.corrections ?? []),
+      { id: crypto.randomUUID(), timestamp: new Date().toISOString(), ...correction },
+    ];
+    await this.store.savePlan(taskId, plan);
+    await this.bus.publish(`task.${taskId}.plan_updated`, plan);
+    await this.bus.publish(`task.${taskId}.started`, {
+      kind: "status",
+      from: "orchestrator",
+      taskId,
+      state: "working",
+      note: `YAAA reassessed ${correction.subtaskId} after agent completion: ${correction.action}. ${correction.reason}`,
+    });
+  }
+
+  private async recordVerificationFindings(
+    taskId: string,
+    plan: TaskPlan,
+    subtask: Subtask,
+    agent: AgentRun,
+    verdict: { summary?: string; reason?: string; findings?: string[]; evidence?: string[]; limitations?: string[] },
+  ): Promise<void> {
+    const findings = (verdict.findings ?? []).map(String);
+    const evidence = (verdict.evidence ?? []).map(String);
+    const limitations = (verdict.limitations ?? []).map(String);
+    const finding: VerificationFinding = {
+      id: crypto.randomUUID(),
+      timestamp: new Date().toISOString(),
+      subtaskId: subtask.id,
+      agentId: agent.id,
+      status: "open",
+      summary: String(verdict.summary ?? verdict.reason ?? "Verification found an issue."),
+      findings: findings.length ? findings : ["The verifier reported a failed verification without a specific finding."],
+      evidence,
+      limitations,
+    };
+    plan.verificationFindings = [...(plan.verificationFindings ?? []), finding];
+    await this.store.savePlan(taskId, plan);
+    await this.bus.publish(`task.${taskId}.plan_updated`, plan);
+    await this.bus.publish(`task.${taskId}.started`, {
+      kind: "status",
+      from: "orchestrator",
+      taskId,
+      state: "working",
+      note: `YAAA received verification bugs from ${agent.handle} for ${subtask.id}: ${finding.findings.join(" | ")}${limitations.length ? ` Limitation: ${limitations.join(" | ")}` : ""}`,
+    });
+  }
+
+  private async resolveVerificationFindings(taskId: string, plan: TaskPlan, subtaskId: string, resolution: string, resolved: boolean): Promise<void> {
+    if (!plan.verificationFindings?.length) return;
+    plan.verificationFindings = plan.verificationFindings.map((finding) =>
+      finding.subtaskId === subtaskId && finding.status === "open"
+        ? { ...finding, status: resolved ? "resolved" : "open", resolution: resolved ? resolution : undefined }
+        : finding,
+    );
+    await this.store.savePlan(taskId, plan);
+    await this.bus.publish(`task.${taskId}.plan_updated`, plan);
+  }
 
   constructor(scope: Container = container) {
     this.scope = scope;
@@ -108,10 +181,44 @@ export class OuterLoop {
     } catch {
       // Unit tests and alternate runtimes may not provide Mesh catalog access.
     }
+    try {
+      this.durableQueue = scope.resolve<IEventQueue>("IEventQueue");
+    } catch {
+      // In-memory unit-test scopes intentionally omit durable queue wiring.
+    }
   }
 
   private selectTemplate(subtask: Subtask): string {
     return selectAgentTemplate(subtask);
+  }
+
+  /** Execute one worker assignment through the durable agent queue. The
+   * existing InnerLoop remains the executor; the queue adds a recoverable
+   * assignment boundary and lease so a process crash does not erase work. */
+  private async runInnerLoop(options: Parameters<InnerLoop["run"]>[0]): Promise<any> {
+    if (!this.durableQueue) return this.innerLoop.run(options);
+    await this.durableQueue.recoverExpired("agent");
+    const item = {
+      id: `agent-work-${options.taskId}-${options.agentId}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      taskId: options.taskId,
+      queue: "agent" as const,
+      recipientId: options.agentId,
+      payload: options,
+      createdAt: new Date().toISOString(),
+      availableAt: new Date().toISOString(),
+      attempts: 0,
+    };
+    await this.durableQueue.enqueue(item);
+    const [claim] = await this.durableQueue.claim("agent", options.taskId, options.agentId, 1, 10 * 60_000);
+    if (!claim) throw new Error(`Agent assignment ${item.id} could not be claimed.`);
+    try {
+      const result = await this.innerLoop.run(options);
+      await this.durableQueue.acknowledge(claim);
+      return result;
+    } catch (error) {
+      await this.durableQueue.retry(claim);
+      throw error;
+    }
   }
 
   /**
@@ -235,10 +342,14 @@ export class OuterLoop {
   private async createAgentRun(taskId: string, subtask: Subtask, step: number, templateName = this.selectTemplate(subtask)): Promise<AgentRun> {
     const template = AGENT_REGISTRY[templateName];
     const pokemon = await this.selectPokemonAndImage(taskId);
-    const handle = `@${pokemon.name.toLowerCase()}-${step}`;
-    const displayName = pokemon.name;
+    // One canonical identity is used everywhere: UI handle, AgentRun id,
+    // workspace folder, artifact prefix, and per-agent DB directory.
+    const nameSlug = pokemon.name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "agent";
+    const canonicalId = `${nameSlug}-${step}`;
+    const handle = `@${canonicalId}`;
+    const displayName = pokemon.name.trim();
     return {
-      id: `${subtask.capability}-agent-${Math.random().toString(36).slice(2, 6)}`,
+      id: canonicalId,
       handle,
       displayName,
       taskId,
@@ -306,6 +417,40 @@ export class OuterLoop {
     });
   }
 
+  /**
+   * Verifiers need the live filesystem because generated paths can differ from
+   * the planner's intended name. Keep the inventory bounded, but include source
+   * generators and binary outputs so the verifier can resolve both.
+   */
+  private listWorkspaceArtifactPaths(): string[] {
+    let workingDir: string;
+    try {
+      workingDir = this.scope.resolve<string>("workingDir");
+    } catch {
+      return [];
+    }
+    const root = path.resolve(workingDir);
+    const found: string[] = [];
+    const visit = (directory: string): void => {
+      if (found.length >= 300) return;
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(directory, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        if (found.length >= 300) return;
+        if (entry.name === ".git" || entry.name === "node_modules") continue;
+        const absolute = path.join(directory, entry.name);
+        if (entry.isDirectory()) visit(absolute);
+        else if (entry.isFile()) found.push(path.relative(root, absolute).split(path.sep).join("/"));
+      }
+    };
+    visit(root);
+    return found.sort();
+  }
+
   private writeHandsOnBrief(agent: AgentRun, brief: string): void {
     let workingDir: string;
     try {
@@ -340,6 +485,8 @@ export class OuterLoop {
    * at a model-turn boundary. This keeps the LangGraph graph unchanged while
    * making the orchestrator a real event loop instead of a one-shot Promise. */
   private async processQueuedMessages(taskId: string, force = false): Promise<void> {
+    await this.durableQueue?.recoverExpired("orchestrator");
+    await orchestratorMailbox.hydrate(taskId, `orchestrator-${taskId}`);
     const queued = orchestratorMailbox.drain(taskId);
     if (queued.length === 0) return;
     const agents = (await this.store.getAgents(taskId)) ?? [];
@@ -349,16 +496,29 @@ export class OuterLoop {
       return;
     }
     for (const message of queued) {
+      if (message.from === "agent") {
+        // The durable chat message is already authored by the worker. Do not
+        // mirror it as a YAAA status bubble; that was the attribution bug shown
+        // in the screenshot (YAAA appeared to speak for the sub-agent).
+        const targetAgent = agents.find((agent) => agent.id === message.agentId);
+        const targetHandle = targetAgent?.handle ?? message.agentId ?? "agent";
+        await this.bus.publish(`task.${taskId}.agent_message`, {
+          kind: "info_reply",
+          from: "orchestrator",
+          to: targetAgent?.id ?? message.agentId ?? "agent",
+          answer: `@${targetHandle.replace(/^@/, "")} I received your question: ${message.content}. Continue with the safest evidence-based path while I review it and keep your current work moving.`,
+        });
+        await orchestratorMailbox.acknowledge(message.id);
+        continue;
+      }
+
       await this.bus.publish(`task.${taskId}.started`, {
         kind: "status",
         from: "orchestrator",
         taskId,
         state: "working",
-        note: message.from === "agent"
-          ? `❓ Agent requested orchestrator input: ${message.content}`
-          : `📬 Processing queued ${message.from} message: ${message.content}`,
+        note: `📬 Processing queued ${message.from} message: ${message.content}`,
       });
-      if (message.from === "agent") continue;
 
       // A pickup event alone is not an answer: the UI uses it to move the
       // optimistic user turn out of the queue, but the user still needs a
@@ -375,17 +535,46 @@ export class OuterLoop {
           : `✅ I’m here — I received your message. There are no active workers at this instant, so I’ll incorporate it at the next mission checkpoint and report back with the next result.`,
       });
       for (const agent of workingAgents) {
-        agentControl.post(agent.id, {
+        await this.bus.publish(`task.${taskId}.agent_message`, {
+          kind: "info_reply",
+          from: "orchestrator",
+          to: agent.id,
+          answer: `@${agent.handle.replace(/^@/, "")} ${message.content}`,
+        });
+        const redirect = {
           type: "redirect",
           handsOn: `${message.from === "user" ? "User" : "Orchestrator"} message received while you were working:\n\n${message.content}\n\nIncorporate it at the next safe turn. Continue from existing artifacts; do not restart unless the evidence requires it.`,
           reason: "Queued message delivered by the orchestrator event loop.",
-        });
+        } as const;
+        // The durable queue is the source of truth for each worker lane. The
+        // in-process mailbox remains as a low-latency compatibility path for
+        // runtimes/tests that do not provide a durable queue.
+        if (this.durableQueue) {
+          await this.durableQueue.enqueue({
+            id: `agent-message-${taskId}-${agent.id}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+            taskId,
+            queue: "agent",
+            recipientId: agent.id,
+            payload: redirect,
+            createdAt: new Date().toISOString(),
+            availableAt: new Date().toISOString(),
+            attempts: 0,
+          });
+          await this.bus.publish(`task.${taskId}.agent.${agent.id}.thought`, {
+            kind: "thought",
+            from: agent.id,
+            content: `📤 YAAA dropped a message in ${agent.handle}'s queue: ${message.content}`,
+          });
+        } else {
+          agentControl.post(agent.id, redirect);
+        }
         agentControl.post(agent.id, {
           type: "extend",
           additionalMs: 120_000,
           reason: "Time granted to process queued orchestration input.",
         });
       }
+      await orchestratorMailbox.acknowledge(message.id);
     }
   }
 
@@ -438,7 +627,7 @@ export class OuterLoop {
         handOffPath: `${fixWorkspace}/handOff.md`,
       });
       try {
-        const fixResult = await this.innerLoop.run({ agentId: fixAgent.id, taskId, templateName: producerTemplate, instruction: fixBrief, model: producer?.model });
+        const fixResult = await this.runInnerLoop({ agentId: fixAgent.id, taskId, templateName: producerTemplate, instruction: fixBrief, model: producer?.model });
         fixAgent.status = "completed";
         fixAgent.summary = fixResult.summary || "";
       } catch (err: any) {
@@ -464,7 +653,7 @@ export class OuterLoop {
         handOffPath: `${verifyWorkspace}/handOff.md`,
       });
       try {
-        const reVerify: any = await this.innerLoop.run({ agentId: reVerifyAgent.id, taskId, templateName: verifyTemplate, instruction: verifyBrief, model: verifySubtask.model });
+        const reVerify: any = await this.runInnerLoop({ agentId: reVerifyAgent.id, taskId, templateName: verifyTemplate, instruction: verifyBrief, model: verifySubtask.model });
         verdict = reVerify;
         reVerifyAgent.status = "completed";
         reVerifyAgent.summary = reVerify.summary ?? reVerify.reason;
@@ -642,6 +831,9 @@ export class OuterLoop {
         handsOnPath: `${workspacePrefix}/handsOn.md`,
         proofOfWorkPath: `${workspacePrefix}/proofOfWork.md`,
         handOffPath: `${workspacePrefix}/handOff.md`,
+        workspaceArtifactPaths: ["VerifierAgent", "QaTesterAgent", "CvTesterAgent"].includes(templateName)
+          ? this.listWorkspaceArtifactPaths()
+          : undefined,
       });
       this.writeHandsOnBrief(agent, instruction);
       // Persist the concise live assignment on the agent card; the complete
@@ -658,7 +850,7 @@ export class OuterLoop {
           ? ` using ${requestSource} model: ${selectedModel}`
           : ` using ${requestSource}`;
         console.log(`[OuterLoop] Executing subtask ${subtask.id} (attempt ${attempts})${modelLabel}`);
-        const result = await this.innerLoop.run({
+      const result = await this.runInnerLoop({
           agentId: agent.id,
           taskId,
           templateName,
@@ -703,6 +895,14 @@ export class OuterLoop {
             artifacts: resultArtifacts.map((a) => ({ path: a.path, description: a.description })),
             continuations,
             maxContinuations,
+          });
+          await this.recordPlanCorrection(taskId, plan, {
+            subtaskId: subtask.id,
+            agentId: agent.id,
+            action: decision.action,
+            reason: decision.reason,
+            nextAgentTemplate: decision.nextAgentTemplate,
+            nextModel: decision.nextModel,
           });
           await this.bus.publish(`task.${taskId}.started`, {
             kind: "status",
@@ -761,6 +961,13 @@ export class OuterLoop {
         // Negotiate a bounded fix→re-verify loop before accepting the outcome,
         // instead of letting the failure fall straight through to a run abort.
         if (subtask.capability === "verify" && (result as any).status === "failed") {
+          await this.recordVerificationFindings(taskId, plan, subtask, agent, result as any);
+          await this.recordPlanCorrection(taskId, plan, {
+            subtaskId: subtask.id,
+            agentId: agent.id,
+            action: "verification-findings-received",
+            reason: `YAAA received verifier bugs: ${((result as any).findings ?? []).map(String).join(" | ") || "unspecified verification failure"}. It will decide whether correction and reverification are necessary.`,
+          });
           const outcome = await this.negotiateVerification(taskId, plan, subtask, result as any, ctx);
           agent.status = outcome.passed ? "completed" : "failed";
           agent.finishedAt = new Date().toISOString();
@@ -773,6 +980,7 @@ export class OuterLoop {
             await this.store.savePlan(taskId, plan);
             await this.bus.publish(`task.${taskId}.plan_updated`, plan);
             facts.push(`Subtask ${subtask.id} failed verification after fix rounds. ${outcome.summary}`);
+            await this.resolveVerificationFindings(taskId, plan, subtask.id, "YAAA could not resolve the reported verification bugs within the bounded correction rounds.", false);
             continue;
           }
           subtaskStates[subtask.id] = "completed";
@@ -782,6 +990,7 @@ export class OuterLoop {
           await this.store.savePlan(taskId, plan);
           await this.bus.publish(`task.${taskId}.plan_updated`, plan);
           facts.push(`Subtask ${subtask.id} passed after ${resolveMaxVerificationRounds()}-round fix negotiation. Summary: ${outcome.summary || summary}`);
+          await this.resolveVerificationFindings(taskId, plan, subtask.id, outcome.summary || "YAAA corrected the deliverable and independent verification passed.", true);
           completedOutputs.set(subtask.id, { id: subtask.id, title: subtask.title, summary: outcome.summary || summary, artifacts: resultArtifacts });
           logOuter(taskId, "verification reconciled to pass", { subtaskId: subtask.id });
           continue;
@@ -810,6 +1019,14 @@ export class OuterLoop {
               nextModel: completionReview.nextModel,
             }
           : completionReview;
+        await this.recordPlanCorrection(taskId, plan, {
+          subtaskId: subtask.id,
+          agentId: agent.id,
+          action: effectiveCompletionReview.action,
+          reason: effectiveCompletionReview.reason,
+          nextAgentTemplate: effectiveCompletionReview.nextAgentTemplate,
+          nextModel: effectiveCompletionReview.nextModel,
+        });
         await this.bus.publish(`task.${taskId}.started`, {
           kind: "status",
           from: "orchestrator",
@@ -906,11 +1123,45 @@ export class OuterLoop {
           maxAttempts,
         });
 
-        agent.status = "failed";
+        const loopDetected = identicalErrors >= MAX_IDENTICAL_ERRORS;
+        const terminalFailure = (loopDetected && differentApproachAttempted) || errorAttempts >= maxAttempts;
+        // An attempt can fail while the subtask remains recoverable. Keep that
+        // worker out of the FAILED state until YAAA has exhausted its bounded
+        // correction/replacement policy.
+        agent.status = terminalFailure ? "failed" : "exited";
         agent.finishedAt = new Date().toISOString();
-        agent.summary = err.message;
+        agent.summary = terminalFailure
+          ? err.message
+          : `Recoverable attempt error; YAAA is applying a correction before retrying: ${err.message}`;
         await this.recordAgentLifecycle(agent);
         console.error(`Subtask ${subtask.id} attempt ${attempts} failed:`, err);
+
+        const correctiveSteps = loopDetected
+          ? `Stop repeating the failed approach. YAAA will replace this attempt with a different approach after reviewing the repeated error.`
+          : `Inspect the existing artifacts, verify the failing tool/model transcript, and retry with the corrected assignment context.`;
+        // A worker failure is a conversation with YAAA, not a silent agent
+        // death. Publish the worker's report first, then YAAA's explicit
+        // decision so the UI shows who discovered the problem and who chose
+        // the corrective action.
+        await this.bus.publish(`task.${taskId}.agent_message`, {
+          kind: "help_request",
+          from: agent.id,
+          to: "orchestrator",
+          problem: `Execution error on attempt ${attempts}: ${err.message}`,
+        });
+        await this.bus.publish(`task.${taskId}.started`, {
+          kind: "status",
+          from: "orchestrator",
+          taskId,
+          state: "working",
+          note: `@${agent.handle.replace(/^@/, "")} I received the failure report. Corrective steps: ${correctiveSteps}`,
+        });
+        await this.recordPlanCorrection(taskId, plan, {
+          subtaskId: subtask.id,
+          agentId: agent.id,
+          action: loopDetected ? "different-approach" : "retry",
+          reason: err.message,
+        });
 
         // Transient/rate-limit backoff is intentionally NOT done here: the model
         // client already retries 5xx/429 with exponential backoff that honours
@@ -922,7 +1173,6 @@ export class OuterLoop {
         // approach. If even that keeps failing — or an agent that fails a new
         // way every time never trips this and only the safety backstop stops it
         // — the subtask is declared failed.
-        const loopDetected = identicalErrors >= MAX_IDENTICAL_ERRORS;
         if (loopDetected && !differentApproachAttempted) {
           differentApproachAttempted = true;
           warnOuter(taskId, "kill switch activated, retrying with different approach", {
@@ -1061,22 +1311,30 @@ export class OuterLoop {
               error: error instanceof Error ? error.message : String(error),
             });
           }
-          await new Promise((resolve) => setTimeout(resolve, 250));
+          if (this.durableQueue) await this.durableQueue.waitForWork(taskId, 250);
+          else await new Promise((resolve) => setTimeout(resolve, 250));
         }
       })();
       try {
-        await Promise.all(
-          readySubtasks.map((subtask) =>
-            this.runSubtask(taskId, plan, subtask, {
-              subtaskStates,
-              facts,
-              assumptions,
-              completedOutputs,
-              allocateStep,
-              resumeDirective,
-            }),
-          ),
-        );
+        // Run independent work in bounded waves. Promise.all over the whole
+        // ready set previously created an API burst and caused intermittent
+        // provider rate-limit failures.
+        const maxParallel = resolveMaxParallelAgents();
+        for (let offset = 0; offset < readySubtasks.length; offset += maxParallel) {
+          const wave = readySubtasks.slice(offset, offset + maxParallel);
+          await Promise.all(
+            wave.map((subtask) =>
+              this.runSubtask(taskId, plan, subtask, {
+                subtaskStates,
+                facts,
+                assumptions,
+                completedOutputs,
+                allocateStep,
+                resumeDirective,
+              }),
+            ),
+          );
+        }
       } finally {
         polling = false;
         await eventLoop;

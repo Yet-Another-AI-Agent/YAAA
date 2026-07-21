@@ -43,13 +43,22 @@ export function formatAgentLifecycleNotice(
 
 /** Associates stream activity with an agent without imposing a log schema on the runtime. */
 export function getAgentActivity(agent: UIAgent, logs: UILog[]): UILog[] {
-  const identifiers = [agent.id, agent.handle.replace(/^@/, "")]
+  const identifiers = [agent.id, agent.handle.replace(/^@/, ""), agent.displayName]
     .filter(Boolean)
     .map((identifier) => identifier.toLowerCase());
+  const mention = agent.handle.toLowerCase();
 
-  return logs.filter((log) =>
-    log.source === "agent" && identifiers.some((identifier) => log.content.toLowerCase().includes(identifier)),
-  );
+  return logs.filter((log) => {
+    const owner = typeof log.metadata?.agentId === "string" ? log.metadata.agentId.toLowerCase() : "";
+    if (identifiers.some((identifier) => owner === identifier)) return true;
+    const content = log.content.toLowerCase();
+    if (log.source === "agent") return identifiers.some((identifier) => content.includes(identifier));
+    // YAAA replies and lifecycle notices are part of the agent's conversation
+    // when they explicitly address or identify that agent. Unrelated
+    // orchestrator/system logs remain out of the per-agent view.
+    return (log.source === "orchestrator" || log.source === "system") &&
+      (content.includes(mention) || identifiers.some((identifier) => content.includes(identifier)));
+  });
 }
 
 export function getVisibleLogContent(content: string): string {

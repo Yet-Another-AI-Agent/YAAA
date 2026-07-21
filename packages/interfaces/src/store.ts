@@ -5,6 +5,7 @@ import type {
   ConversationMessage,
   LedgerEntry,
   TaskPlan,
+  RuntimeEvent,
 } from "@yaaa/shared";
 
 export interface IStore {
@@ -24,6 +25,10 @@ export interface IStore {
 
   saveAgent(taskId: string, agent: AgentRun): Promise<void>;
   getAgents(taskId: string): Promise<AgentRun[]>;
+
+  /** Optional append-only journal. Implementations may add this incrementally. */
+  saveRuntimeEvent?(event: RuntimeEvent): Promise<void>;
+  getRuntimeEvents?(taskId: string, options?: { topic?: string; limit?: number }): Promise<RuntimeEvent[]>;
 
 }
 

@@ -10,6 +10,12 @@ export interface UIQueuedMessage {
   time: string;
 }
 
+function agentIdFromTopic(topic: string): string {
+  const parts = topic.split(".");
+  const agentIndex = parts.indexOf("agent");
+  return agentIndex >= 0 && parts[agentIndex + 1] ? parts[agentIndex + 1] : "agent";
+}
+
 export function useTaskViewModel() {
   const [goal, setGoal] = useState("");
   // The mission text actually submitted for the active channel. Kept separate
@@ -51,6 +57,20 @@ export function useTaskViewModel() {
   const pickedUpMessageIdsRef = useRef<Set<string>>(new Set());
   const pickedUpMessageContentsRef = useRef<Set<string>>(new Set());
 
+  // Queue state belongs to the ViewModel. Runtime events carry identity and
+  // content, so the view never has to infer state from a formatted log line.
+  const acknowledgeQueuedMessage = (messageId?: string, content?: string) => {
+    const queued = queuedMessagesRef.current.find((message) =>
+      (messageId && message.id === messageId) || (content && message.content === content),
+    );
+    if (!queued) return;
+    pickedUpMessageIdsRef.current.add(queued.id);
+    pickedUpMessageContentsRef.current.add(queued.content);
+    queuedMessagesRef.current = queuedMessagesRef.current.filter((message) => message.id !== queued.id);
+    setQueuedMessages(queuedMessagesRef.current);
+    addLog("user", queued.content, "response");
+  };
+
   useEffect(() => {
     awaitingConfirmationRef.current = awaitingConfirmation;
   }, [awaitingConfirmation]);
@@ -88,7 +108,24 @@ export function useTaskViewModel() {
     const handleEvent = (eventData: { topic: string; data: any }) => {
         const { topic, data } = eventData;
 
-        if (topic.endsWith("agent_status")) {
+        if (topic.includes("chat-message") || data?.type === "chat-message") {
+          const message = data?.message ?? data;
+          if (message?.kind === "help_request" || message?.kind === "info_request") {
+            addLog(
+              "agent",
+              `[${message.from ?? message.agentId ?? "agent"}] @yaaa ${message.problem ?? message.question}`,
+              "response",
+              { agentId: message.from ?? message.agentId },
+            );
+          } else if (message?.kind === "info_reply") {
+            const target = agentsRef.current.find((agent) => agent.id === message.to);
+            const handle = target?.handle?.replace(/^@/, "") ?? String(message.to ?? "agent").replace(/^@/, "");
+            const answer = String(message.answer ?? "").replace(new RegExp(`^@${handle}\\s*`, "i"), "");
+            addLog("orchestrator", `@${handle} ${answer}`, "response");
+          }
+        }
+
+        else if (topic.endsWith("agent_status")) {
           const index = agentsRef.current.findIndex((agent) => agent.id === data.id);
           const previous = index < 0 ? undefined : agentsRef.current[index];
           const nextAgents = index < 0
@@ -112,6 +149,14 @@ export function useTaskViewModel() {
                 producedArtifacts.push(...st.artifacts);
               }
             });
+            const implementationArtifact: UIArtifact = {
+              path: "orchestrator.md",
+              mimeType: "text/markdown",
+              description: "YAAA implementation strategy and execution ledger.",
+            };
+            if (!producedArtifacts.some((artifact) => artifact.path === implementationArtifact.path)) {
+              producedArtifacts.unshift(implementationArtifact);
+            }
             setArtifacts(producedArtifacts);
 
             const hasStarted = data.subtasks.some((st: any) => st.state === "running" || st.state === "completed");
@@ -125,6 +170,7 @@ export function useTaskViewModel() {
                   "orchestrator",
                   "[plan-proposal] Implementation strategy ready for review.",
                   "response",
+                  { artifactPath: "orchestrator.md", artifactLabel: "Implementation strategy" },
                 );
               }
             }
@@ -146,12 +192,38 @@ export function useTaskViewModel() {
 
         else if (topic.endsWith(".thought")) {
           // Reasoning tokens — rendered as collapsible "thinking", not chat.
-          addLog("agent", data.content, "thinking");
+          addLog("agent", data.content, "thinking", { agentId: agentIdFromTopic(topic) });
+        }
+
+        else if (topic.endsWith(".llm_context")) {
+          const agentName = agentIdFromTopic(topic);
+          const request = Array.isArray(data.messages)
+            ? data.messages.map((message: any) => `${message.type}: ${message.content}`).join("\n\n")
+            : "";
+          addLog("agent", `🧠 ${agentName} → LLM (turn ${data.turn}, ${data.model})\n${request}`, "thinking", { agentId: agentName });
+        }
+
+        else if (topic.endsWith(".llm_response")) {
+          const agentName = agentIdFromTopic(topic);
+          addLog("agent", `🧠 LLM → ${agentName} (turn ${data.turn}, ${data.model})\n${data.content || "(empty response)"}`, "thinking", { agentId: agentName });
         }
 
         else if (topic.endsWith(".tool_requested")) {
-          const agentName = topic.split(".").find((p) => p.includes("agent-")) || "agent";
-          addLog("agent", `🛠️ ${agentName}: ${data.content}`, "activity", data.metadata);
+          const agentName = agentIdFromTopic(topic);
+          addLog("agent", `🛠️ ${agentName}: ${data.content}`, "activity", { ...(data.metadata ?? {}), agentId: agentName });
+        }
+
+        else if (/\.action_(requested|started|approved|denied|completed|failed)$/.test(topic)) {
+          const agentName = agentIdFromTopic(topic);
+          const status = topic.match(/\.action_([^\.]+)$/)?.[1] ?? "updated";
+          const action = data?.capability && data?.method
+            ? `${data.capability}.${data.method}`
+            : "tool action";
+          const detail = data?.error ? ` — ${data.error}` : data?.result ? ` — ${String(data.result)}` : "";
+          addLog("agent", `🔧 ${agentName}: ${action} ${status}${detail}`, "activity", {
+            ...(data ?? {}),
+            agentId: agentName,
+          });
         }
 
         else if (topic.includes("topic_updated")) {
@@ -168,6 +240,10 @@ export function useTaskViewModel() {
           }
         }
 
+        else if (topic.endsWith("queue-accepted")) {
+          acknowledgeQueuedMessage(data?.messageId, data?.content);
+        }
+
         else if (topic.includes("started") || topic.includes("completed") || topic.includes("failed")) {
           if (data && data.note) {
             const queuedPickup = String(data.note).match(/^📬 Processing queued user message:\s*(.*)$/s);
@@ -175,11 +251,7 @@ export function useTaskViewModel() {
               const content = queuedPickup[1].trim();
               const queued = queuedMessagesRef.current.find((message) => message.content === content);
               if (queued && !pickedUpMessageIdsRef.current.has(queued.id)) {
-                pickedUpMessageIdsRef.current.add(queued.id);
-                pickedUpMessageContentsRef.current.add(content);
-                queuedMessagesRef.current = queuedMessagesRef.current.filter((message) => message.id !== queued.id);
-                setQueuedMessages(queuedMessagesRef.current);
-                addLog("user", queued.content, "response");
+                acknowledgeQueuedMessage(queued.id, content);
               } else if (!queued && !pickedUpMessageContentsRef.current.has(content)) {
                 // Reopened missions may receive the pickup event without the
                 // local optimistic queue state. Still render the user turn.

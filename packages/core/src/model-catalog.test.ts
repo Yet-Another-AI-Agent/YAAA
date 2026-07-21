@@ -92,9 +92,10 @@ describe("resolveModelFromCatalog", () => {
     expect(resolveModelFromCatalog([noTools, CHEAP]).model).toBe("anthropic/claude-haiku-4.5");
   });
 
-  it("preserves the requested model when the catalog is empty or unreachable", () => {
-    const resolved = resolveModelFromCatalog([], "anthropic/claude-sonnet-4.5");
-    expect(resolved.model).toBe("anthropic/claude-sonnet-4.5");
+  it("uses the configured fallback when the catalog is empty or unreachable", () => {
+    const resolved = resolveModelFromCatalog([], "google/gemini-3-flash", ["google/gemini-3.1-pro"]);
+    expect(resolved.model).toBe("google/gemini-3.1-pro");
+    expect(resolved.reason).toContain("unchecked model id");
   });
 
   it("is idempotent, so re-resolving an already-resolved model does not change it", () => {

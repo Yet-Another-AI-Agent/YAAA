@@ -48,7 +48,7 @@ describe("agentIdentity", () => {
   });
 
   it("falls back to a generic role for unknown ids", () => {
-    expect(agentIdentity("mystery").roleLabel).toBe("Specialist Agent");
+    expect(agentIdentity("mystery").roleLabel).toBe("Agent");
   });
 });
 

@@ -35,6 +35,31 @@ export class MessageBus implements IBus {
       }
     }
 
+    // Keep an append-only journal for every task-scoped event. AgentMessage
+    // persistence below remains for the existing read model and compatibility.
+    const taskId = this.getTaskIdFromTopic(topic) ?? this.getTaskIdFromMessage(message);
+    if (taskId) {
+      try {
+        const store = this.injectedStore ?? container.resolve<IStore>("IStore");
+        await store.saveRuntimeEvent?.({
+          id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          taskId,
+          topic,
+          timestamp: new Date().toISOString(),
+          payload: message,
+          ...(typeof message === "object" && message !== null && typeof message.from === "string"
+            ? { agentId: message.from }
+            : {}),
+        });
+      } catch (err) {
+        // Test/embedded runtimes may intentionally omit persistence. Keep the
+        // bus best-effort just as the legacy AgentMessage projection is.
+        if (!/Dependency injection token not found/.test(err instanceof Error ? err.message : String(err))) {
+          console.warn(`[MessageBus] runtime event persistence failed for ${topic}`, err);
+        }
+      }
+    }
+
     // 2. Persist messages of type AgentMessage to the store
     const parseResult = AgentMessageSchema.safeParse(message);
     if (parseResult.success) {
@@ -69,5 +94,10 @@ export class MessageBus implements IBus {
     // thoughts don't have taskId directly, they may be prefixed or scoped.
     // For M1, we assume all agent actions are bound to tasks.
     return null;
+  }
+
+  private getTaskIdFromTopic(topic: string): string | null {
+    const match = topic.match(/^task\.([^.]+)/);
+    return match?.[1] ?? null;
   }
 }

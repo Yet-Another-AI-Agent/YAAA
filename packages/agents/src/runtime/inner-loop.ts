@@ -1,5 +1,5 @@
 import type { IBus, ModelRole, ModelResolver, IMeshGateway } from "@yaaa/interfaces";
-import { container, type Container, PermissionEngine, pauseController, agentControl, orchestratorMailbox } from "@yaaa/platform";
+import { container, type Container, PermissionEngine, pauseController, agentControl, orchestratorMailbox, type IEventQueue } from "@yaaa/platform";
 import { type ArtifactRef, type ToolCall, isInsufficientFundsError, resolveFileRoots } from "@yaaa/shared";
 import { AGENT_REGISTRY } from "../registry.js";
 import { createReactAgent } from "@langchain/langgraph/prebuilt";
@@ -235,6 +235,7 @@ function collectWorkspaceArtifacts(
   workspaceRoot: string,
   artifacts: ArtifactRef[],
   role: string,
+  currentAgentWorkspace?: string,
 ): void {
   const existing = new Set(artifacts.map((artifact) => path.normalize(artifact.path)));
   const ignoredDirectories = new Set(["agent-workspaces", "node_modules", ".git", ".yaaa"]);
@@ -259,6 +260,7 @@ function collectWorkspaceArtifacts(
       }
       const extension = path.extname(entry.name).slice(1).toLowerCase();
       if (!deliverableExtensions.has(extension)) continue;
+      if (/^(?:hands?on|hands?_off|handoff|proofofwork|incompletework)\.md$/i.test(entry.name)) continue;
       let stat: fs.Stats;
       try {
         stat = fs.statSync(absolute);
@@ -277,6 +279,11 @@ function collectWorkspaceArtifacts(
     }
   };
   walk(workspaceRoot);
+  // Shell-created deliverables are often written beside the agent's
+  // handsOn/proof files. The task root scan intentionally hides all
+  // agent-workspaces to avoid leaking sibling-private files, so scan only the
+  // current agent's workspace explicitly and expose its real deliverables.
+  if (currentAgentWorkspace) walk(currentAgentWorkspace);
 }
 
 async function writeIncompleteWorkArtifact(
@@ -597,7 +604,7 @@ function repairToolCallTranscript(messages: BaseMessage[]): BaseMessage[] {
       cursor += 1;
     }
     const responseIds = new Set(followingTools.map((toolMessage) => toolMessage.tool_call_id));
-    const validCalls = calls.filter((call) => responseIds.has(call.id));
+    const validCalls = calls.filter((call) => typeof call.id === "string" && responseIds.has(call.id));
     if (validCalls.length !== calls.length) repairedCalls += calls.length - validCalls.length;
 
     // Do not carry raw provider tool calls alongside the normalized LangChain
@@ -689,7 +696,7 @@ function truncateForLog(value: string, max = 140): string {
 function summarizeToolArgs(args: unknown): string {
   if (!args || typeof args !== "object") return "";
   const record = args as Record<string, unknown>;
-  const salientKeys = ["query", "url", "command", "path", "pattern", "selector", "source", "id"];
+  const salientKeys = ["query", "url", "command", "script", "path", "pattern", "selector", "source", "id"];
   for (const key of salientKeys) {
     const value = record[key];
     if (typeof value === "string" && value.trim()) {
@@ -766,6 +773,8 @@ function buildToolMetadata(
   if (pathArg) metadata.path = pathArg;
   const selector = previewText(record.selector, 160);
   if (selector) metadata.selector = selector;
+  const script = previewText(record.script, 500);
+  if (script) metadata.script = script;
 
   const screenshotPath =
     resultString(output, "screenshotPath") ??
@@ -774,6 +783,8 @@ function buildToolMetadata(
       : undefined) ??
     (method === "screenshot" && typeof output === "string" ? output : undefined);
   if (screenshotPath) metadata.screenshotPath = screenshotPath;
+  const screencastPath = resultString(output, "screencastPath") ?? resultString(output, "videoPath");
+  if (screencastPath) metadata.screencastPath = screencastPath;
   const screenshotAbsolutePath = resultString(output, "screenshotAbsolutePath");
   const dataUrl = screenshotDataUrl(screenshotAbsolutePath ?? screenshotPath);
   if (dataUrl) metadata.screenshotDataUrl = dataUrl;
@@ -803,16 +814,16 @@ function buildToolMetadata(
   return metadata;
 }
 
-function parseVerifierResult(text: string): { status: "passed" | "failed"; reason: string; findings: string[]; evidence: string[] } {
+function parseVerifierResult(text: string): { status: "passed" | "failed"; reason: string; findings: string[]; evidence: string[]; limitations: string[] } {
   try {
     const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
     const raw = JSON.parse(fenced?.[1] ?? text);
     if (raw?.status !== "passed" && raw?.status !== "failed") throw new Error("status must be passed or failed");
     if (!Array.isArray(raw.findings) || !Array.isArray(raw.evidence)) throw new Error("findings and evidence must be arrays");
     if (raw.status === "passed" && raw.evidence.length === 0) throw new Error("a passing result requires evidence");
-    return { status: raw.status, reason: String(raw.summary ?? "No summary provided."), findings: raw.findings.map(String), evidence: raw.evidence.map(String) };
+    return { status: raw.status, reason: String(raw.summary ?? "No summary provided."), findings: raw.findings.map(String), evidence: raw.evidence.map(String), limitations: Array.isArray(raw.limitations) ? raw.limitations.map(String) : [] };
   } catch (error) {
-    return { status: "failed", reason: `Verifier returned invalid structured output: ${error instanceof Error ? error.message : String(error)}`, findings: ["The verifier response could not be validated."], evidence: [] };
+    return { status: "failed", reason: `Verifier returned invalid structured output: ${error instanceof Error ? error.message : String(error)}`, findings: ["The verifier response could not be validated."], evidence: [], limitations: [] };
   }
 }
 
@@ -864,6 +875,7 @@ export class InnerLoop {
   private modelFactory: ChatModelFactory;
   private maxTurns: number;
   private modelResolver?: ModelResolver;
+  private durableQueue?: IEventQueue;
 
   constructor(scope: Container = container) {
     this.scope = scope;
@@ -875,6 +887,11 @@ export class InnerLoop {
       this.modelResolver = scope.resolve<ModelResolver>("modelResolver");
     } catch {
       // Alternate/test runtimes may not expose Mesh model discovery.
+    }
+    try {
+      this.durableQueue = scope.resolve<IEventQueue>("IEventQueue");
+    } catch {
+      // Lightweight unit-test scopes may intentionally omit durable queues.
     }
   }
 
@@ -979,6 +996,7 @@ export class InnerLoop {
     // the timeout watchdog so a still-working agent gets more time rather than
     // being aborted at the original deadline.
     let grantedExtensionMs = 0;
+    let llmTurn = 0;
 
     const agent = createReactAgent({
       llm: model,
@@ -993,6 +1011,22 @@ export class InnerLoop {
         await pauseController.waitIfPaused(agentId);
         const base = repairToolCallTranscript(state.messages.map(withNonEmptyContent));
         const injected: BaseMessage[] = [];
+
+        // LangGraph invokes this hook once per model turn. Persist the exact
+        // sanitized context sent to the model for replay and auditability.
+        llmTurn += 1;
+        await this.bus.publish(`task.${taskId}.agent.${agentId}.llm_context`, {
+          kind: "llm_context",
+          from: agentId,
+          taskId,
+          turn: llmTurn,
+          model: modelName,
+          templateName: options.templateName,
+          messages: base.map((message) => ({
+            type: message.constructor.name,
+            content: typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+          })),
+        });
 
         // Automated Loop and Tool Failure Course Correction
         const autoCorrection = getAutoCourseCorrection(base);
@@ -1027,6 +1061,24 @@ export class InnerLoop {
             });
           } else if (directive.type === "stop") {
             throw new AgentStopRequestedError(directive.reason);
+          }
+        }
+        if (this.durableQueue) {
+          await this.durableQueue.recoverExpired("agent");
+          const claims = await this.durableQueue.claim("agent", taskId, agentId, 20, 10 * 60_000);
+          for (const claim of claims) {
+            const directive = claim.item.payload as { type?: string; handsOn?: string; reason?: string };
+            if (directive?.type === "redirect" && directive.handsOn) {
+              await this.bus.publish(`task.${taskId}.agent.${agentId}.thought`, {
+                kind: "thought",
+                from: agentId,
+                content: `📥 ${agentId} pulled a message from its queue: ${directive.handsOn}`,
+              });
+              injected.push(new HumanMessage(
+                `Worker queue message from YAAA — follow this updated assignment now:\n\n${directive.handsOn}`,
+              ));
+            }
+            await this.durableQueue.acknowledge(claim);
           }
         }
         return { llmInputMessages: [...base, ...injected] };
@@ -1076,11 +1128,27 @@ export class InnerLoop {
           getExtensionMs: () => grantedExtensionMs,
         },
       )) as { messages: BaseMessage[] };
+      await this.bus.publish(`task.${taskId}.agent.${agentId}.llm_response`, {
+        kind: "llm_response",
+        from: agentId,
+        taskId,
+        turn: llmTurn,
+        model: modelName,
+        content: finalTextOf(finalState.messages),
+      });
       logInner(agentId, "model invocation completed", {
         messageCount: finalState.messages.length,
         sawToolProgress,
       });
     } catch (err) {
+      await this.bus.publish(`task.${taskId}.agent.${agentId}.llm_response`, {
+        kind: "llm_response",
+        from: agentId,
+        taskId,
+        turn: llmTurn,
+        model: modelName,
+        content: `[request failed] ${err instanceof Error ? err.message : String(err)}`,
+      });
       if (isInsufficientFundsError(err)) throw err;
       if (isRecursionLimitError(err)) {
         throw new Error(
@@ -1337,7 +1405,7 @@ export class InnerLoop {
     // Reconcile shell-created files before the verifier or orchestrator sees
     // the result. This is what makes a generated PPTX count even when it was
     // produced by `node create_presentation.js` rather than write_file.
-    collectWorkspaceArtifacts(workspaceRoot, artifacts, template.role);
+    collectWorkspaceArtifacts(workspaceRoot, artifacts, template.role, agentWorkspace);
 
     if (template.modelRole === "verifier") {
       const verdict = parseVerifierResult(finalText);
@@ -1586,6 +1654,26 @@ export class InnerLoop {
             content: `${capability}.${method}${argSummary ? ` — ${argSummary}` : ""}`,
             metadata: buildToolMetadata(capability, method, args),
           });
+          await bus.publish(`task.${taskId}.agent.${agentId}.action_requested`, {
+            kind: "action_requested",
+            actionId: call.id,
+            agentId,
+            taskId,
+            capability,
+            method,
+            args,
+            timestamp: new Date().toISOString(),
+          });
+          await bus.publish(`task.${taskId}.agent.${agentId}.action_started`, {
+            kind: "action_started",
+            actionId: call.id,
+            agentId,
+            taskId,
+            capability,
+            method,
+            args,
+            timestamp: new Date().toISOString(),
+          });
           logInner(agentId, "tool requested", {
             capability,
             method,
@@ -1611,6 +1699,27 @@ export class InnerLoop {
               from: agentId,
               content: `✓ ${capability}.${method}: ${resultSummary}`,
               metadata,
+            });
+            await bus.publish(`task.${taskId}.agent.${agentId}.action_approved`, {
+              kind: "action_approved",
+              actionId: call.id,
+              agentId,
+              taskId,
+              capability,
+              method,
+              args,
+              timestamp: new Date().toISOString(),
+            });
+            await bus.publish(`task.${taskId}.agent.${agentId}.action_completed`, {
+              kind: "action_completed",
+              actionId: call.id,
+              agentId,
+              taskId,
+              capability,
+              method,
+              args,
+              result: output,
+              timestamp: new Date().toISOString(),
             });
             logInner(agentId, "tool completed", {
               capability,
@@ -1638,6 +1747,18 @@ export class InnerLoop {
               from: agentId,
               content: `✗ ${capability}.${method} failed: ${errorSummary}`,
               metadata,
+            });
+            const denied = /approval|denied|not approved/i.test(errorSummary);
+            await bus.publish(`task.${taskId}.agent.${agentId}.${denied ? "action_denied" : "action_failed"}`, {
+              kind: denied ? "action_denied" : "action_failed",
+              actionId: call.id,
+              agentId,
+              taskId,
+              capability,
+              method,
+              args,
+              error: errorSummary,
+              timestamp: new Date().toISOString(),
             });
             warnInner(agentId, "tool failed", {
               capability,
@@ -1676,14 +1797,15 @@ export class InnerLoop {
       gated("generate_image", "generateImage", "Generate an image using AI from a text prompt and save it to a file path in the workspace. Returns the status.",
         z.object({
           prompt: z.string().describe("Detailed description of the image to generate, e.g. 'a beautiful drawing of a plant cell'."),
-          outputPath: z.string().describe("Path to save the generated PNG image in the workspace, e.g. 'images/plant_cell.png'.")
+          outputPath: z.string().describe("Path to save the generated PNG image in the workspace, e.g. 'images/plant_cell.png'."),
+          background: z.enum(["auto", "transparent", "opaque"]).default("auto").describe("Use transparent for logos, stickers, icons, cutouts, overlays, sprites, or assets placed over other content; opaque for full scenes, posters, and backgrounds; auto only when either is acceptable.")
         }),
         async (a) => {
           const gateway = this.scope.resolve<any>("IMeshGateway");
           if (!gateway.generateImage) {
             throw new Error("Image generation is not supported by the current gateway.");
           }
-          const base64Data = await gateway.generateImage(a.prompt);
+          const base64Data = await gateway.generateImage(a.prompt, { background: a.background });
           const buffer = Buffer.from(base64Data, "base64");
           await filesProvider.writeFile(a.outputPath, buffer);
           return { status: "success", message: `Generated image saved to ${a.outputPath}` };
@@ -1715,6 +1837,7 @@ export class InnerLoop {
             id: `agent-question-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
             taskId,
             from: "agent",
+            agentId,
             content: question,
             createdAt: new Date().toISOString(),
           });
@@ -1785,6 +1908,7 @@ export class InnerLoop {
         gated("browser_forward", "forward", "Navigate forward.", z.object({ id: z.string() }), (a) => browser.forward(a.id), undefined, "browser"),
         gated("browser_wait", "waitFor", "Wait for an element to appear.", z.object({ id: z.string(), selector: z.string(), timeoutMs: z.number().positive().default(30000) }), (a) => browser.waitFor(a.id, a.selector, a.timeoutMs), undefined, "browser"),
         gated("browser_content", "content", "Get rendered text and HTML from an element.", z.object({ id: z.string(), selector: z.string().default("body") }), (a) => browser.content(a.id, a.selector), undefined, "browser"),
+        gated("browser_evaluate_script", "evaluate", "Run one complete JavaScript/async IIFE in the page and return JSON-serializable observations. Use this for splash-screen timers, delayed transitions, games, performance measurements, and other time-bound behavior: collect the whole interaction and timing sequence inside one injected script instead of relying on many model round trips. If the requirement cannot be evaluated by one script or existing app instrumentation, report that limitation and request a shell test harness or instrumentation.", z.object({ id: z.string(), script: z.string().min(1).describe("A complete JavaScript expression or async IIFE that returns JSON-serializable observations/results.") }), (a) => browser.evaluate(a.id, a.script), undefined, "browser"),
         gated("browser_screenshot", "screenshot", "Capture a page, full page, or element screenshot. Screenshots are stored in the agent logs folder.", z.object({ id: z.string(), outputPath: z.string(), fullPage: z.boolean().default(false), selector: z.string().optional() }), async (a) => {
           const target = screenshotLogPath(workspaceRoot, agentId, a.outputPath);
           const savedPath = await browser.screenshot(a.id, target.absolute, a);

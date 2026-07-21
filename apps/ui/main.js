@@ -109,16 +109,45 @@ function forwardRuntimeEvent(taskId, event) {
         data: { content: event.content, metadata: event.metadata },
       });
       break;
+    case "llm-context":
+      emitTaskEvent(taskId, {
+        topic: `task.${taskId}.agent.${event.from}.llm_context`,
+        data: { turn: event.turn, model: event.model, messages: event.messages },
+      });
+      break;
+    case "llm-response":
+      emitTaskEvent(taskId, {
+        topic: `task.${taskId}.agent.${event.from}.llm_response`,
+        data: { turn: event.turn, model: event.model, content: event.content },
+      });
+      break;
     case "agent-status":
       emitTaskEvent(taskId, {
         topic: `task.${taskId}.agent_status`,
         data: event.agent,
       });
       break;
+    case "chat-message":
+      emitTaskEvent(taskId, {
+        topic: `task.${taskId}.chat-message`,
+        data: { type: "chat-message", message: event.message },
+      });
+      break;
+      break;
     case "status":
       emitTaskEvent(taskId, {
         topic: `task.${taskId}.started`,
         data: { note: event.note },
+      });
+      break;
+    case "queue-accepted":
+      emitTaskEvent(taskId, {
+        topic: `task.${taskId}.queue-accepted`,
+        data: {
+          messageId: event.messageId,
+          from: event.from,
+          content: event.content,
+        },
       });
       break;
     case "topic-updated":
@@ -422,6 +451,19 @@ ipcMain.handle("save-line-comments", async (_event, { taskId, artifactPath, comm
 );
 
 ipcMain.handle("get-yaaa-dir", async () => workspace.getYaaaDir());
+
+ipcMain.handle("get-settings", async () => workspace.getSettings());
+
+ipcMain.handle("save-model-preference", async (_event, preference) =>
+  workspace.saveModelPreference(preference),
+);
+
+ipcMain.handle("open-external", async (_event, url) => {
+  const value = String(url ?? "");
+  if (!/^https:\/\//i.test(value)) return false;
+  await shell.openExternal(value);
+  return true;
+});
 
 // ------------------------------------------------------------ IPC: onboarding
 

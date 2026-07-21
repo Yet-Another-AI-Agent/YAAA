@@ -1,6 +1,6 @@
 import OpenAI from "openai";
 import type { IMeshGateway, ChatMessage, ChatOptions, ModelRole, ChatResult, ToolDefinition } from "@yaaa/interfaces";
-import { isInsufficientFundsError, INSUFFICIENT_FUNDS_CODE } from "@yaaa/shared";
+import { isInsufficientFundsError, INSUFFICIENT_FUNDS_CODE, type ModelPreference } from "@yaaa/shared";
 
 /**
  * Normalize provider errors: if the failure means the account is out of
@@ -64,7 +64,11 @@ async function retryApiCall<T>(label: string, operation: () => Promise<T>): Prom
       // Deterministic request/schema errors will not improve on retry. API
       // availability failures (timeouts, transport, 429/5xx) still receive
       // the required three attempts.
-      if (isInsufficientFundsError(err) || /validationexception|bad request|\b400\b/i.test(message) || attempt === MIN_API_ATTEMPTS) break;
+      if (
+        isInsufficientFundsError(err)
+        || /validationexception|bad request|\b400\b|model_not_found|\b404\b/i.test(message)
+        || attempt === MIN_API_ATTEMPTS
+      ) break;
       console.warn(`[MeshGateway] ${label} failed; retrying`, {
         attempt,
         nextAttempt: attempt + 1,
@@ -84,6 +88,7 @@ export interface MeshGatewayConfig {
   apiKey?: string;
   baseURL?: string;
   modelMapping?: Record<ModelRole, string>;
+  modelPreference?: ModelPreference;
   timeout?: number;
   maxRetries?: number;
 }
@@ -132,13 +137,26 @@ export class MeshGateway implements IMeshGateway {
     // Default Mesh API routing mapping for various agent roles. The planner can
     // assign any supported provider/company model per subtask, while these are
     // only fallback role mappings when no explicit model was selected.
+    const orchestratorModel = config.modelPreference === "sota"
+      ? "anthropic/claude-sonnet-4.5"
+      : config.modelPreference === "balanced"
+        ? "google/gemini-3.1-pro-preview"
+        : "google/gemini-2.5-pro-preview";
     this.modelMapping = {
-      planner: "google/gemini-2.5-pro",
-      worker: "google/gemini-2.5-flash",
-      verifier: "google/gemini-2.5-flash",
-      utility: "google/gemini-2.5-flash",
+      planner: orchestratorModel,
+      worker: orchestratorModel,
+      verifier: orchestratorModel,
+      utility: orchestratorModel,
       ...config.modelMapping,
     };
+    // Mesh rejects the old speculative Claude 5 id with 404. Normalize it at
+    // the gateway boundary so stale settings cannot break utility/planner
+    // calls before the live catalog resolver gets a chance to run.
+    for (const role of Object.keys(this.modelMapping) as ModelRole[]) {
+      if (this.modelMapping[role] === "anthropic/claude-opus-5") {
+        this.modelMapping[role] = "anthropic/claude-sonnet-4.5";
+      }
+    }
   }
 
   /** Read Mesh's live, cross-provider catalog. Pricing and availability are
@@ -197,7 +215,7 @@ export class MeshGateway implements IMeshGateway {
       return { content };
     }
 
-    const model = this.modelMapping[options.modelRole];
+    const model = options.model || this.modelMapping[options.modelRole];
     try {
       const oaiTools = options.tools?.map((t) => ({
         type: "function" as const,
@@ -266,7 +284,7 @@ export class MeshGateway implements IMeshGateway {
       return;
     }
 
-    const model = this.modelMapping[options.modelRole];
+    const model = options.model || this.modelMapping[options.modelRole];
     try {
       const createStream = (includeTemperature: boolean) =>
         this.openai.chat.completions.create({
@@ -304,7 +322,7 @@ export class MeshGateway implements IMeshGateway {
     }
   }
 
-  async generateImage(prompt: string, options: { model?: string } = {}): Promise<string> {
+  async generateImage(prompt: string, options: { model?: string; background?: "transparent" | "opaque" | "auto" } = {}): Promise<string> {
     if (this.isMockMode) {
       return "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
     }
@@ -318,6 +336,7 @@ export class MeshGateway implements IMeshGateway {
           prompt,
           n: 1,
           size: "1024x1024",
+          background: options.background ?? "auto",
         }),
       );
       const item = response.data?.[0];

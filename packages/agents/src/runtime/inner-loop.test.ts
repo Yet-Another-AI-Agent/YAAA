@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { container, PermissionEngine } from "@yaaa/platform";
+import { container, PermissionEngine, orchestratorMailbox } from "@yaaa/platform";
 import type { IBus } from "@yaaa/interfaces";
 import { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { AIMessage, type BaseMessage } from "@langchain/core/messages";
@@ -180,6 +180,29 @@ describe("InnerLoop Worker Loop (ReAct)", () => {
 
     expect(result.status).toBe("passed");
     expect(result.reason).toContain("All sections present");
+  });
+
+  it("queues an agent question with its identity for the orchestrator event loop", async () => {
+    install([
+      toolCall("ask_orchestrator", { question: "Should I preserve the existing API or migrate it?" }),
+      new AIMessage({ content: "I asked the orchestrator and will continue safely." }),
+    ]);
+
+    await innerLoop.run({
+      agentId: "sub-agent-1",
+      taskId: "task-queue-contract",
+      templateName: "FilesAgent",
+      instruction: "Inspect the API and ask for guidance if the compatibility decision is ambiguous.",
+    });
+
+    expect(mockBus.publish).toHaveBeenCalledWith(
+      "task.task-queue-contract.agent_message",
+      expect.objectContaining({ kind: "help_request", from: "sub-agent-1", to: "orchestrator" }),
+    );
+    expect(orchestratorMailbox.drain("task-queue-contract")).toEqual([
+      expect.objectContaining({ from: "agent", agentId: "sub-agent-1", content: "Should I preserve the existing API or migrate it?" }),
+    ]);
+    orchestratorMailbox.clear("task-queue-contract");
   });
 
   it("reads a structured failed verdict too", async () => {

@@ -158,6 +158,13 @@ describe("MeshGateway", () => {
     expect(onReasoning).not.toHaveBeenCalled();
   });
 
+  it("uses an explicit model id instead of the role mapping", async () => {
+    const gateway = new MeshGateway({ apiKey: "some-key", modelMapping: { planner: "google/gemini-2.5-flash", worker: "google/gemini-2.5-flash", verifier: "google/gemini-2.5-flash", utility: "google/gemini-2.5-flash" } });
+    mockCreate.mockResolvedValue({ choices: [{ message: { content: "ok" } }] });
+    await gateway.chat([{ role: "user", content: "hello" }], { modelRole: "worker", model: "google/gemini-3-flash-preview" });
+    expect(mockCreate.mock.calls[0][0].model).toBe("google/gemini-3-flash-preview");
+  });
+
   it("should cover each deterministic mock role response", async () => {
     const gateway = new MeshGateway({ apiKey: "" });
 

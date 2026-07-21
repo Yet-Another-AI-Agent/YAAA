@@ -20,6 +20,7 @@ import {
   type DependencyOutput,
   type MentionRoute,
   type TaskPlan,
+  type ModelPreference,
   type MissionSnapshot,
 } from "@yaaa/shared";
 import { ConversationCoordinator } from "./conversations.js";
@@ -48,6 +49,7 @@ export interface AppConfig {
   userProfession?: string;
   userDescription?: string;
   skipOnboarding?: boolean;
+  modelPreference?: ModelPreference;
 }
 
 export interface TaskRow {
@@ -70,6 +72,14 @@ export interface RunTaskHooks {
   onApproval?: (agentId: string, call: any) => Promise<boolean>;
 }
 
+/** Accept names used by older settings builds while persisting one canonical value. */
+function normalizeModelPreference(value: unknown): ModelPreference {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (normalized === "advanced" || normalized === "advance" || normalized === "sota") return "sota";
+  if (normalized === "cost-effective" || normalized === "cost_effective") return "cost-effective";
+  return "balanced";
+}
+
 export interface ResumeProfile {
   name: string;
   profession: string;
@@ -83,6 +93,10 @@ export function buildStrategyAcknowledgement(goal: string): string {
     return `Got it — I’ll prepare a strategy using exactly ${requestedAgentCount} agents, preserving the roles you requested. You can review it before any agent starts.`;
   }
   return "Got it — I’ll prepare a concise implementation strategy for your review. No agents will start until you approve it.";
+}
+
+function buildClarificationFallback(goal: string): string {
+  return `Before I prepare the implementation strategy for “${goal}”, what is the intended deliverable and who is it for? Please also share any required format, scope, deadline, or success criteria that would affect the approach.`;
 }
 
 function hasIncompletePlanWork(plan: TaskPlan): boolean {
@@ -193,6 +207,30 @@ export class Workspace {
     if (profile.description !== undefined)
       c.userDescription = profile.description;
     if (profile.skip) c.skipOnboarding = true;
+    this.saveConfig(c);
+    return { success: true };
+  }
+
+  getSettings(): {
+    name: string;
+    profession: string;
+    description: string;
+    hasApiKey: boolean;
+    modelPreference: ModelPreference;
+  } {
+    const c = this.loadConfig();
+    return {
+      name: c.userName ?? "",
+      profession: c.userProfession ?? "",
+      description: c.userDescription ?? "",
+      hasApiKey: Boolean(c.accessToken),
+      modelPreference: normalizeModelPreference(c.modelPreference),
+    };
+  }
+
+  saveModelPreference(preference: ModelPreference): { success: boolean } {
+    const c = this.loadConfig();
+    c.modelPreference = normalizeModelPreference(preference);
     this.saveConfig(c);
     return { success: true };
   }
@@ -776,6 +814,7 @@ export class Workspace {
     const gateway = new MeshGateway({
       apiKey: config.accessToken ?? process.env.MESH_API_KEY ?? undefined,
       modelMapping: config.preferredModels as any,
+      modelPreference: config.modelPreference ?? "balanced",
     });
     const router = new IntentRouter(gateway);
     const decision = await router.route(message, { userName: config.userName });
@@ -797,6 +836,7 @@ export class Workspace {
     const gateway = new MeshGateway({
       apiKey: config.accessToken ?? process.env.MESH_API_KEY ?? undefined,
       modelMapping: config.preferredModels as any,
+      modelPreference: config.modelPreference ?? "balanced",
     });
     return new IntentRouter(gateway).classifyPlanReview(message);
   }
@@ -808,6 +848,7 @@ export class Workspace {
     const gateway = new MeshGateway({
       apiKey: config.accessToken ?? process.env.MESH_API_KEY ?? undefined,
       modelMapping: config.preferredModels as any,
+      modelPreference: config.modelPreference ?? "balanced",
     });
     return new IntentRouter(gateway).classifyMissionFollowup(message);
   }
@@ -979,7 +1020,10 @@ export class Workspace {
     const workingDir = path.join(taskDir, "working");
 
     fs.mkdirSync(workingDir, { recursive: true });
-    fs.mkdirSync(path.join(taskDir, "databases"), { recursive: true });
+    // Runtime state is private to the task and lives under .yaaa. Existing
+    // history is intentionally not migrated because this layout changes the
+    // persistence contract and stale chat/events can be misleading.
+    fs.mkdirSync(path.join(taskDir, ".yaaa", "agents"), { recursive: true });
     fs.mkdirSync(path.join(taskDir, "resources"), { recursive: true });
 
     fs.writeFileSync(
@@ -994,11 +1038,7 @@ export class Workspace {
       JSON.stringify(config.preferredModels ?? {}, null, 2),
       "utf-8",
     );
-    fs.writeFileSync(
-      path.join(taskDir, "agents"),
-      JSON.stringify([], null, 2),
-      "utf-8",
-    );
+    fs.writeFileSync(path.join(taskDir, "agents"), JSON.stringify([], null, 2), "utf-8");
 
     const db = this.openMainDb();
     try {
@@ -1026,6 +1066,7 @@ export class Workspace {
     const gateway = new MeshGateway({
       apiKey: config.accessToken ?? process.env.MESH_API_KEY ?? undefined,
       modelMapping: config.preferredModels as any,
+      modelPreference: config.modelPreference ?? "balanced",
     });
     gateway
       .chat(
@@ -1070,16 +1111,23 @@ export class Workspace {
     goal: string,
     task: CreatedTask,
     hooks: RunTaskHooks = {},
-    options: { priorSummary?: string } = {},
+    options: { priorSummary?: string; correction?: string } = {},
   ): Promise<TaskPlan> {
     const config = this.loadConfig();
+    const priorStore = new SqliteStore(this.tasksDir);
+    const priorPlan = await priorStore.getPlan(task.taskId).catch(() => null);
+    priorStore.closeAll();
     const runtime = createRuntime({
       taskId: task.taskId,
       tasksBaseDir: this.tasksDir,
       workingDir: task.workingDir,
       apiKey: config.accessToken ?? process.env.MESH_API_KEY ?? undefined,
       modelMapping: config.preferredModels ?? undefined,
+      modelPreference: config.modelPreference ?? "balanced",
       onEvent: (event) => {
+        if (event.type === "plan-updated" && !this.deletedTasks.has(task.taskId)) {
+          this.writeOrchestratorMd(task.taskDir, task.taskId, goal, "planning", event.plan, []);
+        }
         if (!this.deletedTasks.has(task.taskId)) hooks.onEvent?.(event);
       },
       onApproval: hooks.onApproval
@@ -1100,8 +1148,24 @@ export class Workspace {
           profession: config.userProfession,
           description: config.userDescription,
         },
+        modelPreference: config.modelPreference ?? "balanced",
         priorSummary: options.priorSummary,
+        correctionGoal: options.correction,
       });
+      if (priorPlan?.corrections?.length || options.correction?.trim()) {
+        plan.corrections = [
+          ...(priorPlan?.corrections ?? []),
+          ...(options.correction?.trim()
+            ? [{
+                id: crypto.randomUUID(),
+                timestamp: new Date().toISOString(),
+                subtaskId: "plan",
+                action: "replanned",
+                reason: options.correction.trim(),
+              }]
+            : []),
+        ];
+      }
       if (this.deletedTasks.has(task.taskId))
         throw new Error("Task was deleted.");
       this.updateTaskStatus(task.taskId, "awaiting_confirmation");
@@ -1170,6 +1234,7 @@ export class Workspace {
       hooks,
       {
         priorSummary: `${await this.buildMissionPriorSummary(taskId)}\n\nThe user reviewed the mission and provided the following correction to address:\n\n${feedback}\n\nIncorporate this correction into a revised, improved strategy. Preserve completed work and continue from checkpoint evidence.`,
+        correction: feedback,
       },
     );
 
@@ -1196,12 +1261,19 @@ export class Workspace {
     const task = this.requireTask(taskId);
     if (this.activeTaskRuns.has(taskId)) {
       await this.appendUserMessageToMission(taskId, message);
+      const messageId = crypto.randomUUID();
       orchestratorMailbox.post({
-        id: crypto.randomUUID(),
+        id: messageId,
         taskId,
         from: "user",
         content: message,
         createdAt: new Date().toISOString(),
+      });
+      hooks.onEvent?.({
+        type: "queue-accepted",
+        messageId: messageId,
+        from: "user",
+        content: message,
       });
       const reply = "Queued — the orchestrator will review this message on its next event-loop tick and route it to the active work.";
       await this.appendOrchestratorReplyToMission(taskId, reply);
@@ -1215,6 +1287,12 @@ export class Workspace {
     // mission on this task instead of rejecting it as already running.
     if (task.status === "running") {
       await this.appendUserMessageToMission(taskId, message);
+      hooks.onEvent?.({
+        type: "queue-accepted",
+        messageId: crypto.randomUUID(),
+        from: "user",
+        content: message,
+      });
       if (await this.classifyMissionFollowup(message) === "resume") {
         const existingPlan = await this.getStoredPlan(taskId);
         if (!existingPlan) {
@@ -1239,6 +1317,12 @@ export class Workspace {
       return { kind: "task", plan: result.plan ?? { goal: task.prompt, subtasks: [] }, result };
     }
     await this.appendUserMessageToMission(taskId, message);
+    hooks.onEvent?.({
+      type: "queue-accepted",
+      messageId: crypto.randomUUID(),
+      from: "user",
+      content: message,
+    });
 
     if (task.status === "conversing") {
       const decision = await this.evaluateConversationalOnboarding(taskId, message, hooks);
@@ -1407,6 +1491,7 @@ export class Workspace {
       const gateway = new MeshGateway({
         apiKey: config.accessToken ?? process.env.MESH_API_KEY ?? undefined,
         modelMapping: config.preferredModels as any,
+        modelPreference: config.modelPreference ?? "balanced",
       });
       const messages: ChatMessage[] = [
         {
@@ -1455,6 +1540,7 @@ export class Workspace {
     const gateway = new MeshGateway({
       apiKey: config.accessToken ?? process.env.MESH_API_KEY ?? undefined,
       modelMapping: config.preferredModels as any,
+      modelPreference: config.modelPreference ?? "balanced",
     });
 
     hooks.onEvent?.({
@@ -1482,7 +1568,8 @@ Analyze the conversation history. Decide if:
 	   - Always leave room for an "Other" answer; never make the suggested options exhaustive unless you explicitly say that selecting Other is allowed.
 	   - Do not refer vaguely to "the previous one", "that", or "continue" without identifying exactly what it refers to. Ask only questions whose answers materially affect the plan.
 	   - If asking multiple questions, number them and ensure each one is independently answerable.
-2. You have a solid understanding and the request needs any real work to be carried out -> Choose action "prepare_plan" and reply stating you are preparing the plan. This is REQUIRED whenever fulfilling the request depends on an external action or live data: web search, browsing, reading/writing files, running commands, or any tool use. A single-step request (e.g. "find the cheapest flight") still needs an agent to run the tools, so it is "prepare_plan", NOT "direct_execute".
+	   2. You have a solid understanding and the request needs any real work to be carried out -> Choose action "prepare_plan" and reply stating you are preparing the plan. This is REQUIRED whenever fulfilling the request depends on an external action or live data: web search, browsing, reading/writing files, running commands, or any tool use. A single-step request (e.g. "find the cheapest flight") still needs an agent to run the tools, so it is "prepare_plan", NOT "direct_execute".
+	   This is the first clarification turn. For presentation, report, or other content-artifact requests, ask about the audience, purpose, tone/visual style, and speaker-note or depth requirements when they are not specified, because these materially affect the deliverable. Do not repeat details the user already gave, such as the topic, file format, or slide count. For purely mechanical requests with all material decisions specified, choose "prepare_plan" without unnecessary questions.
 3. You can FULLY answer the request right now, purely from your own knowledge, with no external action, no tool, and no live/current data -> Choose action "direct_execute" and write the complete answer in the "reply" field. You have no tools in this step, so never promise to "search", "look up", "gather", or "fetch" anything under this action — if you would need to, choose "prepare_plan" instead.
 
 When action is "direct_execute" and your answer contains code, a Markdown document, tabular data, or any renderable content, you MUST embed it using the viewer protocol below inside the "reply" string — do not paste raw code or long Markdown as plain text. The fenced yaaa-viewer block goes inside the "reply" value (JSON-escaped like any other string content).
@@ -1519,9 +1606,9 @@ You must respond with ONLY a JSON object:
     }
 
     return {
-      thought: "Failed to parse LLM response, falling back to prepare_plan.",
-      reply: "Understood. I will now prepare a plan for this mission.",
-      action: "prepare_plan",
+      thought: "The clarification response was invalid, so YAAA must pause and ask for the minimum material details instead of skipping clarification.",
+      reply: buildClarificationFallback(message),
+      action: "chat",
     };
   }
 
@@ -1608,6 +1695,7 @@ You must respond with ONLY a JSON object:
     const gateway = new MeshGateway({
       apiKey: config.accessToken ?? process.env.MESH_API_KEY ?? undefined,
       modelMapping: config.preferredModels as any,
+      modelPreference: config.modelPreference ?? "balanced",
     });
 
     hooks.onEvent?.({
@@ -1780,7 +1868,11 @@ Do not output any conversational text or JSON. Respond with ONLY the raw synthes
       workingDir,
       apiKey: config.accessToken ?? process.env.MESH_API_KEY ?? undefined,
       modelMapping: config.preferredModels ?? undefined,
+      modelPreference: config.modelPreference ?? "balanced",
       onEvent: (event) => {
+        if (event.type === "plan-updated" && !this.deletedTasks.has(taskId)) {
+          this.writeOrchestratorMd(taskDir, taskId, goal, "running", event.plan, []);
+        }
         if (!this.deletedTasks.has(taskId)) hooks.onEvent?.(event);
       },
       onApproval: hooks.onApproval
@@ -1808,18 +1900,18 @@ Do not output any conversational text or JSON. Respond with ONLY the raw synthes
         result.plan,
         ledger,
       );
-      const messages = await runtime.store.getMessages(taskId);
       if (this.deletedTasks.has(taskId)) throw new Error("Task was deleted.");
-      const agents = Array.from(
-        new Set(
-          messages
-            .filter((m: any) => m.from && String(m.from).includes("agent-"))
-            .map((m: any) => m.from),
-        ),
-      );
+      const agents = await this.getTaskAgents(taskId);
       fs.writeFileSync(
         path.join(taskDir, "agents"),
-        JSON.stringify(agents, null, 2),
+        JSON.stringify(
+          agents.map((agent) => ({
+            name: agent.displayName || agent.handle,
+            path: path.join(taskDir, ".yaaa", "agents", agent.id),
+          })),
+          null,
+          2,
+        ),
         "utf-8",
       );
       return result;
@@ -1863,10 +1955,11 @@ Do not output any conversational text or JSON. Respond with ONLY the raw synthes
     if (!apiKey || !text) return fallback;
 
     try {
-      const gateway = new MeshGateway({
-        apiKey,
-        modelMapping: config.preferredModels as any,
-      });
+    const gateway = new MeshGateway({
+      apiKey,
+      modelMapping: config.preferredModels as any,
+      modelPreference: config.modelPreference ?? "balanced",
+    });
       const resultTextRes = await gateway.chat(
         [
           {
@@ -1903,15 +1996,87 @@ Do not output any conversational text or JSON. Respond with ONLY the raw synthes
     content += `* **Updated At**: ${new Date().toISOString()}\n\n`;
 
     if (plan) {
+      if (plan.planningAnalysis) {
+        content += `## Detailed Implementation Goal\n\n`;
+        content += `${plan.planningAnalysis.implementationGoal}\n\n`;
+        content += `### Planning Decisions\n\n`;
+        content += `**Step decomposition:** ${plan.planningAnalysis.decompositionRationale}\n\n`;
+        content += `**Model policy:** ${plan.planningAnalysis.modelPolicy}\n\n`;
+        for (const review of plan.planningAnalysis.stepReviews ?? []) {
+          content += `#### ${review.subtaskId}\n\n`;
+          content += `- **Independent execution:** ${review.independentExecution ? "yes" : "no"}\n`;
+          content += `- **Dependency reasoning:** ${review.dependencyReason}\n`;
+          content += `- **Selected role:** \`${review.selectedRole}\`\n`;
+          content += `- **Role expectation:** ${review.roleExpectation}\n`;
+          content += `- **Selected model:** \`${review.selectedModel}\`\n`;
+          content += `- **Model reasoning:** ${review.modelReason}\n`;
+          content += `- **Role fit review:**\n`;
+          for (const role of review.consideredRoles ?? []) {
+            content += `  - ${role.relevant ? "✅" : "—"} \`${role.agentTemplate}\`: ${role.rationale}\n`;
+          }
+          content += `\n`;
+        }
+      }
       content += `${ORCHESTRATOR_MD_HEADERS.PLAN}\n`;
       content += `Goal: ${plan.goal}\n\n`;
+      content += `### Detailed Implementation Methodology\n\n`;
+      content += `${plan.methodology || "YAAA will execute the dependency graph, reassess evidence after every agent result, and correct the next assignment before proceeding."}\n\n`;
+      content += `### Execution Graph\n\n`;
+      for (const stage of plan.executionGraph ?? []) {
+        content += `- **Stage ${stage.stage} — ${stage.mode}**: ${stage.subtaskIds.join(", ")}\n`;
+        if (stage.rationale) content += `  - Rationale: ${stage.rationale}\n`;
+      }
+      content += `\n`;
       for (const subtask of plan.subtasks ?? []) {
         content += `- **[${subtask.id}]** ${subtask.title}\n`;
         content += `  - Capability: \`${subtask.capability}\`\n`;
+        content += `  - Agent role: \`${subtask.agentTemplate || "YAAA-selected specialist"}\`\n`;
+        if (subtask.routingReason) content += `  - Routing: ${subtask.routingReason}\n`;
+        if (subtask.model) content += `  - Model: \`${subtask.model}\`${subtask.modelReason ? ` — ${subtask.modelReason}` : ""}\n`;
         content += `  - Status: \`${subtask.state || "pending"}\`\n`;
         content += `  - Success Criteria: *${subtask.successCriteria}*\n`;
         if (subtask.dependsOn && subtask.dependsOn.length > 0) {
           content += `  - Dependencies: [${subtask.dependsOn.join(", ")}]\n`;
+        }
+        content += `\n`;
+      }
+      if (plan.verification) {
+        content += `### Verification Plan and Tool Limits\n\n`;
+        content += `- **Required**: ${plan.verification.required ? "yes" : "no"}\n`;
+        content += `- **Strategy**: ${plan.verification.strategy}\n`;
+        content += `- **Decision policy**: ${plan.verification.decisionPolicy}\n`;
+        for (const stage of plan.verification.stages ?? []) {
+          content += `- **${stage.id} — ${stage.kind}** (${stage.available ? "available" : "unavailable"})\n`;
+          content += `  - Targets: [${stage.targetSubtaskIds.join(", ")}]\n`;
+          content += `  - Capability: \`${stage.capability}\`; Method: ${stage.method}\n`;
+          if (stage.limitation) content += `  - Limitation: ${stage.limitation}\n`;
+          if (stage.fallback) content += `  - Fallback: ${stage.fallback}\n`;
+        }
+        for (const limitation of plan.verification.toolLimitations ?? []) {
+          content += `- Tool limitation: ${limitation}\n`;
+        }
+        content += `\n`;
+      }
+      if (plan.verificationFindings && plan.verificationFindings.length > 0) {
+        content += `### Verification Findings Reported to YAAA\n\n`;
+        for (const finding of plan.verificationFindings) {
+          content += `- **${finding.status.toUpperCase()} — ${finding.subtaskId} — ${finding.summary}**\n`;
+          content += `  - Agent: ${finding.agentId || "YAAA"}\n`;
+          for (const item of finding.findings) content += `  - Bug: ${item}\n`;
+          for (const item of finding.evidence) content += `  - Evidence: ${item}\n`;
+          for (const item of finding.limitations) content += `  - Limitation: ${item}\n`;
+          if (finding.resolution) content += `  - Resolution: ${finding.resolution}\n`;
+        }
+        content += `\n`;
+      }
+      if (plan.corrections && plan.corrections.length > 0) {
+        content += `### YAAA Reassessment and Corrections\n\n`;
+        for (const correction of plan.corrections) {
+          content += `- **${correction.timestamp} — ${correction.subtaskId} — ${correction.action}**\n`;
+          content += `  - Agent: ${correction.agentId || "YAAA"}\n`;
+          content += `  - Reason: ${correction.reason}\n`;
+          if (correction.nextAgentTemplate) content += `  - Next agent role: ${correction.nextAgentTemplate}\n`;
+          if (correction.nextModel) content += `  - Next model: ${correction.nextModel}\n`;
         }
         content += `\n`;
       }

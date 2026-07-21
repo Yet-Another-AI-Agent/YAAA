@@ -45,9 +45,11 @@ describe("agentWorkspace", () => {
       { id: "1", time: "10:00", source: "agent", content: "[@sage-1] searched the repository", kind: "activity" },
       { id: "2", time: "10:01", source: "agent", content: "[agent-builder] wrote a test", kind: "activity" },
       { id: "3", time: "10:02", source: "system", content: "mission started", kind: "system" },
+      { id: "4", time: "10:03", source: "orchestrator", content: "@sage-1 I received your failure report.", kind: "response" },
+      { id: "5", time: "10:04", source: "system", content: "[agent-lifecycle] @sage-1 started subtask-1", kind: "system" },
     ]);
 
-    expect(activity.map((log) => log.id)).toEqual(["1"]);
+    expect(activity.map((log) => log.id)).toEqual(["1", "4", "5"]);
   });
 
   it("orders working agents by their lifecycle message position", () => {

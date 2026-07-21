@@ -28,6 +28,12 @@ describe("renderMarkdown", () => {
     expect(items).toEqual(["one", "two", "three"]);
   });
 
+  it("renders ordered Markdown lists", () => {
+    const { container } = render(<>{renderMarkdown("1. one\n2. **two**")}</>);
+    expect(container.querySelectorAll("ol > li")).toHaveLength(2);
+    expect(container.querySelector("ol strong")?.textContent).toBe("two");
+  });
+
   it("groups consecutive plain lines into a single paragraph", () => {
     const { container } = render(<>{renderMarkdown("line one\nline two\n\nline three")}</>);
     const paragraphs = container.querySelectorAll("p");

@@ -85,9 +85,9 @@ export function resolveModelFromCatalog(
   const eligible = catalog.filter(isEligible);
   if (eligible.length === 0) {
     return {
-      model: requested,
+      model: fallbacks[0] || requested,
       reason: requested
-        ? `Mesh's catalog listed no tool-capable model, so YAAA kept the planner's choice of ${requested}.`
+        ? `Mesh's catalog was unavailable, so YAAA used the configured fallback ${fallbacks[0] || requested} instead of sending an unchecked model id.`
         : "Mesh's catalog listed no tool-capable model, so YAAA used the configured role default.",
     };
   }

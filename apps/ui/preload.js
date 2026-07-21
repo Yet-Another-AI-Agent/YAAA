@@ -44,6 +44,9 @@ contextBridge.exposeInMainWorld("electronAPI", {
   listMcpIntegrations: (taskId) => ipcRenderer.invoke("list-mcp-integrations", taskId),
   getPausedAgents: () => ipcRenderer.invoke("get-paused-agents"),
   getYaaaDir: () => ipcRenderer.invoke("get-yaaa-dir"),
+  getSettings: () => ipcRenderer.invoke("get-settings"),
+  saveModelPreference: (preference) => ipcRenderer.invoke("save-model-preference", preference),
+  openExternal: (url) => ipcRenderer.invoke("open-external", url),
   onTaskEvent: (callback) => {
     const subscription = (event, value) => callback(value);
     ipcRenderer.on("task-event", subscription);

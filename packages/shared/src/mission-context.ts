@@ -46,6 +46,8 @@ export interface AgentBriefInput {
   proofOfWorkPath?: string;
   /** Agent-authored handoff path expected at completion. */
   handOffPath?: string;
+  /** Live files found in the task workspace immediately before this brief. */
+  workspaceArtifactPaths?: string[];
 }
 
 /** ~1.5k tokens of dependency context by default. */
@@ -100,6 +102,7 @@ export function buildAgentBrief(input: AgentBriefInput): string {
     handsOnPath,
     proofOfWorkPath,
     handOffPath,
+    workspaceArtifactPaths = [],
   } = input;
 
   const sections: string[] = [];
@@ -148,6 +151,12 @@ export function buildAgentBrief(input: AgentBriefInput): string {
   } else {
     sections.push(
       `## Results from completed dependencies\nNone yet — this is an early step in the plan.`,
+    );
+  }
+
+  if (workspaceArtifactPaths.length > 0) {
+    sections.push(
+      `## Live workspace artifact inventory\nThe following files currently exist in the task workspace. These are authoritative current paths, not guesses from the original plan:\n${workspaceArtifactPaths.map((filePath) => `- \`${filePath}\``).join("\n")}`,
     );
   }
 
