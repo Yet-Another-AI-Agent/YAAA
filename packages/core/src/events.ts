@@ -1,4 +1,4 @@
-import type { TaskPlan, ArtifactRef, AgentRun } from "@yaaa/shared";
+import type { TaskPlan, ArtifactRef, AgentRun, RuntimeAction, AgentMessage } from "@yaaa/shared";
 
 /**
  * The structured event contract emitted by the core runtime.
@@ -12,9 +12,14 @@ export type RuntimeEvent =
   | { type: "plan-updated"; plan: TaskPlan }
   | { type: "thought"; from: string; content: string }
   | { type: "tool-requested"; from: string; content: string; metadata?: Record<string, unknown> }
+  | { type: "llm-context"; from: string; turn: number; model: string; messages: unknown[] }
+  | { type: "llm-response"; from: string; turn: number; model: string; content: string }
+  | { type: "action"; action: RuntimeAction }
   | { type: "agent-status"; agent: AgentRun }
   | { type: "status"; from: string; note: string }
+  | { type: "queue-accepted"; messageId: string; from: string; content: string }
   | { type: "result"; from: string; summary: string; artifacts: ArtifactRef[]; incomplete?: boolean }
+  | { type: "chat-message"; message: Extract<AgentMessage, { kind: "help_request" | "info_request" | "info_reply" }> }
   | { type: "complete"; result: TaskRunResult }
   | { type: "topic-updated"; taskId: string; topic: string };
 
@@ -51,6 +56,9 @@ export function mapBusEvent(
         ...(msg.incomplete ? { incomplete: true } : {}),
       };
     }
+    if (msg && (msg.kind === "help_request" || msg.kind === "info_request" || msg.kind === "info_reply")) {
+      return { type: "chat-message", message: msg };
+    }
     return null;
   }
 
@@ -81,6 +89,51 @@ export function mapBusEvent(
       from,
       content: msg?.content ?? "",
       ...(metadata ? { metadata } : {}),
+    };
+  }
+
+  if (topic.startsWith(`${base}.agent.`) && topic.endsWith(".llm_context")) {
+    const from = topic.split(".").find((p) => p.includes("agent-")) ?? msg?.from ?? "agent";
+    return {
+      type: "llm-context",
+      from,
+      turn: Number(msg?.turn ?? 0),
+      model: String(msg?.model ?? "unknown"),
+      messages: Array.isArray(msg?.messages) ? msg.messages : [],
+    };
+  }
+
+  if (topic.startsWith(`${base}.agent.`) && topic.endsWith(".llm_response")) {
+    const from = topic.split(".").find((p) => p.includes("agent-")) ?? msg?.from ?? "agent";
+    return {
+      type: "llm-response",
+      from,
+      turn: Number(msg?.turn ?? 0),
+      model: String(msg?.model ?? "unknown"),
+      content: String(msg?.content ?? ""),
+    };
+  }
+
+  if (topic.startsWith(`${base}.agent.`) && /\.action_(requested|started|approved|denied|completed|failed)$/.test(topic)) {
+    const status = topic.endsWith(".action_started") ? "started"
+      : topic.endsWith(".action_approved") ? "approved"
+        : topic.endsWith(".action_denied") ? "denied"
+          : topic.endsWith(".action_completed") ? "completed"
+            : topic.endsWith(".action_failed") ? "failed" : "requested";
+    return {
+      type: "action",
+      action: {
+        id: msg?.actionId,
+        taskId,
+        agentId: msg?.agentId ?? "agent",
+        capability: msg?.capability ?? "unknown",
+        method: msg?.method ?? "unknown",
+        args: msg?.args ?? {},
+        status,
+        timestamp: msg?.timestamp ?? new Date().toISOString(),
+        ...("result" in (msg ?? {}) ? { result: msg.result } : {}),
+        ...(typeof msg?.error === "string" ? { error: msg.error } : {}),
+      },
     };
   }
 

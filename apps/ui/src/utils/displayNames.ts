@@ -21,14 +21,6 @@ export function isOrchestratorSender(sender: string): boolean {
   return ORCHESTRATOR_RE.test((sender || "").trim());
 }
 
-// Gender-diverse first names. The pool is intentionally large so distinct
-// agents in one mission rarely collide.
-const FIRST_NAMES = [
-  "Mike", "Sarah", "Alex", "Priya", "Diego", "Mei", "Omar", "Lena",
-  "Raj", "Nina", "Theo", "Zoe", "Ivan", "Aria", "Kofi", "Yuki",
-  "Noah", "Elena", "Sam", "Farah",
-];
-
 // Roster template -> readable job title. Keys are the template role with a
 // trailing "agent" stripped, so both "ResearcherAgent" and "Researcher" match.
 const ROLE_LABELS: Record<string, string> = {
@@ -56,16 +48,6 @@ const CAPABILITY_ROLE_LABELS: Record<string, string> = {
   integration: "Integrations Engineer",
 };
 
-/** Stable non-negative hash for deterministic name selection. */
-function hashString(input: string): number {
-  let hash = 0;
-  for (let i = 0; i < input.length; i++) {
-    hash = (hash << 5) - hash + input.charCodeAt(i);
-    hash |= 0; // force 32-bit
-  }
-  return Math.abs(hash);
-}
-
 export interface AgentIdentity {
   /** Human first name, e.g. "Mike". */
   firstName: string;
@@ -88,7 +70,7 @@ function roleLabelFor(rawId: string, role?: string): string {
     const cap = capMatch[1].toLowerCase();
     if (CAPABILITY_ROLE_LABELS[cap]) return CAPABILITY_ROLE_LABELS[cap];
   }
-  return "Specialist Agent";
+  return "Agent";
 }
 
 /**
@@ -96,8 +78,10 @@ function roleLabelFor(rawId: string, role?: string): string {
  * deterministically from the id so it never changes between renders.
  */
 export function agentIdentity(rawId: string, role?: string, pokemonName?: string, handle?: string): AgentIdentity {
-  const seed = (rawId || "agent").toLowerCase();
-  const firstName = pokemonName || FIRST_NAMES[hashString(seed) % FIRST_NAMES.length];
+  // Unknown agents must not be invented as unrelated people (for example
+  // "Sam"). Persisted AgentRun.displayName is the only human name source;
+  // missing data gets a neutral label until the real agent record arrives.
+  const firstName = pokemonName?.trim() || "Agent";
   const roleLabel = roleLabelFor(rawId, role);
   return {
     firstName,

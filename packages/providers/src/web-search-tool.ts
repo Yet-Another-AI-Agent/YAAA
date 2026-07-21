@@ -25,12 +25,14 @@ interface UiSearchOptions extends Required<Pick<SearchOptions, "limit">> {
 
 type UiSearcher = (query: string, options: UiSearchOptions) => Promise<SearchResult[]>;
 
-function attachScreenshotPath(results: SearchResult[], screenshotPath: string): SearchResult[] {
+type SearchResultsWithScreenshot = SearchResult[] & { screenshotPath?: string };
+
+function attachScreenshotPath(results: SearchResult[], screenshotPath: string): SearchResultsWithScreenshot {
   Object.defineProperty(results, "screenshotPath", {
     value: screenshotPath,
     enumerable: false,
   });
-  return results;
+  return results as SearchResultsWithScreenshot;
 }
 
 function normalizeResults(results: SearchResult[], limit: number): SearchResult[] {
@@ -119,7 +121,11 @@ export class WebSearchTool {
           time: options.time,
           timeoutMs: 20_000,
         });
-        if (results.length > 0) return normalizeResults(results, limit);
+        if (results.length > 0) {
+          const normalized = normalizeResults(results, limit);
+          const screenshotPath = (results as SearchResultsWithScreenshot).screenshotPath;
+          return screenshotPath ? attachScreenshotPath(normalized, screenshotPath) : normalized;
+        }
         errors.push("UI search returned no results");
       } catch (error: any) {
         errors.push(error?.message ?? String(error));

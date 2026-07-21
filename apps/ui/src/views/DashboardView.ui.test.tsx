@@ -745,7 +745,7 @@ describe("DashboardView", () => {
       expect(continueMission).not.toHaveBeenCalled();
     });
 
-    it("renders suggested options as checkboxes and includes Other text", () => {
+    it("renders suggested options as radio buttons and includes Other text", () => {
       const continueMission = vi.fn();
       render(<DashboardView viewModel={makeViewModel({
         taskId: "task-1",
@@ -765,6 +765,56 @@ describe("DashboardView", () => {
 
       expect(continueMission).toHaveBeenCalledWith(expect.stringContaining("PowerPoint"), expect.anything());
       expect(continueMission.mock.calls[0][0]).toContain("Other: A branded version");
+    });
+
+    it("renders Markdown in options and turns a Markdown-only Other option into a textarea", () => {
+      render(<DashboardView viewModel={makeViewModel({
+        taskId: "task-1",
+        logs: [{
+          id: "q-markdown-options",
+          time: "10:00",
+          source: "orchestrator",
+          kind: "response",
+          content: "Which output?\nOptions:\n- **PowerPoint**\n- **Other**",
+        }],
+      })} />);
+
+      expect(screen.getByLabelText("PowerPoint").getAttribute("type")).toBe("radio");
+      expect(screen.getByText("PowerPoint").tagName).toBe("STRONG");
+      expect(screen.getByPlaceholderText("Type your answer...")).toBeTruthy();
+    });
+
+    it("shows the textarea when Other includes please specify punctuation", () => {
+      render(<DashboardView viewModel={makeViewModel({
+        taskId: "task-1",
+        logs: [{
+          id: "q-other-specify",
+          time: "10:00",
+          source: "orchestrator",
+          kind: "response",
+          content: "What is the target audience?\nOptions:\n- General public\n- Other (please specify).",
+        }],
+      })} />);
+
+      fireEvent.click(screen.getByLabelText("Other"));
+      expect(screen.getByPlaceholderText("Type your answer...")).toBeTruthy();
+    });
+
+    it("treats a labeled prompt as a question instead of a radio option", () => {
+      render(<DashboardView viewModel={makeViewModel({
+        taskId: "task-1",
+        logs: [{
+          id: "q-labeled-prompt",
+          time: "10:00",
+          source: "orchestrator",
+          kind: "response",
+          content: "I can help with that. Please provide a few details?\n- Target Audience: Who is the primary audience for this slideshow video? Knowing this will help tailor the language.\n- General public\n- Aquarium hobbyists\n- Other (please specify).",
+        }],
+      })} />);
+
+      expect(screen.queryByLabelText("Target Audience: Who is the primary audience for this slideshow video? Knowing this will help tailor the language.")).toBeNull();
+      expect(screen.getByText(/Target Audience: Who is the primary audience/)).toBeTruthy();
+      expect(screen.getByLabelText("General public").getAttribute("type")).toBe("radio");
     });
 
     it("infers checkbox options when the AI puts an either-or choice in the question", () => {

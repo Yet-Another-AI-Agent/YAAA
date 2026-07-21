@@ -37,4 +37,19 @@ describe("WebSearchTool", () => {
       timeoutMs: 20_000,
     });
   });
+
+  it("preserves the search-page screenshot path while normalizing results", async () => {
+    const results = [
+      { title: "Search result", url: "https://example.com", description: "Example" },
+    ] as Array<{ title: string; url: string; description: string }> & { screenshotPath?: string };
+    Object.defineProperty(results, "screenshotPath", {
+      value: "/tmp/yaaa-tool-previews/search.png",
+      enumerable: false,
+    });
+    const tool = new WebSearchTool([vi.fn().mockResolvedValue(results)]);
+
+    const normalized = await tool.search("example");
+
+    expect((normalized as typeof results).screenshotPath).toBe("/tmp/yaaa-tool-previews/search.png");
+  });
 });

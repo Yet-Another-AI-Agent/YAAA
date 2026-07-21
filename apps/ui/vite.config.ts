@@ -5,9 +5,7 @@ import react from '@vitejs/plugin-react'
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
-  // Vitest consumes this extension at test time; Vite's own type does not
-  // declare it, so keep the config on the app's single Vite type instance.
-  // @ts-expect-error Vitest augments Vite config with the `test` property.
+  // The Vitest type reference above augments Vite's config with `test`.
   test: {
     setupFiles: ['./src/testSetup.ts'],
   },

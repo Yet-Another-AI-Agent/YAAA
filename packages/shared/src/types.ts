@@ -114,6 +114,95 @@ export interface MentionRoute {
 export interface TaskPlan {
   goal: string;
   subtasks: Subtask[];
+  /** Structured planning decisions shown in YAAA's implementation ledger. */
+  planningAnalysis?: PlanningAnalysis;
+  /** Detailed explanation of how YAAA will execute the work. */
+  methodology?: string;
+  /** Dependency-derived stages; subtasks in one parallel stage may run together. */
+  executionGraph?: PlanExecutionStage[];
+  /** Durable reassessment/correction history written after agent results. */
+  corrections?: PlanCorrection[];
+  /** Explicit verification strategy and known limits of the selected tools. */
+  verification?: VerificationPlan;
+  /** Findings reported by independent verification agents back to YAAA. */
+  verificationFindings?: VerificationFinding[];
+}
+
+export interface PlanningAnalysis {
+  implementationGoal: string;
+  decompositionRationale: string;
+  modelPolicy: string;
+  stepReviews: PlanningStepReview[];
+}
+
+export interface PlanningStepReview {
+  subtaskId: string;
+  independentExecution: boolean;
+  dependencyReason: string;
+  consideredRoles: PlanningRoleAssessment[];
+  selectedRole: string;
+  roleExpectation: string;
+  selectedModel: string;
+  modelReason: string;
+}
+
+export interface PlanningRoleAssessment {
+  agentTemplate: string;
+  relevant: boolean;
+  rationale: string;
+}
+
+/** User-controlled quality/cost policy applied to YAAA and every sub-agent. */
+export type ModelPreference = "sota" | "balanced" | "cost-effective";
+
+export interface PlanExecutionStage {
+  stage: number;
+  mode: "sequential" | "parallel";
+  subtaskIds: string[];
+  rationale?: string;
+}
+
+export interface PlanCorrection {
+  id: string;
+  timestamp: string;
+  subtaskId: string;
+  agentId?: string;
+  action: string;
+  reason: string;
+  nextAgentTemplate?: string;
+  nextModel?: string;
+}
+
+export interface VerificationPlan {
+  required: boolean;
+  strategy: string;
+  stages: VerificationStage[];
+  toolLimitations: string[];
+  decisionPolicy: string;
+}
+
+export interface VerificationStage {
+  id: string;
+  kind: "artifact" | "automated" | "visual" | "research";
+  targetSubtaskIds: string[];
+  capability: "files" | "shell" | "browser" | "verify" | "docs";
+  method: string;
+  available: boolean;
+  limitation?: string;
+  fallback?: string;
+}
+
+export interface VerificationFinding {
+  id: string;
+  timestamp: string;
+  subtaskId: string;
+  agentId?: string;
+  status: "open" | "resolved" | "accepted";
+  summary: string;
+  findings: string[];
+  evidence: string[];
+  limitations: string[];
+  resolution?: string;
 }
 
 export interface Subtask {
@@ -161,4 +250,53 @@ export interface LedgerEntry {
   assumptions: string[];
   subtaskStates: Record<string, "pending" | "running" | "completed" | "failed">;
   nextStepStrategy: string;
+}
+
+/** Durable append-only record for every runtime event, not only UI messages. */
+export interface RuntimeEvent {
+  id: string;
+  taskId: string;
+  topic: string;
+  timestamp: string;
+  payload: unknown;
+  /** Optional correlation fields used to reconstruct a run or agent turn. */
+  agentId?: string;
+  runId?: string;
+  parentEventId?: string;
+}
+
+export type QueueName = "orchestrator" | "agent";
+export type QueueItemStatus = "pending" | "leased" | "done";
+
+/** Generic durable work item. Payloads stay typed at the queue boundary. */
+export interface QueueItem {
+  id: string;
+  taskId: string;
+  queue: QueueName;
+  recipientId?: string;
+  payload: unknown;
+  createdAt: string;
+  availableAt: string;
+  attempts: number;
+}
+
+export interface QueueClaim {
+  item: QueueItem;
+  leaseId: string;
+  leasedUntil: string;
+}
+
+export type RuntimeActionStatus = "requested" | "started" | "approved" | "denied" | "completed" | "failed";
+
+export interface RuntimeAction {
+  id: string;
+  taskId: string;
+  agentId: string;
+  capability: string;
+  method: string;
+  args: Record<string, unknown>;
+  status: RuntimeActionStatus;
+  timestamp: string;
+  result?: unknown;
+  error?: string;
 }

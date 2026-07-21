@@ -71,6 +71,7 @@ function TypingText({ text, onComplete }: { text: string; onComplete?: () => voi
 
 interface DashboardViewProps {
   viewModel: TaskViewModel;
+  onOpenSettings?: () => void;
 }
 
 function getGreeting(): string {
@@ -79,6 +80,12 @@ function getGreeting(): string {
   if (hour >= 12 && hour < 17) return "Good Afternoon";
   if (hour >= 17 && hour < 21) return "Good Evening";
   return "Good Night";
+}
+
+function orchestratorModelForPreference(preference?: "sota" | "balanced" | "cost-effective"): string {
+  if (preference === "sota") return "anthropic/claude-sonnet-4.5";
+  if (preference === "cost-effective") return "google/gemini-2.5-pro-preview";
+  return "google/gemini-3.1-pro-preview";
 }
 
 const SUGGESTION_CHIPS = [
@@ -161,15 +168,40 @@ function inferInlineOptions(question: string): string[] {
   return first && second ? [first, second] : [];
 }
 
+function isOtherOption(option: string): boolean {
+  // Models sometimes emphasize the option in Markdown (for example,
+  // `- **Other**`). Compare a plain-text form while keeping the original
+  // Markdown for display.
+  const plain = option
+    .replace(/[`*_~]/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/[.!?]+$/, "")
+    .trim();
+  return /^others?\s*(?:\([^)]*\))?$/i.test(plain);
+}
+
+function isLabeledQuestion(text: string): boolean {
+  const separator = text.indexOf(":");
+  if (separator < 1) return false;
+  const prompt = text.slice(separator + 1).trim();
+  return /^(?:who|what|which|when|where|why|how|would|could|can|do|does|did|is|are|will|should|please)\b/i.test(prompt);
+}
+
 function extractClarifyingQuestions(content: string): ClarifyingQuestion[] {
   const lines = content
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
   const questions: ClarifyingQuestion[] = [];
+  const hasStructuredItems = lines.some((line) => /^\s*(?:[-*]|\d+[.)])\s+/.test(line));
   for (const line of lines) {
+    const isListItem = /^\s*(?:[-*]|\d+[.)])\s+/.test(line);
     const text = line.replace(/^\s*(?:[-*]|\d+[.)])\s+/, "").trim();
-    if (/\?\s*$/.test(text)) {
+    const isQuestion = /\?\s*$/.test(text) || isLabeledQuestion(text);
+    // Unbulleted prose is often an introductory sentence. When a structured
+    // list follows it, only the list's question prompts should become form
+    // questions; the introduction must never become a radio option/question.
+    if (isQuestion && (isListItem || !hasStructuredItems)) {
       questions.push({ question: text, options: [] });
       continue;
     }
@@ -185,8 +217,19 @@ function extractClarifyingQuestions(content: string): ClarifyingQuestion[] {
     if (seen.has(item.question)) return false;
     seen.add(item.question);
     if (item.options.length === 0) item.options = inferInlineOptions(item.question);
+    // “Other” is a radio choice when combined with real choices, but when it
+    // is the only option the question becomes a plain free-text field.
+    const hasOther = item.options.some(isOtherOption);
+    const regularOptions = item.options.filter((option) => !isOtherOption(option));
+    item.options = regularOptions.length > 0 && hasOther ? [...regularOptions, "Other"] : regularOptions;
     return true;
   }).slice(0, 8);
+}
+
+function isExplicitClarification(content: string): boolean {
+  return /(?:^|\n)\s*(?:need\s+(?:a\s+few\s+)?clarifications?|clarifying questions?|questions for you|follow-up questions?)\s*:?/i.test(content)
+    || /(?:^|\n)\s*options\s*:/i.test(content)
+    || extractClarifyingQuestions(content).some((item) => inferInlineOptions(item.question).length > 0);
 }
 
 function extractQuestionItems(content: string): string[] {
@@ -202,7 +245,7 @@ function QuestionCarousel({
 }) {
   const questions = useMemo(() => extractClarifyingQuestions(content), [content]);
   const [index, setIndex] = useState(0);
-  const [selectedOptions, setSelectedOptions] = useState<Record<number, string[]>>({});
+  const [selectedOptions, setSelectedOptions] = useState<Record<number, string>>({});
   const [otherAnswers, setOtherAnswers] = useState<Record<number, string>>({});
   // Answers go to the orchestrator as a chat message, which cannot be recalled.
   // Once sent, the form is spent: it stays visible as a record of what was
@@ -212,10 +255,10 @@ function QuestionCarousel({
 
   if (questions.length === 0) return null;
 
-  const currentOptions = selectedOptions[index] ?? [];
+  const currentOption = selectedOptions[index] ?? "";
   const currentOther = otherAnswers[index] ?? "";
   const answeredCount = questions.filter((_, questionIndex) =>
-    (selectedOptions[questionIndex]?.length ?? 0) > 0 || Boolean(otherAnswers[questionIndex]?.trim()),
+    Boolean(selectedOptions[questionIndex]) || Boolean(otherAnswers[questionIndex]?.trim()),
   ).length;
   const canSubmit = answeredCount > 0 && !submitted;
   const currentQuestion = questions[index];
@@ -226,7 +269,7 @@ function QuestionCarousel({
     const body = questions
       .map((question, questionIndex) => {
         const answer = [
-          ...(selectedOptions[questionIndex] ?? []),
+          selectedOptions[questionIndex] ?? "",
           otherAnswers[questionIndex]?.trim() ? `Other: ${otherAnswers[questionIndex].trim()}` : "",
         ].filter(Boolean).join("; ");
         return answer ? `Q: ${question.question}\nA: ${answer}` : "";
@@ -250,35 +293,34 @@ function QuestionCarousel({
       <div className="question-carousel-question">{renderMarkdown(currentQuestion.question)}</div>
       {currentQuestion.options.length > 0 && (
         <fieldset className="question-carousel-options" disabled={submitted}>
-          <legend>Select one or more options</legend>
+          <legend>Select one option</legend>
           {currentQuestion.options.map((option) => (
             <label className="question-carousel-option" key={option}>
               <input
-                type="checkbox"
-                checked={currentOptions.includes(option)}
-                onChange={() => setSelectedOptions((prev) => ({
-                  ...prev,
-                  [index]: currentOptions.includes(option)
-                    ? currentOptions.filter((value) => value !== option)
-                    : [...currentOptions, option],
-                }))}
+                type="radio"
+                name={`question-${index}`}
+                value={option}
+                checked={currentOption === option}
+                onChange={() => setSelectedOptions((prev) => ({ ...prev, [index]: option }))}
               />
-              <span>{option}</span>
+              <span>{renderMarkdown(option)}</span>
             </label>
           ))}
         </fieldset>
       )}
-      <label className="question-carousel-other-label">
-        Other (optional)
-        <textarea
-          className="question-carousel-answer"
-          value={currentOther}
-          placeholder={submitted ? "" : "Type your answer..."}
-          disabled={submitted}
-          readOnly={submitted}
-          onChange={(event) => setOtherAnswers((prev) => ({ ...prev, [index]: event.target.value }))}
-        />
-      </label>
+      {(currentQuestion.options.length === 0 || currentOption === "Other") && (
+        <label className="question-carousel-other-label">
+          {currentQuestion.options.length === 0 ? "Your answer" : "Other"}
+          <textarea
+            className="question-carousel-answer"
+            value={currentOther}
+            placeholder={submitted ? "" : "Type your answer..."}
+            disabled={submitted}
+            readOnly={submitted}
+            onChange={(event) => setOtherAnswers((prev) => ({ ...prev, [index]: event.target.value }))}
+          />
+        </label>
+      )}
       <div className="question-carousel-actions">
         <button
           type="button"
@@ -618,7 +660,11 @@ function isPreviewableArtifact(artPath: string): boolean {
   return Boolean(inferViewerKind(artPath)) || /\.(mmd|mermaid|png|jpe?g|gif|webp|svg)$/i.test(artPath);
 }
 
-export function DashboardView({ viewModel }: DashboardViewProps) {
+function isInternalAgentDocument(artPath: string): boolean {
+  return /(?:^|\/)(?:handsOn|handOff|proofOfWork|incompleteWork)\.md$/i.test(artPath);
+}
+
+export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps) {
   const {
     goal,
     setGoal,
@@ -667,6 +713,13 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   const [loadingHistory, setLoadingHistory] = useState(false);
   const activeHistoryRequestRef = useRef<string | null>(null);
   const [typedMessageIds, setTypedMessageIds] = useState<Set<string>>(new Set());
+  const [orchestratorModel, setOrchestratorModel] = useState(orchestratorModelForPreference());
+
+  useEffect(() => {
+    TaskModel.getSettings()
+      .then((settings) => setOrchestratorModel(orchestratorModelForPreference(settings.modelPreference)))
+      .catch(() => {});
+  }, []);
 
   const handleTypeComplete = (id: string) => {
     setTypedMessageIds((prev) => {
@@ -884,7 +937,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     if (raw.toLowerCase() === "user") return "User";
     if (raw === "User" || raw === "System" || raw === "Agent") return raw;
     const a = resolveAgent(raw);
-    if (a) return agentIdentity(a.id, a.role, a.pokemonName, a.handle).display;
+    if (a) return agentIdentity(a.id, a.role, a.displayName, a.handle).display;
     return displaySender(raw);
   };
 
@@ -990,7 +1043,9 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
           setArtifactPreview({ path: artPath, content: "", kind, dataUrl: binary.dataUrl });
         }
       } else {
-        const content = await TaskModel.readArtifact(activeTaskId, artPath);
+        const content = artPath === "orchestrator.md"
+          ? await TaskModel.readTaskOrchestrator(activeTaskId)
+          : await TaskModel.readArtifact(activeTaskId, artPath);
         if (activeArtifactRequestRef.current !== requestId) return;
         if (content === null) {
           setArtifactPreviewError("Could not read this file.");
@@ -1174,9 +1229,15 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
         } else if (msg.kind === "approval_request") {
           content = `Requested approval for tool execution: ${msg.action?.capability}.${msg.action?.method}`;
         } else if (msg.kind === "info_request") {
-          content = msg.question;
+          content = msg.from === "orchestrator"
+            ? `@${String(msg.to || "agent").replace(/^@/, "")} ${msg.question}`
+            : `@yaaa ${msg.question}`;
         } else if (msg.kind === "info_reply") {
-          content = msg.answer;
+          content = msg.from === "orchestrator"
+            ? `@${String(msg.to || "agent").replace(/^@/, "")} ${String(msg.answer || "").replace(/^@[^\s]+\s*/, "")}`
+            : `@yaaa ${msg.answer}`;
+        } else if (msg.kind === "help_request") {
+          content = `@yaaa ${msg.problem}`;
         } else {
           content = typeof msg.data === "string" ? msg.data : JSON.stringify(msg);
         }
@@ -1188,9 +1249,13 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
         const isPersistedChatTurn =
           msg.kind === "thought" &&
           (msg.from === "user" || msg.from === "orchestrator");
+        const isAgentChatTurn = ["help_request", "info_request", "info_reply"].includes(msg.kind);
         const isPlanProposal = content.startsWith("[plan-proposal]");
         if (isPlanProposal) {
           content = content.replace(/^\[plan-proposal\]\s*/, "");
+          // Historical plan messages can carry the old generic `Agent` sender;
+          // the implementation strategy is always authored by YAAA.
+          sender = ORCHESTRATOR_DISPLAY;
         }
 
         displayMessages.push({
@@ -1200,7 +1265,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
           content,
           kind: isPlanProposal
             ? "plan_proposal"
-            : isPersistedChatTurn
+            : isPersistedChatTurn || isAgentChatTurn
               ? "response"
             : msg.kind === "thought"
               ? "thinking"
@@ -1217,7 +1282,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
           // Sub-agent tool activity belongs to that agent's channel, but
           // lightweight thinking should still stream into the mission so the
           // user can see progress while a long run is active.
-          if (log.source === "agent" && log.kind !== "thinking") return;
+          if (log.source === "agent" && log.kind === "activity") return;
 
           let sender = "Agent";
           if (log.source === "system") sender = "System";
@@ -1228,6 +1293,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
           const isPlanProposal = content.startsWith("[plan-proposal]");
           if (isPlanProposal) {
             content = content.replace(/^\[plan-proposal\]\s*/, "");
+            sender = ORCHESTRATOR_DISPLAY;
           }
           const agentMatch = log.content.match(/^\[([^\]]+)\] (.*)/);
           if (agentMatch) {
@@ -1274,6 +1340,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
     
     const displayArtifacts = selectedTaskId
       ? [
+          { path: "orchestrator.md", mimeType: "text/markdown", description: "YAAA implementation strategy and execution ledger." },
           ...(selectedMissionSnapshot?.plan?.subtasks || []).flatMap((subtask: any) => subtask.artifacts || []),
           ...historyMessages.reduce((acc: any[], m) => {
           if (m.kind === "result" && m.artifacts) {
@@ -1281,8 +1348,8 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
           }
           return acc;
           }, []),
-        ].filter((artifact, index, all) => all.findIndex((candidate) => candidate.path === artifact.path) === index)
-      : artifacts;
+        ].filter((artifact, index, all) => !isInternalAgentDocument(String(artifact.path || "")) && all.findIndex((candidate) => candidate.path === artifact.path) === index)
+      : artifacts.filter((artifact: any) => !isInternalAgentDocument(String(artifact.path || "")));
 
     const currentStatus = selectedTaskId
       ? (selectedMissionSnapshot?.task.status || selectedTask?.status || parsedOrchestrator.status)
@@ -1324,9 +1391,9 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
   // hardcoded fake Slack/GitHub/Web-Search "connected" list.
   const activeCapabilities = Array.from(new Set(displaySubtasks.map((st) => st.capability).filter(Boolean)));
 
-  // Each spawned agent runs in its own sub-thread. While the agent is running
-  // the main card shows YAAA's hands-on assignment; the agent-authored handoff
-  // only appears after the agent has produced completion evidence.
+  // Each spawned sub-agent runs in its own sub-thread. The main surface shows
+  // only YAAA's assignment and the relevant result; internal work documents
+  // remain available to the runtime on disk.
   const missionThreads = useMemo(() => {
     return visibleAgents.map((agent) => {
       const subtask = displaySubtasks.find((s: any) => s.id === agent.subtaskId);
@@ -1337,20 +1404,8 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
         assignmentParts.push(`Success criteria: ${(subtask as any).successCriteria}`);
       }
       const assignment = assignmentParts.join("\n\n") || "Assignment briefing pending.";
-      const subtaskArtifacts = ((subtask as any)?.artifacts || []) as Array<{ path?: string; description?: string; mimeType?: string }>;
-      const agentWorkspacePrefix = `agent-workspaces/${agent.id}/`;
-      const artifacts = [...subtaskArtifacts, ...displayArtifacts].filter((artifact, index, all) => {
-        const path = String(artifact.path || "");
-        return path.startsWith(agentWorkspacePrefix) && all.findIndex((candidate) => candidate.path === artifact.path) === index;
-      });
-      const handsOnArtifact = artifacts.find((artifact) => /(?:^|\/)handsOn\.md$/i.test(String(artifact.path || "")));
-      const handOffArtifact = artifacts.find((artifact) => /(?:^|\/)handOff\.md$/i.test(String(artifact.path || "")));
-      const proofArtifact = artifacts.find((artifact) => /(?:^|\/)proofOfWork\.md$/i.test(String(artifact.path || "")));
-      const handoffReady = ["completed", "failed", "exited"].includes(agent.status) && Boolean(agent.summary || handOffArtifact);
-      const workspace = agentWorkspaces[agent.id];
-      const handoff = agent.summary || workspace?.files.handOff || (handOffArtifact ? `${handOffArtifact.path}\n\n${handOffArtifact.description || "Agent handoff artifact ready."}` : "");
-      const handsOn = workspace?.files.handsOn || assignment;
-      return { agent, subtask, activity, assignment: handsOn, handoff, handoffReady, handsOnArtifact, handOffArtifact, proofArtifact };
+      const result = agent.summary || (subtask as any)?.result || "";
+      return { agent, subtask, activity, assignment, result };
     }).sort((a, b) => getAgentMessageOrderIndex(a.agent, logs) - getAgentMessageOrderIndex(b.agent, logs));
   }, [visibleAgents, displaySubtasks, displayArtifacts, logs, agentWorkspaces]);
 
@@ -1443,14 +1498,9 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
 
   // One collapsed card per spawned sub-agent: the assignment/handoff document
   // opens in the viewer, and "View channel" opens that agent's full sub-channel.
-  const renderMissionThreadCard = ({ agent, activity, assignment, handoff, handoffReady, handsOnArtifact, handOffArtifact }: (typeof missionThreads)[number]) => {
+  const renderMissionThreadCard = ({ agent, activity, result, assignment }: (typeof missionThreads)[number]) => {
     const identity = labelForSender(agent.id);
-    const documentTitle = handoffReady ? "Handoff document" : "handsOn assignment";
-    const documentHeading = handoffReady
-      ? `${identity} → ${ORCHESTRATOR_DISPLAY} · Handoff`
-      : `${ORCHESTRATOR_DISPLAY} → ${identity} · handsOn`;
-    const documentBody = handoffReady ? handoff : assignment;
-    const documentArtifact = handoffReady ? handOffArtifact : handsOnArtifact;
+    const resultText = result || (agent.status === "working" ? `YAAA assigned ${identity} to: ${assignment}` : "No result summary reported yet.");
     return (
       <div className="mission-thread-card" key={`card-${agent.id}`}>
         <div className="slack-message-avatar mission-thread-avatar">
@@ -1461,26 +1511,10 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
             <span className="mission-thread-name">{identity}</span>
             <span className={`detail-status-pill ${agent.status}`}>{agent.status}</span>
           </div>
-          <button
-            type="button"
-            className="mission-thread-handoff mission-thread-handoff-open"
-            title={`Open ${documentTitle}`}
-            onClick={() =>
-              setViewerModal({
-                type: "markdown",
-                source: documentArtifact?.path
-                  ? { path: documentArtifact.path }
-                  : { content: `# ${documentHeading}\n\n${documentBody}` },
-                display: "popup",
-                title: documentTitle,
-              })
-            }
-          >
-            <span className="mission-thread-handoff-label">
-              {handoffReady ? `${identity} handoff · open →` : `${ORCHESTRATOR_DISPLAY} handsOn · open →`}
-            </span>
-            <div className="mission-thread-handoff-text">{documentBody}</div>
-          </button>
+          <div className="mission-thread-handoff mission-thread-result">
+            <span className="mission-thread-handoff-label">Relevant result</span>
+            <div className="mission-thread-handoff-text">{resultText}</div>
+          </div>
         </div>
         <button
           type="button"
@@ -1663,16 +1697,16 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
               className="icon-btn"
               title="API key settings"
               aria-label="API key settings"
-              onClick={() => setApiKeyPrompt("manual")}
+              onClick={() => onOpenSettings?.() ?? setApiKeyPrompt("manual")}
             >
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <circle cx="12" cy="12" r="3"/>
                 <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
               </svg>
             </button>
-            <div className="avatar-btn" title={userName || "User"} aria-label="User profile">
+            <button type="button" className="avatar-btn" title={userName || "User settings"} aria-label="User profile" onClick={() => onOpenSettings?.()}>
               K
-            </div>
+            </button>
           </div>
         </div>
 
@@ -1800,8 +1834,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                   const questionItems = senderLabel !== "User" ? extractQuestionItems(msg.content) : [];
                   const looksLikeClarification =
                     msg.kind === "info_request" ||
-                    questionItems.length >= 2 ||
-                    /\b(?:clarify|clarification|need a few|quick questions|follow-up questions)\b/i.test(msg.content);
+                    (questionItems.length > 0 && isExplicitClarification(msg.content));
                   const canAnswerQuestions =
                     !msg.isHistorical &&
                     msg.kind !== "plan_proposal" &&
@@ -1822,9 +1855,16 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                             <span className="slack-message-time">{msg.time}</span>
                           </div>
                           <div className="slack-message-bubble slack-message-response">
-                            <div className="slack-message-text">
+                          <div className="slack-message-text">
                               <strong>Implementation strategy proposed</strong>
                               <p>{msg.content}</p>
+                              <button
+                                type="button"
+                                className="artifact-inline-link"
+                                onClick={() => handlePreviewArtifact("orchestrator.md")}
+                              >
+                                Open implementation strategy
+                              </button>
                               {displaySubtasks.length > 0 && (
                                 <ol>
                                   {displaySubtasks.map((subtask: any) => (
@@ -2005,7 +2045,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                 <div className="agent-space-heading">Named agents, execution state, and activity</div>
                 {agents.length === 0 ? (
                   <div className="agent-space-note">
-                    Confirm the plan to create the specialist agents assigned to this mission.
+                    Confirm the plan so YAAA can create the sub-agents assigned to this mission.
                   </div>
                 ) : (
                   <>
@@ -2021,14 +2061,14 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                         </div>
                         <span className="detail-status-pill completed">completed</span>
                       </summary>
-                      <div className="agent-space-block-text">Model: {formatModelLabel("google/gemini-2.5-pro")} (planner)</div>
+                      <div className="agent-space-block-text">Model: {formatModelLabel(orchestratorModel)} (planner)</div>
                       <div className="agent-space-block-text agent-space-block-note">Gemini Pro coordinates the mission plan; bounded agent work defaults to the lower-cost Gemini Flash model.</div>
                       <div className="agent-space-block-text">Assigned to: Lead Orchestration</div>
                       <div className="agent-space-block-text">Context window: {estimateOrchestratorUsedTokens(logs, goal).toLocaleString()} / 1,000,000 tokens used</div>
                     </details>
                     {agents.map((agent) => {
                       const agentActivity = getAgentActivity(agent, logs);
-                      const identity = agentIdentity(agent.id, agent.role, agent.pokemonName, agent.handle);
+                      const identity = agentIdentity(agent.id, agent.role, agent.displayName, agent.handle);
                       return (
                       <details className="agent-space-block" key={agent.id}>
                         <summary className="agent-space-block-label">
@@ -2106,11 +2146,11 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                       <div className="mission-team-identity">
                         <span className="mission-team-handle">{ORCHESTRATOR_DISPLAY} · {ORCHESTRATOR_MENTION}</span>
                         <span className="mission-team-role">{ORCHESTRATOR_ROLE_LABEL} · {estimateOrchestratorUsedTokens(logs, goal).toLocaleString()} / 1M tokens</span>
-                        <span className="mission-team-model">{formatModelLabel("google/gemini-2.5-pro")}</span>
+                        <span className="mission-team-model">{formatModelLabel(orchestratorModel)}</span>
                       </div>
                     </div>
                     {agents.map((agent) => {
-                      const identity = agentIdentity(agent.id, agent.role, agent.pokemonName, agent.handle);
+                      const identity = agentIdentity(agent.id, agent.role, agent.displayName, agent.handle);
                       return (
                       <div className="mission-team-member" key={agent.id}>
                         <span className={`mission-team-status ${agent.status}`} aria-label={agent.status} />
@@ -2129,7 +2169,7 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                     })}
                   </div>
                   {agents.length === 0 ? (
-                    <div className="slack-section-empty">Specialist agents will join after the plan is confirmed.</div>
+                    <div className="slack-section-empty">YAAA will add sub-agents after the plan is confirmed.</div>
                   ) : null}
                 </div>
 
@@ -2505,57 +2545,9 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
             </div>
             <div className="artifact-preview-body">
               <div className="thread-section">
-                <div className="thread-section-title">
-                  {ORCHESTRATOR_DISPLAY} → {labelForSender(openThread.agent.id)} · handsOn assignment
-                </div>
-                <button
-                  type="button"
-                  className="thread-handoff-doc thread-doc-open"
-                  title="Open handsOn assignment"
-                  onClick={() =>
-                    setViewerModal({
-                      type: "markdown",
-                      source: openThread.handsOnArtifact?.path
-                        ? { path: openThread.handsOnArtifact.path }
-                        : {
-                            content: `# ${ORCHESTRATOR_DISPLAY} → ${labelForSender(openThread.agent.id)} · handsOn\n\n${openThread.assignment}`,
-                          },
-                      display: "popup",
-                      title: "handsOn assignment",
-                    })
-                  }
-                >
-                  {openThread.assignment}
-                  <span className="thread-doc-open-hint">Open document →</span>
-                </button>
+                <div className="thread-section-title">Relevant result</div>
+                <div className="thread-handoff-doc">{openThread.result || "No result summary reported yet."}</div>
               </div>
-              {openThread.handoffReady && (
-                <div className="thread-section">
-                  <div className="thread-section-title">
-                    {labelForSender(openThread.agent.id)} → {ORCHESTRATOR_DISPLAY} · Handoff document
-                  </div>
-                  <button
-                    type="button"
-                    className="thread-handoff-doc thread-doc-open"
-                    title="Open handoff document"
-                    onClick={() =>
-                      setViewerModal({
-                        type: "markdown",
-                        source: openThread.handOffArtifact?.path
-                          ? { path: openThread.handOffArtifact.path }
-                          : {
-                              content: `# ${labelForSender(openThread.agent.id)} → ${ORCHESTRATOR_DISPLAY} · Handoff\n\n${openThread.handoff}`,
-                            },
-                        display: "popup",
-                        title: "Handoff document",
-                      })
-                    }
-                  >
-                    {openThread.handoff}
-                    <span className="thread-doc-open-hint">Open document →</span>
-                  </button>
-                </div>
-              )}
               <div className="thread-section">
                 <div className="thread-section-title">Thread activity ({openThread.activity.length})</div>
                 {openThread.activity.length === 0 ? (
@@ -2567,39 +2559,11 @@ export function DashboardView({ viewModel }: DashboardViewProps) {
                 )}
               </div>
               <div className="thread-section">
-                <div className="thread-section-title">Proof of work</div>
+                <div className="thread-section-title">Status</div>
                 <div className="agent-space-block-text">
-                  Status: <span className={`detail-status-pill ${openThread.agent.status}`}>{openThread.agent.status}</span>
+                  <span className={`detail-status-pill ${openThread.agent.status}`}>{openThread.agent.status}</span>
                 </div>
                 <AgentWorkingStatus agent={openThread.agent} activity={openThread.activity} />
-                {openThread.agent.summary || openThread.proofArtifact ? (
-                  <button
-                    type="button"
-                    className="thread-handoff-doc thread-doc-open"
-                    title="Open proof-of-work document"
-                    onClick={() =>
-                      setViewerModal({
-                        type: "markdown",
-                        source: openThread.proofArtifact?.path
-                          ? { path: openThread.proofArtifact.path }
-                          : {
-                              content: `# ${labelForSender(openThread.agent.id)} → ${ORCHESTRATOR_DISPLAY} · Proof of work\n\n${openThread.agent.summary}`,
-                            },
-                        display: "popup",
-                        title: "Proof of work",
-                      })
-                    }
-                  >
-                    {openThread.proofArtifact
-                      ? `${openThread.proofArtifact.path}\n\n${openThread.proofArtifact.description || "Proof of work artifact ready."}`
-                      : openThread.agent.summary}
-                    <span className="thread-doc-open-hint">Open document →</span>
-                  </button>
-                ) : (
-                  <div className="agent-space-block-text">
-                    The agent has not reported its proof of work yet.
-                  </div>
-                )}
               </div>
             </div>
           </div>

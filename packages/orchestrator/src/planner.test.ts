@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { container } from "@yaaa/platform";
 import type { IMeshGateway, IBus } from "@yaaa/interfaces";
-import { Planner, getRequestedAgentCount, defaultModelForSubtask, MODEL_TIERS } from "./planner.js";
+import { Planner, getRequestedAgentCount, defaultModelForSubtask, MODEL_TIERS, PREFERENCE_MODEL_DEFAULTS } from "./planner.js";
 
 describe("Planner", () => {
   let mockGateway: IMeshGateway;
@@ -88,6 +88,54 @@ describe("Planner", () => {
     expect(plan.goal).toBe("Write report");
     expect(plan.subtasks.length).toBe(1);
     expect(plan.subtasks[0].id).toBe("task-1");
+    expect(plan.planningAnalysis?.implementationGoal).toContain("Write report");
+    expect(plan.planningAnalysis?.stepReviews[0].consideredRoles.length).toBeGreaterThan(1);
+    expect(plan.verification?.required).toBe(true);
+    expect(plan.verification?.stages.map((stage) => stage.kind)).toContain("artifact");
+    expect(plan.verification?.toolLimitations.join(" ")).toContain("rendered");
+  });
+
+  it("applies the selected model policy when a model is omitted", async () => {
+    (mockGateway.chat as any).mockResolvedValue({
+      content: '```json\n{"goal":"g","subtasks":[{"id":"task-1","title":"t","capability":"files","dependsOn":[],"riskLevel":"low","successCriteria":"s","agentTemplate":"FilesAgent","routingReason":"bounded file work"}]}\n```',
+    });
+
+    const sota = await planner.plan("g", undefined, { modelPreference: "sota" });
+    expect(sota.subtasks[0].model).toBe(PREFERENCE_MODEL_DEFAULTS.sota);
+    expect(sota.subtasks[0].modelReason).toContain("SOTA");
+
+    const costEffective = await planner.plan("g", undefined, { modelPreference: "cost-effective" });
+    expect(costEffective.subtasks[0].model).toBe(PREFERENCE_MODEL_DEFAULTS["cost-effective"]);
+    expect(costEffective.subtasks[0].modelReason).toContain("Cost Effective");
+  });
+
+  it("normalizes a model's comma-separated capabilities to one routed primary capability", async () => {
+    (mockGateway.chat as any).mockResolvedValue({
+      content: `\`\`\`json
+{"goal":"g","subtasks":[
+  {"id":"files","title":"Create files and run supporting commands","capability":"files, shell, browser","dependsOn":[],"riskLevel":"low","successCriteria":"the files exist","agentTemplate":"FilesAgent","routingReason":"bounded file work","model":"google/gemini-2.5-flash"},
+  {"id":"verify","title":"Verify files and inspect the browser output","capability":"verify, files, browser","dependsOn":["files"],"riskLevel":"low","successCriteria":"verification passes","agentTemplate":"QaTesterAgent","routingReason":"independent verification","model":"google/gemini-2.5-flash"}
+]}
+\`\`\``,
+    });
+
+    const plan = await planner.plan("Create and verify files");
+
+    expect(plan.subtasks.map((subtask) => subtask.capability)).toEqual(["files", "verify"]);
+  });
+
+  it("tells the planner that capability is singular and permission-scoped", async () => {
+    (mockGateway.chat as any).mockResolvedValue({ content: '```json\n{ "goal": "g", "subtasks": [] }\n```' });
+
+    await planner.plan("Do a thing");
+
+    const systemPrompt = (mockGateway.chat as any).mock.calls[0][0][0].content as string;
+    expect(systemPrompt).toContain("exactly one primary 'capability'");
+    expect(systemPrompt).toContain("never output a comma-separated capability list or array");
+    expect(systemPrompt).toContain("Verification is a first-class part of the plan");
+    expect(systemPrompt).toContain("report the unproven claim as a bug/limitation to YAAA");
+    expect(systemPrompt).toContain("VerifierAgent");
+    expect(systemPrompt).toContain("read-only independent artifact/evidence verification");
   });
 
   it("should run the auto-repair loop once if the first planning attempt fails validation", async () => {

@@ -2,7 +2,7 @@ import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
-import type { AgentMessage, AgentRun, TaskPlan, LedgerEntry } from "@yaaa/shared";
+import type { AgentMessage, AgentRun, TaskPlan, LedgerEntry, RuntimeEvent } from "@yaaa/shared";
 
 // ---------------------------------------------------------------------------
 // Mock better-sqlite3 with a pure in-memory implementation so tests run on
@@ -20,13 +20,15 @@ vi.mock("better-sqlite3", async () => {
     agents: any[];
     conversations: any[];
     conversation_messages: any[];
+    runtime_events: any[];
+    queue_items: any[];
     autoId: number;
   }>();
 
   function getDb(dbPath: string) {
     if (!dbs.has(dbPath)) {
       dbs.set(dbPath, {
-        messages: [], plans: [], ledger: [], audit_logs: [], agents: [], conversations: [], conversation_messages: [], autoId: 1,
+        messages: [], plans: [], ledger: [], audit_logs: [], agents: [], conversations: [], conversation_messages: [], runtime_events: [], queue_items: [], autoId: 1,
       });
     }
     return dbs.get(dbPath)!;
@@ -68,6 +70,34 @@ vi.mock("better-sqlite3", async () => {
         } else if (/INSERT INTO conversation_messages/.test(sql)) {
           const [id, task_id, conversation_id, data] = args;
           db.conversation_messages.push({ id, task_id, conversation_id, data, created_at: new Date().toISOString() });
+        } else if (/INSERT OR REPLACE INTO runtime_events/.test(sql)) {
+          const [id, task_id, topic, timestamp, agent_id, run_id, parent_event_id, payload] = args;
+          const index = db.runtime_events.findIndex((row) => row.id === id);
+          const row = { id, task_id, topic, timestamp, agent_id, run_id, parent_event_id, payload };
+          if (index >= 0) db.runtime_events[index] = row; else db.runtime_events.push(row);
+        } else if (/INSERT OR IGNORE INTO queue_items/.test(sql)) {
+          const [id, task_id, queue, recipient_id, payload, created_at, available_at, attempts] = args;
+          if (!db.queue_items.some((row) => row.id === id)) {
+            db.queue_items.push({ id, task_id, queue, recipient_id, payload, created_at, available_at, attempts, status: "pending", lease_id: null, leased_until: null });
+          }
+          return { changes: 1 };
+        } else if (/UPDATE queue_items SET status = 'leased'/.test(sql)) {
+          const [lease_id, leased_until, id] = args;
+          const row = db.queue_items.find((candidate) => candidate.id === id && candidate.status === "pending");
+          if (!row) return { changes: 0 };
+          row.status = "leased"; row.lease_id = lease_id; row.leased_until = leased_until; row.attempts += 1;
+          return { changes: 1 };
+        } else if (/UPDATE queue_items SET status = 'done'/.test(sql)) {
+          const [id, lease_id] = args;
+          const row = db.queue_items.find((candidate) => candidate.id === id && candidate.lease_id === lease_id);
+          if (!row) return { changes: 0 };
+          row.status = "done"; row.lease_id = null; row.leased_until = null;
+          return { changes: 1 };
+        } else if (/UPDATE queue_items SET status = 'pending'/.test(sql)) {
+          const first = args[0];
+          const row = db.queue_items.find((candidate) => candidate.id === args[1] && candidate.lease_id === args[2]);
+          if (row) { row.status = "pending"; row.lease_id = null; row.leased_until = null; row.available_at = first; return { changes: 1 }; }
+          return { changes: 0 };
         }
       };
 
@@ -91,6 +121,24 @@ vi.mock("better-sqlite3", async () => {
         if (/FROM conversations/.test(sql)) return db.conversations.filter((row) => row.task_id === args[0]);
         if (/FROM conversation_messages/.test(sql)) {
           return db.conversation_messages.filter((row) => row.task_id === args[0] && row.conversation_id === args[1]);
+        }
+        if (/FROM runtime_events/.test(sql)) {
+          return db.runtime_events.filter((row) => row.task_id === args[0] && (!args[1] || row.topic === args[1]));
+        }
+        if (/FROM queue_items/.test(sql)) {
+          if (/status = 'pending' AND available_at/.test(sql)) {
+            return db.queue_items.filter((row) => row.task_id === args[0] && row.queue === args[1] && row.status === "pending");
+          }
+          if (/task_id = \? AND queue = \? AND status = \?/.test(sql)) {
+            return db.queue_items.filter((row) => row.task_id === args[0] && row.queue === args[1] && row.status === args[2]);
+          }
+          if (/task_id = \? AND queue = \?/.test(sql)) {
+            return db.queue_items.filter((row) => row.task_id === args[0] && row.queue === args[1]);
+          }
+          if (/task_id = \? AND status = \?/.test(sql)) {
+            return db.queue_items.filter((row) => row.task_id === args[0] && row.status === args[1]);
+          }
+          return db.queue_items.filter((row) => row.task_id === args[0]);
         }
         return [];
       };
@@ -153,6 +201,44 @@ describe("SqliteStore", () => {
     const messages = await store.getMessages(taskId);
     expect(messages.length).toBe(1);
     expect(messages[0]).toEqual(msg);
+  });
+
+  it("should save and retrieve the ordered runtime event journal", async () => {
+    const event: RuntimeEvent = {
+      id: "event-1",
+      taskId,
+      topic: "task.test-task-123.agent.agent-1.llm_context",
+      timestamp: new Date().toISOString(),
+      agentId: "agent-1",
+      payload: { turn: 1, messages: [{ role: "user", content: "hello" }] },
+    };
+
+    await store.saveRuntimeEvent(event);
+    const events = await store.getRuntimeEvents(taskId, { topic: event.topic });
+    expect(events).toEqual([event]);
+  });
+
+  it("should claim, acknowledge, and retry durable queue items", async () => {
+    const item = {
+      id: "queue-1",
+      taskId,
+      queue: "orchestrator" as const,
+      payload: { content: "continue" },
+      createdAt: new Date().toISOString(),
+      availableAt: new Date(0).toISOString(),
+      attempts: 0,
+    };
+    await store.enqueueQueueItem(item);
+    const [claim] = await store.claimQueueItems({ queue: "orchestrator", taskId, consumerId: "test" });
+    expect(claim.item.payload).toEqual(item.payload);
+    // Agent DBs are separate and do not contain queue_items. Queue lifecycle
+    // operations must target task DBs only, even after an agent DB is opened.
+    fs.mkdirSync(path.join(testDbDir, taskId, ".yaaa", "agents", "agent-1"), { recursive: true });
+    await store.getAgents(taskId);
+    await store.retryQueueItem({ id: item.id, leaseId: claim.leaseId });
+    const [secondClaim] = await store.claimQueueItems({ queue: "orchestrator", taskId, consumerId: "test-2" });
+    await store.acknowledgeQueueItem({ id: item.id, leaseId: secondClaim.leaseId });
+    await expect(store.getQueueItems(taskId, { status: "done" })).resolves.toHaveLength(1);
   });
 
   it("should save and retrieve TaskPlan", async () => {

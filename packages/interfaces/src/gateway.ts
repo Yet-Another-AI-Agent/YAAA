@@ -10,6 +10,8 @@ export interface ToolDefinition {
 
 export interface ChatOptions {
   modelRole: ModelRole;
+  /** Optional exact Mesh model id; takes precedence over the role mapping. */
+  model?: string;
   temperature?: number;
   jsonMode?: boolean;
   tools?: ToolDefinition[];
@@ -55,5 +57,5 @@ export type ModelResolver = (requested?: string) => Promise<ModelResolution>;
 export interface IMeshGateway {
   chat(messages: ChatMessage[], options: ChatOptions): Promise<ChatResult>;
   chatStream(messages: ChatMessage[], options: ChatOptions): AsyncIterable<string>;
-  generateImage?(prompt: string, options?: { model?: string }): Promise<string>;
+  generateImage?(prompt: string, options?: { model?: string; background?: "transparent" | "opaque" | "auto" }): Promise<string>;
 }

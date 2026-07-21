@@ -159,7 +159,7 @@ describe("useTaskViewModel — mission continuity", () => {
     expect(result.current.running).toBe(true);
   });
 
-  it("holds an active follow-up in the queue until the pickup event arrives", async () => {
+  it("clears an active follow-up when the typed queue acknowledgement arrives", async () => {
     let onEvent: ((event: any) => void) | undefined;
     vi.mocked(TaskModel.subscribeEvents).mockImplementation((eventHandler) => {
       onEvent = eventHandler;
@@ -193,8 +193,8 @@ describe("useTaskViewModel — mission continuity", () => {
     expect(result.current.logs.some((log) => log.content === "whats happening?")).toBe(false);
 
     act(() => onEvent?.({
-      topic: "task.task-123.started",
-      data: { note: "📬 Processing queued user message: whats happening?" },
+      topic: "task.task-123.queue-accepted",
+      data: { messageId: "mailbox-message-1", content: "whats happening?", from: "user" },
     }));
 
     expect(result.current.queuedMessages).toEqual([]);
@@ -309,7 +309,7 @@ describe("useTaskViewModel — mission continuity", () => {
         expect.objectContaining({
           source: "orchestrator",
           kind: "response",
-          content: "[plan-proposal] Implementation plan ready for review.",
+          content: "[plan-proposal] Implementation strategy ready for review.",
         }),
       ]),
     );

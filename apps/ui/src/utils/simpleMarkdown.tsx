@@ -52,6 +52,7 @@ export function renderMarkdown(content: string): ReactNode[] {
   const lines = content.split("\n");
   const blocks: ReactNode[] = [];
   let listBuffer: string[] = [];
+  let orderedListBuffer: string[] = [];
   let paraBuffer: string[] = [];
   let i = 0;
 
@@ -68,6 +69,17 @@ export function renderMarkdown(content: string): ReactNode[] {
     );
   };
 
+  const flushOrderedList = () => {
+    if (orderedListBuffer.length === 0) return;
+    const items = orderedListBuffer;
+    orderedListBuffer = [];
+    blocks.push(
+      <ol key={`ol-${blocks.length}`}>
+        {items.map((item, idx) => <li key={idx}>{renderInline(item)}</li>)}
+      </ol>,
+    );
+  };
+
   const flushPara = () => {
     if (paraBuffer.length === 0) return;
     const text = paraBuffer.join(" ");
@@ -80,6 +92,7 @@ export function renderMarkdown(content: string): ReactNode[] {
 
     if (line.trim().startsWith("```")) {
       flushList();
+      flushOrderedList();
       flushPara();
       const codeLines: string[] = [];
       i++;
@@ -99,6 +112,7 @@ export function renderMarkdown(content: string): ReactNode[] {
     const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
     if (headingMatch) {
       flushList();
+      flushOrderedList();
       flushPara();
       pushHeading(blocks, Math.min(headingMatch[1].length, 4), renderInline(headingMatch[2]));
       i++;
@@ -107,25 +121,38 @@ export function renderMarkdown(content: string): ReactNode[] {
 
     const listMatch = line.match(/^\s*[-*]\s+(.*)$/);
     if (listMatch) {
+      flushOrderedList();
       flushPara();
       listBuffer.push(listMatch[1]);
       i++;
       continue;
     }
 
+    const orderedListMatch = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (orderedListMatch) {
+      flushList();
+      flushPara();
+      orderedListBuffer.push(orderedListMatch[1]);
+      i++;
+      continue;
+    }
+
     if (line.trim() === "") {
       flushList();
+      flushOrderedList();
       flushPara();
       i++;
       continue;
     }
 
     flushList();
+    flushOrderedList();
     paraBuffer.push(line.trim());
     i++;
   }
 
   flushList();
+  flushOrderedList();
   flushPara();
 
   return blocks;
