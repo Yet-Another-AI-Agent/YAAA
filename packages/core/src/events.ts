@@ -21,7 +21,8 @@ export type RuntimeEvent =
   | { type: "result"; from: string; summary: string; artifacts: ArtifactRef[]; incomplete?: boolean }
   | { type: "chat-message"; message: Extract<AgentMessage, { kind: "help_request" | "info_request" | "info_reply" }> }
   | { type: "complete"; result: TaskRunResult }
-  | { type: "topic-updated"; taskId: string; topic: string };
+  | { type: "topic-updated"; taskId: string; topic: string }
+  | { type: "execution"; from: string; event: "attached" | "output" | "screenshot" | "detached" | "exited"; data: Record<string, unknown> };
 
 export interface TaskRunResult {
   success: boolean;
@@ -139,6 +140,11 @@ export function mapBusEvent(
 
   if (topic.startsWith(`${base}.agent.`) && topic.endsWith(".lifecycle")) {
     return { type: "agent-status", agent: msg as AgentRun };
+  }
+
+  const executionMatch = topic.match(/^task\.[^.]+\.agent\.([^.]+)\.execution-(attached|output|screenshot|detached|exited)$/);
+  if (executionMatch) {
+    return { type: "execution", from: executionMatch[1], event: executionMatch[2] as any, data: msg && typeof msg === "object" ? msg : {} };
   }
 
   return null;

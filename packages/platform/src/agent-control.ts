@@ -42,6 +42,26 @@ export class AgentControlMailbox {
     return queue;
   }
 
+  /**
+   * Remove only live watchdog controls. Redirects remain queued for the next
+   * model turn, while extensions and stops can affect an invocation already in
+   * progress.
+   */
+  takeLive(agentId: string): { additionalMs: number; stopReason?: string } {
+    const queue = this.mailboxes.get(agentId);
+    if (!queue || queue.length === 0) return { additionalMs: 0 };
+    let additionalMs = 0;
+    let stopReason: string | undefined;
+    const deferred: AgentControlDirective[] = [];
+    for (const directive of queue) {
+      if (directive.type === "extend") additionalMs += Math.max(0, directive.additionalMs);
+      else if (directive.type === "stop") stopReason = directive.reason;
+      else deferred.push(directive);
+    }
+    this.mailboxes.set(agentId, deferred);
+    return { additionalMs, stopReason };
+  }
+
   /** Drop any pending directives for an agent (call when its run ends). */
   clear(agentId: string): void {
     this.mailboxes.delete(agentId);

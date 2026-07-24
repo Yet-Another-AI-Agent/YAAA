@@ -1,4 +1,5 @@
 import type { IBus, ModelRole, ModelResolver, IMeshGateway } from "@yaaa/interfaces";
+import type { ExecutionSessionManagerLike } from "@yaaa/interfaces";
 import { container, type Container, PermissionEngine, pauseController, agentControl, orchestratorMailbox, type IEventQueue } from "@yaaa/platform";
 import { type ArtifactRef, type ToolCall, isInsufficientFundsError, resolveFileRoots } from "@yaaa/shared";
 import { AGENT_REGISTRY } from "../registry.js";
@@ -33,12 +34,12 @@ function resolveMaxTurns(): number {
 // research + synthesis, image generation). The old 120s ceiling routinely
 // timeboxed still-working agents into "incomplete" checkpoints, which the outer
 // loop then churned into failures. Still env-tunable for tighter/looser runs.
-const DEFAULT_AGENT_INVOKE_TIMEOUT_MS = 480_000;
+const DEFAULT_AGENT_INVOKE_TIMEOUT_MS = 1_440_000;
 // Do not kill a model merely because it has not called a tool yet. Reasoning,
 // structured output, and provider-side queueing can all legitimately precede
 // the first tool observation. Operators may still opt into a shorter watchdog
 // with YAAA_AGENT_FIRST_PROGRESS_TIMEOUT_MS.
-const DEFAULT_AGENT_FIRST_PROGRESS_TIMEOUT_MS = 480_000;
+const DEFAULT_AGENT_FIRST_PROGRESS_TIMEOUT_MS = 1_440_000;
 const DEFAULT_AGENT_CHECKPOINT_TIMEOUT_MS = 15_000;
 
 class AgentInvocationTimeoutError extends Error {
@@ -90,6 +91,14 @@ function isAgentInvocationTimeoutError(err: unknown): err is AgentInvocationTime
 function logInner(agentId: string, message: string, details?: Record<string, unknown>): void {
   const suffix = details ? ` ${JSON.stringify(details)}` : "";
   console.log(`[YAAA:InnerLoop:${agentId}] ${message}${suffix}`);
+}
+
+const LLM_CONSOLE_PREVIEW_LIMIT = 4_000;
+
+function truncateLlmConsole(value: unknown, max = LLM_CONSOLE_PREVIEW_LIMIT): string {
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  if (!text) return "";
+  return text.length > max ? `${text.slice(0, max)}… [truncated ${text.length - max} chars]` : text;
 }
 
 function warnInner(agentId: string, message: string, details?: Record<string, unknown>): void {
@@ -180,7 +189,7 @@ function formatToolObservations(observations: ToolObservation[] = []): string {
 function formatToolObservationMetadata(metadata: Record<string, unknown> | undefined): string {
   if (!metadata) return "";
   const details: string[] = [];
-  const keys = ["path", "screenshotPath", "command", "url", "query", "title", "stdout", "stderr", "exitCode"];
+  const keys = ["path", "screenshotPath", "command", "url", "query", "title", "stdout", "stderr", "exitCode", "timedOut", "durationMs"];
   for (const key of keys) {
     const value = metadata[key];
     if (typeof value === "string" && value.trim()) {
@@ -400,6 +409,7 @@ async function withAgentProgressTimeout<T>(
     invokeTimeoutMs: number;
     firstProgressTimeoutMs: number;
     hasToolProgress: () => boolean;
+    consumeLiveControl?: () => { additionalMs: number; stopReason?: string };
     /**
      * Additional wall-clock granted mid-run (e.g. by a supervisor `extend`
      * directive). Read live each tick so a still-working agent can be given more
@@ -416,9 +426,18 @@ async function withAgentProgressTimeout<T>(
   const timeout = new Promise<never>((_, reject) => {
     watchdog = setInterval(() => {
       if (settled) return;
+      const liveControl = options.consumeLiveControl?.() ?? { additionalMs: 0 };
+      if (liveControl.stopReason !== undefined) {
+        settled = true;
+        controller.abort();
+        reject(new AgentStopRequestedError(liveControl.stopReason));
+        return;
+      }
       const elapsed = Date.now() - startedAt;
       const effectiveInvokeTimeout =
-        options.invokeTimeoutMs + Math.max(0, options.getExtensionMs?.() ?? 0);
+        options.invokeTimeoutMs
+        + Math.max(0, options.getExtensionMs?.() ?? 0)
+        + Math.max(0, liveControl.additionalMs);
       if (!options.hasToolProgress() && elapsed >= options.firstProgressTimeoutMs) {
         settled = true;
         controller.abort();
@@ -598,13 +617,26 @@ function repairToolCallTranscript(messages: BaseMessage[]): BaseMessage[] {
     }
 
     const followingTools: ToolMessage[] = [];
+    const seenResponseIds = new Set<string>();
     let cursor = index + 1;
     while (cursor < messages.length && messages[cursor].getType() === "tool") {
-      followingTools.push(messages[cursor] as ToolMessage);
+      const toolMessage = messages[cursor] as ToolMessage;
+      // A retry/interruption can leave the same tool response in the
+      // LangGraph transcript more than once. Gemini counts response parts,
+      // so forwarding duplicates causes its 400 mismatch error.
+      if (typeof toolMessage.tool_call_id === "string" && !seenResponseIds.has(toolMessage.tool_call_id)) {
+        followingTools.push(toolMessage);
+        seenResponseIds.add(toolMessage.tool_call_id);
+      }
       cursor += 1;
     }
     const responseIds = new Set(followingTools.map((toolMessage) => toolMessage.tool_call_id));
-    const validCalls = calls.filter((call) => typeof call.id === "string" && responseIds.has(call.id));
+    const seenCallIds = new Set<string>();
+    const validCalls = calls.filter((call) => {
+      if (typeof call.id !== "string" || !responseIds.has(call.id) || seenCallIds.has(call.id)) return false;
+      seenCallIds.add(call.id);
+      return true;
+    });
     if (validCalls.length !== calls.length) repairedCalls += calls.length - validCalls.length;
 
     // Do not carry raw provider tool calls alongside the normalized LangChain
@@ -714,6 +746,8 @@ function summarizeToolResult(output: unknown): string {
     if (typeof record.title === "string" && record.title.trim()) return truncateForLog(record.title);
     if (typeof record.url === "string" && record.url.trim()) return truncateForLog(record.url);
     if (typeof record.text === "string" && record.text.trim()) return truncateForLog(record.text);
+    if (record.timedOut === true) return `timed out after ${typeof record.durationMs === "number" ? `${record.durationMs}ms` : "the command deadline"}`;
+    if (typeof record.exitCode === "number" && record.exitCode !== 0) return `exited with code ${record.exitCode}`;
     return "done";
   }
   if (typeof output === "string" && output.trim()) return truncateForLog(output);
@@ -797,6 +831,12 @@ function buildToolMetadata(
     if (typeof (output as Record<string, unknown>).exitCode !== "undefined") {
       metadata.exitCode = (output as Record<string, unknown>).exitCode;
     }
+    if (typeof (output as Record<string, unknown>).timedOut === "boolean") {
+      metadata.timedOut = (output as Record<string, unknown>).timedOut;
+    }
+    if (typeof (output as Record<string, unknown>).durationMs === "number") {
+      metadata.durationMs = (output as Record<string, unknown>).durationMs;
+    }
     const title = previewText((output as Record<string, unknown>).title, 180);
     if (title) metadata.title = title;
   }
@@ -804,8 +844,10 @@ function buildToolMetadata(
     metadata.results = output.slice(0, 3).map((item) => {
       if (!item || typeof item !== "object") return String(item);
       const result = item as Record<string, unknown>;
+      const resultPath = result.path ?? result.relativePath ?? result.filePath ?? result.name;
       return {
-        title: previewText(result.title, 120),
+        title: previewText(result.title ?? result.name ?? result.path ?? result.relativePath ?? result.filePath, 120),
+        path: previewText(resultPath, 220),
         url: previewText(result.url, 160),
         description: previewText(result.description, 180),
       };
@@ -876,6 +918,7 @@ export class InnerLoop {
   private maxTurns: number;
   private modelResolver?: ModelResolver;
   private durableQueue?: IEventQueue;
+  private executionSessions?: ExecutionSessionManagerLike;
 
   constructor(scope: Container = container) {
     this.scope = scope;
@@ -892,6 +935,11 @@ export class InnerLoop {
       this.durableQueue = scope.resolve<IEventQueue>("IEventQueue");
     } catch {
       // Lightweight unit-test scopes may intentionally omit durable queues.
+    }
+    try {
+      this.executionSessions = scope.resolve<ExecutionSessionManagerLike>("ExecutionSessionManager");
+    } catch {
+      // Optional for lightweight unit-test scopes.
     }
   }
 
@@ -997,11 +1045,26 @@ export class InnerLoop {
     // being aborted at the original deadline.
     let grantedExtensionMs = 0;
     let llmTurn = 0;
+    const consumeLiveControl = () => {
+      const control = agentControl.takeLive(agentId);
+      if (control.additionalMs > 0) {
+        grantedExtensionMs += control.additionalMs;
+        void this.bus.publish(`task.${taskId}.agent.${agentId}.thought`, {
+          kind: "thought",
+          from: agentId,
+          taskId,
+          content: `⏱️ YAAA granted +${Math.round(control.additionalMs / 1000)}s more time while the agent was running.`,
+        });
+      }
+      return { additionalMs: 0, stopReason: control.stopReason };
+    };
 
     const agent = createReactAgent({
       llm: model,
       tools,
-      prompt: template.systemPrompt,
+      prompt: `${template.systemPrompt}
+
+Progress and observation contract: before every tool call, include a concise "progress" argument (maximum 240 characters) explaining what you are doing and what this step will determine. This is shown directly to the user while the tool runs. If the next tool may take time, make the progress message specific enough to explain the wait; do not use generic text such as "working" or "processing". Also provide expectedDurationMs when you can estimate it. For long-running shell or browser sessions, provide observationPlan with waitForMs, capture (for example stdout, stderr, browser-state, screenshot, or network), and detachWhen. These are user-facing execution estimates and evidence instructions; the runtime's deterministic deadline and cleanup rules always take precedence.`,
       // Honour a user-issued pause between model turns without polling, drain any
       // supervisor control directives (extend / redirect / stop), and sanitise
       // the model input so no empty text content block reaches a Bedrock-backed
@@ -1015,7 +1078,7 @@ export class InnerLoop {
         // LangGraph invokes this hook once per model turn. Persist the exact
         // sanitized context sent to the model for replay and auditability.
         llmTurn += 1;
-        await this.bus.publish(`task.${taskId}.agent.${agentId}.llm_context`, {
+        const llmContext = {
           kind: "llm_context",
           from: agentId,
           taskId,
@@ -1026,7 +1089,9 @@ export class InnerLoop {
             type: message.constructor.name,
             content: typeof message.content === "string" ? message.content : JSON.stringify(message.content),
           })),
-        });
+        };
+        console.log(`[YAAA:LLM:${agentId}] request turn ${llmTurn} (${modelName}) ${truncateLlmConsole(llmContext.messages)}`);
+        await this.bus.publish(`task.${taskId}.agent.${agentId}.llm_context`, llmContext);
 
         // Automated Loop and Tool Failure Course Correction
         const autoCorrection = getAutoCourseCorrection(base);
@@ -1035,7 +1100,7 @@ export class InnerLoop {
           await this.bus.publish(`task.${taskId}.agent.${agentId}.thought`, {
             kind: "thought",
             from: agentId,
-            content: `🛡️ Agent Loop Guard: Injected course correction warning.`,
+            content: `🛡️ Course correction injected by YAAA:\n\n${autoCorrection}`,
           });
           warnInner(agentId, "injected loop guard warning", { autoCorrection });
         }
@@ -1057,7 +1122,7 @@ export class InnerLoop {
             await this.bus.publish(`task.${taskId}.agent.${agentId}.thought`, {
               kind: "thought",
               from: agentId,
-              content: `🧭 Supervisor redirected the agent.${directive.reason ? ` ${directive.reason}` : ""}`,
+              content: `🧭 Supervisor course correction injected${directive.reason ? `: ${directive.reason}` : "."}\n\nCorrection:\n${directive.handsOn}`,
             });
           } else if (directive.type === "stop") {
             throw new AgentStopRequestedError(directive.reason);
@@ -1126,29 +1191,34 @@ export class InnerLoop {
           firstProgressTimeoutMs,
           hasToolProgress: () => sawToolProgress,
           getExtensionMs: () => grantedExtensionMs,
+          consumeLiveControl,
         },
       )) as { messages: BaseMessage[] };
-      await this.bus.publish(`task.${taskId}.agent.${agentId}.llm_response`, {
+      const llmResponse = {
         kind: "llm_response",
         from: agentId,
         taskId,
         turn: llmTurn,
         model: modelName,
         content: finalTextOf(finalState.messages),
-      });
+      };
+      console.log(`[YAAA:LLM:${agentId}] response turn ${llmTurn} (${modelName}) ${truncateLlmConsole(llmResponse.content)}`);
+      await this.bus.publish(`task.${taskId}.agent.${agentId}.llm_response`, llmResponse);
       logInner(agentId, "model invocation completed", {
         messageCount: finalState.messages.length,
         sawToolProgress,
       });
     } catch (err) {
-      await this.bus.publish(`task.${taskId}.agent.${agentId}.llm_response`, {
+      const llmErrorResponse = {
         kind: "llm_response",
         from: agentId,
         taskId,
         turn: llmTurn,
         model: modelName,
         content: `[request failed] ${err instanceof Error ? err.message : String(err)}`,
-      });
+      };
+      console.log(`[YAAA:LLM:${agentId}] response turn ${llmTurn} (${modelName}) ${truncateLlmConsole(llmErrorResponse.content)}`);
+      await this.bus.publish(`task.${taskId}.agent.${agentId}.llm_response`, llmErrorResponse);
       if (isInsufficientFundsError(err)) throw err;
       if (isRecursionLimitError(err)) {
         throw new Error(
@@ -1231,6 +1301,7 @@ export class InnerLoop {
               firstProgressTimeoutMs,
               hasToolProgress: () => sawToolProgress,
               getExtensionMs: () => grantedExtensionMs,
+              consumeLiveControl,
             },
           )) as { messages: BaseMessage[] };
           logInner(agentId, "self-introspection recovery completed", {
@@ -1352,7 +1423,8 @@ export class InnerLoop {
             invokeTimeoutMs,
             firstProgressTimeoutMs,
             hasToolProgress: () => sawToolProgress,
-            getExtensionMs: () => grantedExtensionMs,
+              getExtensionMs: () => grantedExtensionMs,
+              consumeLiveControl,
           },
         )) as { messages: BaseMessage[] };
         finalText = finalTextOf(finalState.messages);
@@ -1612,6 +1684,18 @@ export class InnerLoop {
         ? `${serialized.slice(0, maxToolOutput)}\n\n[output truncated: ${serialized.length} chars total, showing first ${maxToolOutput}]`
         : serialized;
 
+    // LangGraph can execute multiple tool calls from one model turn
+    // concurrently even when the provider-side `parallel_tool_calls: false`
+    // hint is ignored. Serialize the complete permission/tool lifecycle per
+    // agent so subprocesses, browser sessions, approvals, and event ordering
+    // cannot race each other or leave one call permanently unresolved.
+    let toolQueue: Promise<void> = Promise.resolve();
+    const serializeToolCall = <T>(operation: () => Promise<T>): Promise<T> => {
+      const queued = toolQueue.then(operation, operation);
+      toolQueue = queued.then(() => undefined, () => undefined);
+      return queued;
+    };
+
     const gated = (
       name: string,
       method: string,
@@ -1620,9 +1704,51 @@ export class InnerLoop {
       invoke: (args: any) => Promise<unknown>,
       onSuccess?: (args: any) => void,
       capability = "files",
-    ) =>
-      tool(
-        async (args: any) => {
+    ) => {
+      // Bedrock Converse requires every tool input schema to have a root
+      // `type: "object"`. Zod intersections serialize as `allOf` and Mesh's
+      // Converse route rejects that shape, even when both sides are objects.
+      // All built-in gated tools use object schemas, so merge the metadata
+      // fields into the object shape instead of creating an intersection.
+      const progressSchema = z.object({
+        progress: z.string().max(240).optional().describe("A concise user-facing message explaining what this tool call is doing."),
+        expectedDurationMs: z.number().int().positive().max(600_000).optional().describe("LLM estimate for this tool call in milliseconds."),
+        observationPlan: z.object({
+          waitForMs: z.number().int().positive().max(600_000).optional(),
+          capture: z.array(z.string()).max(8).optional().describe("Evidence to capture before detaching, such as stdout, stderr, browser-state, screenshot, or network."),
+          detachWhen: z.string().max(240).optional().describe("Condition that makes it safe to stop observing."),
+        }).optional().describe("Evidence and detach instructions for a long-running execution."),
+      });
+      const toolSchema = schema instanceof z.ZodObject
+        ? schema.extend(progressSchema.shape)
+        : schema.and(progressSchema);
+      return tool(
+        (args: any) => serializeToolCall(async () => {
+          // The model supplies a short user-facing progress key with every
+          // tool call. It describes why this step is running and becomes the
+          // visible Thought update while the provider is busy. Keep it out of
+          // the provider arguments and out of duplicate-call signatures.
+          const progressHint = typeof args?.progress === "string"
+            ? truncateForLog(args.progress, 240)
+            : undefined;
+          const expectedDurationMs = typeof args?.expectedDurationMs === "number"
+            ? Math.min(600_000, Math.max(1, Math.floor(args.expectedDurationMs)))
+            : undefined;
+          const observationPlan = args?.observationPlan && typeof args.observationPlan === "object"
+            ? args.observationPlan as Record<string, unknown>
+            : undefined;
+          const observationWaitMs = observationPlan && typeof observationPlan.waitForMs === "number"
+            ? Math.min(600_000, Math.max(1, Math.floor(observationPlan.waitForMs)))
+            : undefined;
+          args = args && typeof args === "object" ? { ...args } : {};
+          delete args.progress;
+          delete args.expectedDurationMs;
+          delete args.observationPlan;
+          // Let the LLM's observation contract configure a persistent session
+          // when the provider exposes a compatible observation-window field.
+          if (observationWaitMs && method === "observe" && typeof args.windowMs !== "number") {
+            args.windowMs = observationWaitMs;
+          }
           // An identical (tool, args) call can only reproduce the previous
           // observation, so once it has been attempted MAX_REPEATED_CALLS times
           // we stop executing it and steer the agent instead of letting it
@@ -1651,8 +1777,13 @@ export class InnerLoop {
           await bus.publish(`task.${taskId}.agent.${agentId}.tool_requested`, {
             kind: "thought",
             from: agentId,
-            content: `${capability}.${method}${argSummary ? ` — ${argSummary}` : ""}`,
-            metadata: buildToolMetadata(capability, method, args),
+            content: progressHint || `${capability}.${method}${argSummary ? ` — ${argSummary}` : ""}`,
+            metadata: {
+              ...buildToolMetadata(capability, method, args),
+              ...(progressHint ? { progress: progressHint } : {}),
+              ...(expectedDurationMs ? { expectedDurationMs } : {}),
+              ...(observationPlan ? { observationPlan } : {}),
+            },
           });
           await bus.publish(`task.${taskId}.agent.${agentId}.action_requested`, {
             kind: "action_requested",
@@ -1662,6 +1793,9 @@ export class InnerLoop {
             capability,
             method,
             args,
+            ...(progressHint ? { progress: progressHint } : {}),
+            ...(expectedDurationMs ? { expectedDurationMs } : {}),
+            ...(observationPlan ? { observationPlan } : {}),
             timestamp: new Date().toISOString(),
           });
           await bus.publish(`task.${taskId}.agent.${agentId}.action_started`, {
@@ -1672,6 +1806,9 @@ export class InnerLoop {
             capability,
             method,
             args,
+            ...(progressHint ? { progress: progressHint } : {}),
+            ...(expectedDurationMs ? { expectedDurationMs } : {}),
+            ...(observationPlan ? { observationPlan } : {}),
             timestamp: new Date().toISOString(),
           });
           logInner(agentId, "tool requested", {
@@ -1682,9 +1819,52 @@ export class InnerLoop {
           });
           try {
             const output = await permissions.executeWithApproval(agentId, call, () => invoke(args));
+            const outputRecord = output && typeof output === "object" ? output as Record<string, unknown> : {};
+            const sessionId = typeof args?.id === "string" ? args.id : typeof outputRecord.id === "string" ? outputRecord.id : undefined;
+            if (this.executionSessions && sessionId && ["open", "observe", "attach", "detach", "close", "terminate", "read"].includes(method)) {
+              if (method === "open") {
+                await this.executionSessions.create({
+                  id: sessionId,
+                  taskId,
+                  agentId,
+                  kind: capability === "browser" ? "browser" : "shell",
+                  backendId: sessionId,
+                  cwd: typeof outputRecord.cwd === "string" ? outputRecord.cwd : undefined,
+                  url: typeof outputRecord.url === "string" ? outputRecord.url : undefined,
+                  pid: typeof outputRecord.pid === "number" ? outputRecord.pid : undefined,
+                });
+                await bus.publish(`task.${taskId}.agent.${agentId}.execution-attached`, { sessionId, kind: capability, method, state: "attached", timeoutMs: observationWaitMs ?? expectedDurationMs ?? args.timeoutMs ?? args.windowMs, ...(progressHint ? { progress: progressHint } : {}), ...(observationPlan ? { observationPlan } : {}), ...outputRecord });
+              } else if (method === "detach") {
+                await this.executionSessions.detach(sessionId);
+                await bus.publish(`task.${taskId}.agent.${agentId}.execution-detached`, { sessionId, kind: capability, method, state: "detached", timeoutMs: observationWaitMs ?? expectedDurationMs ?? args.timeoutMs ?? args.windowMs, ...(progressHint ? { progress: progressHint } : {}), ...(observationPlan ? { observationPlan } : {}) });
+              } else if (method === "attach") {
+                await this.executionSessions.reattach(sessionId);
+                await bus.publish(`task.${taskId}.agent.${agentId}.execution-attached`, { sessionId, kind: capability, method, state: "attached", timeoutMs: observationWaitMs ?? expectedDurationMs ?? args.timeoutMs ?? args.windowMs, ...(progressHint ? { progress: progressHint } : {}), ...(observationPlan ? { observationPlan } : {}) });
+              } else if (method === "observe" || method === "read") {
+                await this.executionSessions.observe(sessionId, {
+                  kind: capability === "browser" ? "browser-state" : outputRecord.running === false ? "exit" : "stdout",
+                  summary: previewText(outputRecord.output ?? outputRecord.visibleText ?? output, 1_000),
+                  outputPath: typeof outputRecord.screenshotPath === "string" ? outputRecord.screenshotPath : undefined,
+                  exitCode: typeof outputRecord.exitCode === "number" ? outputRecord.exitCode : undefined,
+                  timedOut: outputRecord.timedOut === true,
+                });
+                await bus.publish(`task.${taskId}.agent.${agentId}.execution-output`, { sessionId, kind: capability, method, timeoutMs: observationWaitMs ?? expectedDurationMs ?? args.timeoutMs ?? args.windowMs, ...(progressHint ? { progress: progressHint } : {}), ...(observationPlan ? { observationPlan } : {}), ...outputRecord });
+                if (outputRecord.running === false) {
+                  await this.executionSessions.setState(sessionId, "exited", { lastObservedAt: new Date().toISOString() });
+                  await bus.publish(`task.${taskId}.agent.${agentId}.execution-exited`, { sessionId, kind: capability, method, timeoutMs: observationWaitMs ?? expectedDurationMs ?? args.timeoutMs ?? args.windowMs, ...(progressHint ? { progress: progressHint } : {}), ...(observationPlan ? { observationPlan } : {}), ...outputRecord });
+                }
+                if (typeof outputRecord.screenshotPath === "string") {
+                  await bus.publish(`task.${taskId}.agent.${agentId}.execution-screenshot`, { sessionId, kind: capability, method, screenshotPath: outputRecord.screenshotPath, timeoutMs: observationWaitMs ?? expectedDurationMs ?? args.timeoutMs ?? args.windowMs, ...(progressHint ? { progress: progressHint } : {}), ...(observationPlan ? { observationPlan } : {}) });
+                }
+              } else if (method === "close" || method === "terminate") {
+                await this.executionSessions.setState(sessionId, "exited");
+                await bus.publish(`task.${taskId}.agent.${agentId}.execution-exited`, { sessionId, kind: capability, method, timeoutMs: observationWaitMs ?? expectedDurationMs ?? args.timeoutMs ?? args.windowMs, ...(progressHint ? { progress: progressHint } : {}), ...(observationPlan ? { observationPlan } : {}), ...outputRecord });
+              }
+            }
             onSuccess?.(args);
             const resultSummary = summarizeToolResult(output);
             const metadata = buildToolMetadata(capability, method, args, output);
+            if (progressHint) metadata.progress = progressHint;
             toolObservations.push({
               capability,
               method,
@@ -1767,9 +1947,14 @@ export class InnerLoop {
             });
             return capOutput(`Tool execution error: ${err?.message ?? String(err)}`);
           }
+        }),
+        {
+          name,
+          description: `${description} Include a concise progress string (max 240 characters) in the progress argument explaining what this step is doing for the user while it runs. Provide expectedDurationMs when possible. For long-running work, include observationPlan with waitForMs, capture, and detachWhen.`,
+          schema: toolSchema,
         },
-        { name, description, schema },
       );
+    };
 
     let result: StructuredToolInterface[] = filesProvider ? [
       gated("read_file", "readFile", "Read the complete text contents of a file in the workspace.",
@@ -1779,6 +1964,15 @@ export class InnerLoop {
         z.object({ path: z.string().describe("Path to the file."), content: z.string().describe("Content to write.") }),
         (a) => filesProvider.writeFile(a.path, a.content),
         (a) => artifacts.push({ path: a.path, mimeType: inferMime(a.path), description: `File produced by ${role}.` })),
+      gated("download_file", "downloadFile", "Download an original binary asset from an HTTP(S) URL into the task workspace. Use this for website logos, photographs, PDFs, and other source assets; do not replace an original asset with generated content.",
+        z.object({
+          url: z.string().url().describe("HTTP(S) URL of the original asset."),
+          outputPath: z.string().describe("Workspace-relative destination path, including the real extension."),
+          timeoutMs: z.number().int().positive().max(120_000).optional(),
+          maxBytes: z.number().int().positive().max(100 * 1024 * 1024).optional(),
+        }),
+        (a) => filesProvider.downloadFile(a.url, a.outputPath, { timeoutMs: a.timeoutMs, maxBytes: a.maxBytes }),
+        (a) => artifacts.push({ path: a.outputPath, mimeType: inferMime(a.outputPath), description: `Downloaded original asset from ${a.url}.` })),
       gated("list_files", "listFiles", "List files and folders in a directory.",
         z.object({ path: z.string().describe("Directory path to list.") }),
         (a) => filesProvider.listFiles(a.path)),
@@ -1855,6 +2049,35 @@ export class InnerLoop {
           schema: z.object({ question: z.string().min(1) }),
         },
       ),
+      tool(
+        async ({ additionalMs, reason }: { additionalMs: number; reason: string }) => {
+          orchestratorMailbox.post({
+            id: `agent-extension-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            taskId,
+            from: "agent",
+            agentId,
+            kind: "extension_request",
+            additionalMs,
+            content: reason,
+            createdAt: new Date().toISOString(),
+          });
+          await bus.publish(`task.${taskId}.agent.${agentId}.thought`, {
+            kind: "thought",
+            from: agentId,
+            taskId,
+            content: `⏳ Requested +${Math.round(additionalMs / 1000)}s from YAAA: ${reason}`,
+          });
+          return "Extension request queued. Continue with the current work; YAAA will approve or deny it asynchronously. If denied, save a checkpoint and stop starting new expensive work.";
+        },
+        {
+          name: "request_extension",
+          description: "Ask YAAA for bounded additional wall-clock time when the current work is making real progress but cannot finish within the current timebox. This is a request, not a guarantee; state the exact remaining work and why the extra time is needed.",
+          schema: z.object({
+            additionalMs: z.number().int().min(30_000).max(300_000),
+            reason: z.string().min(1).max(500),
+          }),
+        },
+      ),
     );
 
     if (capabilities.includes("shell")) {
@@ -1869,10 +2092,13 @@ export class InnerLoop {
           : workspaceRoot,
       });
       result.push(
-        gated("execute_command", "execute", "Run a command with timeout and separate stdout/stderr. Defaults to the task working directory.", z.object({ command: z.string(), cwd: z.string().optional(), timeoutMs: z.number().positive().optional() }), (a) => shell.execute(a.command, withWorkspaceCwd(a)), undefined, "shell"),
-        gated("open_terminal", "open", "Open a durable interactive terminal session. Defaults to the task working directory.", z.object({ id: z.string().optional(), cwd: z.string().optional(), shell: z.string().optional() }), (a) => shell.open(withWorkspaceCwd(a)), undefined, "shell"),
+        gated("execute_command", "execute", "Run a short command with a hard timeout and separate stdout/stderr. Use open_terminal for installs, builds, dev servers, migrations, docker compose, or any process expected to run longer than 30 seconds.", z.object({ command: z.string(), cwd: z.string().optional(), timeoutMs: z.number().int().positive().max(300_000).default(30_000) }), (a) => shell.execute(a.command, withWorkspaceCwd(a)), undefined, "shell"),
+        gated("open_terminal", "open", "Open a durable interactive terminal session for installs, builds, dev servers, migrations, docker compose, and other long-running work. Detaching stops observation but does not kill the process.", z.object({ id: z.string().optional(), cwd: z.string().optional(), shell: z.string().optional() }), (a) => shell.open(withWorkspaceCwd(a)), undefined, "shell"),
         gated("write_terminal", "write", "Write input to an existing terminal; optionally press Enter.", z.object({ id: z.string(), input: z.string(), enter: z.boolean().default(false) }), (a) => shell.write(a.id, a.input, a.enter), undefined, "shell"),
         gated("read_terminal", "read", "Read buffered output and status from an existing terminal.", z.object({ id: z.string(), from: z.number().int().nonnegative().default(0), clear: z.boolean().default(false) }), (a) => shell.read(a.id, a.from, a.clear), undefined, "shell"),
+        gated("observe_terminal", "observe", "Observe a bounded tail of a durable terminal session for 15–60 seconds without killing it.", z.object({ id: z.string(), windowMs: z.number().int().positive().max(60_000).default(15_000), from: z.number().int().nonnegative().optional(), maxLines: z.number().int().positive().max(200).default(200) }), (a) => shell.observe(a.id, a), undefined, "shell"),
+        gated("detach_terminal", "detach", "Stop observing a terminal while leaving its process alive.", z.object({ id: z.string() }), (a) => shell.detach(a.id), undefined, "shell"),
+        gated("attach_terminal", "attach", "Reattach observation to an existing terminal session.", z.object({ id: z.string() }), (a) => shell.attach(a.id), undefined, "shell"),
         gated("list_terminals", "list", "List terminal sessions for reattachment.", z.object({}), () => shell.list(), undefined, "shell"),
         gated("navigate_terminal", "navigate", "Change an interactive terminal's working directory.", z.object({ id: z.string(), cwd: z.string() }), (a) => shell.navigate(a.id, a.cwd), undefined, "shell"),
         gated("resize_terminal", "resize", "Resize an interactive terminal.", z.object({ id: z.string(), cols: z.number().int().positive(), rows: z.number().int().positive() }), (a) => shell.resize(a.id, a.cols, a.rows), undefined, "shell"),
@@ -1895,7 +2121,11 @@ export class InnerLoop {
       const browser = optionalProvider("capability:browser");
       if (browser) {
       result.push(
-        gated("open_browser", "open", "Open a persistent Chromium browser session.", z.object({ id: z.string().optional(), headless: z.boolean().default(true) }), (a) => browser.open(a), undefined, "browser"),
+        gated("open_browser", "open", "Open a persistent Chromium browser session. If the target URL is known, provide it so the session navigates before returning; otherwise call browser_navigate immediately after this tool. Do not inspect or screenshot the initial blank page as if it were the target. Observation screenshots are saved under the agent workspace.", z.object({ id: z.string().optional(), url: z.string().url().optional().describe("Target page URL to navigate to before returning."), timeoutMs: z.number().positive().default(30_000), headless: z.boolean().default(true) }), async (a) => {
+          const opened = await browser.open({ ...a, agentId });
+          if (!a.url) return opened;
+          return { ...opened, ...(await browser.navigate(opened.id, a.url, a.timeoutMs)) };
+        }, undefined, "browser"),
         gated("browser_navigate", "navigate", "Navigate a browser session to a URL.", z.object({ id: z.string(), url: z.string().url(), timeoutMs: z.number().positive().default(30000) }), (a) => browser.navigate(a.id, a.url, a.timeoutMs), undefined, "browser"),
         gated("browser_click", "click", "Click an element selected with CSS or Playwright syntax.", z.object({ id: z.string(), selector: z.string() }), (a) => browser.click(a.id, a.selector), undefined, "browser"),
         gated("browser_type", "type", "Type into an element, optionally clearing and submitting.", z.object({ id: z.string(), selector: z.string(), text: z.string(), clear: z.boolean().default(false), submit: z.boolean().default(false) }), (a) => browser.type(a.id, a.selector, a.text, a), undefined, "browser"),
@@ -1908,11 +2138,18 @@ export class InnerLoop {
         gated("browser_forward", "forward", "Navigate forward.", z.object({ id: z.string() }), (a) => browser.forward(a.id), undefined, "browser"),
         gated("browser_wait", "waitFor", "Wait for an element to appear.", z.object({ id: z.string(), selector: z.string(), timeoutMs: z.number().positive().default(30000) }), (a) => browser.waitFor(a.id, a.selector, a.timeoutMs), undefined, "browser"),
         gated("browser_content", "content", "Get rendered text and HTML from an element.", z.object({ id: z.string(), selector: z.string().default("body") }), (a) => browser.content(a.id, a.selector), undefined, "browser"),
+        gated("observe_browser", "observe", "Collect a bounded browser snapshot: URL, title, visible text, readiness, console errors, network failures, and a durable screenshot.", z.object({ id: z.string() }), (a) => browser.observe(a.id), undefined, "browser"),
+        gated("attach_browser", "attach", "Reattach observation to a persistent browser session.", z.object({ id: z.string() }), (a) => browser.attachBrowser(a.id), undefined, "browser"),
+        gated("detach_browser", "detach", "Stop observing a browser while leaving the Chromium session alive.", z.object({ id: z.string() }), (a) => browser.detachBrowser(a.id), undefined, "browser"),
         gated("browser_evaluate_script", "evaluate", "Run one complete JavaScript/async IIFE in the page and return JSON-serializable observations. Use this for splash-screen timers, delayed transitions, games, performance measurements, and other time-bound behavior: collect the whole interaction and timing sequence inside one injected script instead of relying on many model round trips. If the requirement cannot be evaluated by one script or existing app instrumentation, report that limitation and request a shell test harness or instrumentation.", z.object({ id: z.string(), script: z.string().min(1).describe("A complete JavaScript expression or async IIFE that returns JSON-serializable observations/results.") }), (a) => browser.evaluate(a.id, a.script), undefined, "browser"),
         gated("browser_screenshot", "screenshot", "Capture a page, full page, or element screenshot. Screenshots are stored in the agent logs folder.", z.object({ id: z.string(), outputPath: z.string(), fullPage: z.boolean().default(false), selector: z.string().optional() }), async (a) => {
           const target = screenshotLogPath(workspaceRoot, agentId, a.outputPath);
           const savedPath = await browser.screenshot(a.id, target.absolute, a);
           return { screenshotPath: target.relative, screenshotAbsolutePath: savedPath };
+        }, undefined, "browser"),
+        gated("capture_browser_screenshot", "captureScreenshot", "Capture a durable screenshot for an observation window.", z.object({ id: z.string(), outputPath: z.string() }), async (a) => {
+          const target = screenshotLogPath(workspaceRoot, agentId, a.outputPath);
+          return { screenshotPath: target.relative, screenshotAbsolutePath: await browser.captureBrowserScreenshot(a.id, target.absolute) };
         }, undefined, "browser"),
         gated("close_browser", "close", "Close a Chromium session.", z.object({ id: z.string() }), (a) => browser.close(a.id), undefined, "browser"),
       );

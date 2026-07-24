@@ -6,7 +6,7 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
-    "build": "tsc -b"
+    "build": "tsc -b && cp src/benchmarks.json dist/benchmarks.json"
   },
   "dependencies": {
     "@langchain/core": "^1.2.2",

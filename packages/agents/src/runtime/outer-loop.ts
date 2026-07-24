@@ -46,6 +46,14 @@ function resolveMaxContinuations(): number {
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 20;
 }
 
+const DEFAULT_AGENT_EXTENSION_BUDGET_MS = 10 * 60 * 1000;
+const MAX_SINGLE_AGENT_EXTENSION_MS = 5 * 60 * 1000;
+
+function resolveAgentExtensionBudget(): number {
+  const raw = Number(process.env.YAAA_MAX_AGENT_EXTENSION_MS);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_AGENT_EXTENSION_BUDGET_MS;
+}
+
 // How many fix→re-verify rounds a failing verification may negotiate before the
 // subtask is declared failed. A failed verifier is not the end of the line: the
 // master sends the deliverable back to a worker to fix, then re-verifies.
@@ -484,7 +492,11 @@ export class OuterLoop {
   /** Drain messages posted while the run is busy and route them cooperatively
    * at a model-turn boundary. This keeps the LangGraph graph unchanged while
    * making the orchestrator a real event loop instead of a one-shot Promise. */
-  private async processQueuedMessages(taskId: string, force = false): Promise<void> {
+  private async processQueuedMessages(
+    taskId: string,
+    force = false,
+    extensionGrants: Map<string, number> = new Map(),
+  ): Promise<void> {
     await this.durableQueue?.recoverExpired("orchestrator");
     await orchestratorMailbox.hydrate(taskId, `orchestrator-${taskId}`);
     const queued = orchestratorMailbox.drain(taskId);
@@ -497,6 +509,45 @@ export class OuterLoop {
     }
     for (const message of queued) {
       if (message.from === "agent") {
+        if (message.kind === "extension_request") {
+          const targetAgent = agents.find((agent) => agent.id === message.agentId);
+          const targetId = targetAgent?.id ?? message.agentId;
+          const requestedMs = Math.min(
+            MAX_SINGLE_AGENT_EXTENSION_MS,
+            Math.max(1_000, Math.floor(Number(message.additionalMs) || 0)),
+          );
+          const key = `${taskId}:${targetId ?? "unknown"}`;
+          const usedMs = extensionGrants.get(key) ?? 0;
+          const remainingMs = Math.max(0, resolveAgentExtensionBudget() - usedMs);
+          const grantedMs = targetAgent && remainingMs > 0 ? Math.min(requestedMs, remainingMs) : 0;
+          if (targetAgent && grantedMs > 0) {
+            extensionGrants.set(key, usedMs + grantedMs);
+            agentControl.post(targetAgent.id, {
+              type: "extend",
+              additionalMs: grantedMs,
+              reason: message.content,
+            });
+            await this.bus.publish(`task.${taskId}.agent.${targetAgent.id}.thought`, {
+              kind: "thought",
+              from: "orchestrator",
+              taskId,
+              content: `⏱️ Extension approved: +${Math.round(grantedMs / 1000)}s. Budget remaining: ${Math.round((remainingMs - grantedMs) / 1000)}s.`,
+            });
+          } else if (targetAgent) {
+            const reason = usedMs >= resolveAgentExtensionBudget()
+              ? "The agent extension budget has been exhausted."
+              : "The extension request could not be approved because the agent is no longer active.";
+            agentControl.post(targetAgent.id, { type: "stop", reason });
+            await this.bus.publish(`task.${taskId}.agent.${targetAgent.id}.thought`, {
+              kind: "thought",
+              from: "orchestrator",
+              taskId,
+              content: `⛔ Extension denied. ${reason} Saving a checkpoint now.`,
+            });
+          }
+          await orchestratorMailbox.acknowledge(message.id);
+          continue;
+        }
         // The durable chat message is already authored by the worker. Do not
         // mirror it as a YAAA status bubble; that was the attribution bug shown
         // in the screenshot (YAAA appeared to speak for the sub-agent).
@@ -1271,6 +1322,7 @@ export class OuterLoop {
     const priorLedger = (await this.store.getLedgerEntries(taskId)) ?? [];
     let step = Math.max(0, ...priorLedger.map((entry) => entry.step)) + 1;
     const allocateStep = (): number => step++;
+    const extensionGrants = new Map<string, number>();
     // Warm Mesh's catalog once up front so the first agent does not pay the
     // lookup latency, and so an unreachable catalog is reported before any
     // subtask starts rather than mid-run.
@@ -1278,7 +1330,7 @@ export class OuterLoop {
 
     // Outer plan loop
     while (subtasks.some((st) => subtaskStates[st.id] !== "completed" && subtaskStates[st.id] !== "failed")) {
-      await this.processQueuedMessages(taskId);
+      await this.processQueuedMessages(taskId, false, extensionGrants);
       const readySubtasks = subtasks.filter(
         (st) =>
           subtaskStates[st.id] === "pending" &&
@@ -1305,7 +1357,7 @@ export class OuterLoop {
       const eventLoop = (async () => {
         while (polling) {
           try {
-            await this.processQueuedMessages(taskId);
+            await this.processQueuedMessages(taskId, false, extensionGrants);
           } catch (error) {
             warnOuter(taskId, "event-loop tick failed; will retry", {
               error: error instanceof Error ? error.message : String(error),
@@ -1348,7 +1400,7 @@ export class OuterLoop {
 
     // The run can finish between two event-loop ticks. Drain once more so a
     // message posted during that race cannot remain in the mailbox forever.
-    await this.processQueuedMessages(taskId, true);
+    await this.processQueuedMessages(taskId, true, extensionGrants);
 
     const finalLedger: LedgerEntry = {
       timestamp: new Date().toISOString(),

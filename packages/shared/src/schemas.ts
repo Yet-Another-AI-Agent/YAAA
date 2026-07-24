@@ -66,6 +66,11 @@ export const SubtaskSchema = z.object({
 export const TaskPlanSchema = z.object({
   goal: z.string(),
   subtasks: z.array(SubtaskSchema),
+  planningEstimate: z.object({
+    message: z.string().min(1),
+    considerations: z.array(z.string()),
+    expectedDurationMs: z.number().int().positive(),
+  }).optional(),
   planningAnalysis: z.object({
     implementationGoal: z.string(),
     decompositionRationale: z.string(),

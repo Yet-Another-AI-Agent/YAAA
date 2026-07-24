@@ -168,6 +168,38 @@ describe("InnerLoop Worker Loop (ReAct)", () => {
     );
   });
 
+  it("serializes multiple tool calls emitted in one model turn", async () => {
+    let active = 0;
+    let maximumActive = 0;
+    mockFilesProvider.readFile.mockImplementation(async () => {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      active -= 1;
+      return "file contents";
+    });
+    install([
+      new AIMessage({
+        content: "",
+        tool_calls: [
+          { name: "read_file", args: { path: "a.txt" }, id: "call_a", type: "tool_call" },
+          { name: "read_file", args: { path: "b.txt" }, id: "call_b", type: "tool_call" },
+        ],
+      }),
+      new AIMessage({ content: "Verified both files." }),
+    ]);
+
+    const result = await innerLoop.run({
+      agentId: "serialized-tools-agent",
+      taskId: "task-serialized-tools",
+      templateName: "FilesAgent",
+      instruction: "Read both files and report the result.",
+    });
+
+    expect(result.summary).toBe("Verified both files.");
+    expect(maximumActive).toBe(1);
+  });
+
   it("parses a verifier's structured result", async () => {
     install([new AIMessage({ content: JSON.stringify({ status: "passed", summary: "All sections present.", findings: [], evidence: ["report.md inspected"] }) })]);
 
@@ -527,6 +559,29 @@ describe("InnerLoop Worker Loop (ReAct)", () => {
     expect(toolLogs.some((line: string) => line.startsWith("✓"))).toBe(true);
   });
 
+  it("streams the model-provided progress key before executing a tool", async () => {
+    install([
+      toolCall("read_file", { path: "notes/plan.md", progress: "Checking the existing plan before making the next decision." }, "call-progress"),
+      new AIMessage({ content: "Read it." }),
+    ]);
+
+    await innerLoop.run({
+      agentId: "progress-agent",
+      taskId: "task-progress",
+      templateName: "FilesAgent",
+      instruction: "read the plan",
+    });
+
+    expect(mockBus.publish).toHaveBeenCalledWith(
+      "task.task-progress.agent.progress-agent.tool_requested",
+      expect.objectContaining({
+        content: "Checking the existing plan before making the next decision.",
+        metadata: expect.objectContaining({ progress: "Checking the existing plan before making the next decision." }),
+      }),
+    );
+    expect(mockFilesProvider.readFile).toHaveBeenCalledWith("notes/plan.md");
+  });
+
   it("times out when the first model call never returns", async () => {
     process.env.YAAA_AGENT_INVOKE_TIMEOUT_MS = "20";
     container.register("ChatModelFactory", () => new HangingChatModel());
@@ -648,7 +703,7 @@ describe("InnerLoop Worker Loop (ReAct)", () => {
     // Verify that the thought topic was published for loop guard
     expect(mockBus.publish).toHaveBeenCalledWith(
       "task.task-123.agent.loop-guard-agent.thought",
-      expect.objectContaining({ content: expect.stringContaining("Agent Loop Guard") }),
+      expect.objectContaining({ content: expect.stringContaining("Course correction injected by YAAA") }),
     );
 
     // Verify that the last turn model input messages actually contain the system notice

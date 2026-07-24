@@ -6,6 +6,18 @@ import type { TaskPlan } from "@yaaa/shared";
 import { Planner, type PlanContext } from "./planner.js";
 import { Synthesizer } from "./synthesizer.js";
 
+function isInternalArtifact(path: string): boolean {
+  return /(?:^|\/)(?:handsOn|handOff|proofOfWork|incompleteWork)\.md$/i.test(path);
+}
+
+function userFacingSummary(summary: string): string {
+  const clean = summary
+    .replace(/```yaaa-viewer[\s\S]*?```/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return clean.length > 900 ? `${clean.slice(0, 897).trimEnd()}…` : clean;
+}
+
 export class Supervisor {
   private planner: Planner;
   private outerLoop: OuterLoop;
@@ -56,6 +68,16 @@ export class Supervisor {
       const resultMessages = messages.filter((m) => m.kind === "result");
       const allArtifacts = resultMessages.flatMap((m: any) => m.artifacts || []);
 
+      const deliverablePaths = [...new Set(
+        allArtifacts
+          .map((art: any) => String(art.path ?? ""))
+          .filter((path) => path && !isInternalArtifact(path)),
+      )];
+      const conciseSummary = userFacingSummary(result.summary);
+      const summaryWithFiles = deliverablePaths.length
+        ? `${conciseSummary}\n\nFiles: ${deliverablePaths.join(", ")}`
+        : conciseSummary;
+
       let viewerBlocks = "";
       const seen = new Set<string>();
       for (const art of allArtifacts) {
@@ -78,12 +100,12 @@ export class Supervisor {
         from: "orchestrator",
         taskId: activeTaskId,
         state: "done",
-        note: `Goal achieved. Summary: ${result.summary}${viewerBlocks}`
+        note: `Goal achieved. Summary: ${summaryWithFiles}${viewerBlocks}`
       });
 
       return {
         success: result.passed,
-        summary: `${result.summary}${viewerBlocks}`,
+        summary: `${summaryWithFiles}${viewerBlocks}`,
         plan,
       };
     } catch (err: any) {

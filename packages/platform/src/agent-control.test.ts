@@ -33,4 +33,15 @@ describe("AgentControlMailbox", () => {
     mailbox.clear("a1");
     expect(mailbox.hasPending("a1")).toBe(false);
   });
+
+  it("takes live extensions and stops without consuming deferred redirects", () => {
+    const mailbox = new AgentControlMailbox();
+    mailbox.post("a1", { type: "extend", additionalMs: 1_000 });
+    mailbox.post("a1", { type: "redirect", handsOn: "do X" });
+    mailbox.post("a1", { type: "extend", additionalMs: 2_000 });
+    mailbox.post("a1", { type: "stop", reason: "budget exhausted" });
+
+    expect(mailbox.takeLive("a1")).toEqual({ additionalMs: 3_000, stopReason: "budget exhausted" });
+    expect(mailbox.drain("a1")).toEqual([{ type: "redirect", handsOn: "do X" }]);
+  });
 });

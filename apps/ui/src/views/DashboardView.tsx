@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState, useMemo, type FormEvent } from "react";
+import { useRef, useEffect, useState, useMemo, type FormEvent, type ReactNode } from "react";
 import logoImg from "../assets/logo.jpg";
 import type { TaskViewModel } from "../viewmodels/useTaskViewModel";
 import { TaskModel, type UIAgent, type UIAgentWorkspaceSnapshot, type UIMissionSnapshot } from "../models/TaskModel";
@@ -82,8 +82,17 @@ function getGreeting(): string {
   return "Good Night";
 }
 
+function compactText(text: string, maxLength = 240): string {
+  const plain = text
+    .replace(/```[\s\S]*?```/g, "[code]")
+    .replace(/[#>*_`~-]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return plain.length > maxLength ? `${plain.slice(0, maxLength).trimEnd()}…` : plain;
+}
+
 function orchestratorModelForPreference(preference?: "sota" | "balanced" | "cost-effective"): string {
-  if (preference === "sota") return "anthropic/claude-sonnet-4.5";
+  if (preference === "sota") return "OpenAI GPT · best available from Mesh";
   if (preference === "cost-effective") return "google/gemini-2.5-pro-preview";
   return "google/gemini-3.1-pro-preview";
 }
@@ -122,6 +131,67 @@ function formatElapsed(ms: number): string {
   return `${remainingSeconds}s`;
 }
 
+function isActivitySettled(log: UILog, activity: UILog[]): boolean {
+  const capability = metadataText(log.metadata, "capability");
+  const method = metadataText(log.metadata, "method");
+  const actionId = metadataText(log.metadata, "actionId");
+  const logIndex = activity.findIndex((candidate) => candidate.id === log.id);
+  return activity.some((candidate) => {
+    const candidateIndex = activity.findIndex((item) => item.id === candidate.id);
+    if (candidate.id === log.id || (logIndex >= 0 && candidateIndex <= logIndex)) return false;
+    const sameAction = actionId && metadataText(candidate.metadata, "actionId") === actionId;
+    const sameTool = capability && method
+      && metadataText(candidate.metadata, "capability") === capability
+      && metadataText(candidate.metadata, "method") === method;
+    if (!sameAction && !sameTool) return false;
+    return /(?:completed|failed|denied|exited|done|captured|returned|error|✓|✗)/i.test(candidate.content);
+  });
+}
+
+function isPendingActivity(log: UILog, activity: UILog[]): boolean {
+  if (/(?:completed|failed|denied|exited|done|captured|returned|error|✓|✗)/i.test(log.content)) return false;
+  const capability = metadataText(log.metadata, "capability");
+  const method = metadataText(log.metadata, "method");
+  return !isActivitySettled(log, activity) && (
+    /(?:requested|started|waiting|observing)(?:\.\.\.|$)/i.test(log.content)
+    || (Boolean(capability && method) && /🛠️/.test(log.content))
+  );
+}
+
+function isToolCompletion(log: UILog): boolean {
+  return log.kind === "activity"
+    && /(?:completed|failed|denied|exited|done|captured|returned|error|✓|✗)/i.test(log.content);
+}
+
+function modelTimeoutFromActivity(activity: UILog[]): number | null {
+  const timeoutLog = activity.find((log) => /first progress timeout \d+ms/i.test(log.content));
+  const match = timeoutLog?.content.match(/first progress timeout (\d+)ms/i);
+  return match ? Number(match[1]) : null;
+}
+
+function activityWaitDescription(log: UILog): string {
+  if (log.kind === "thinking" && /→\s*LLM\s*\(/i.test(log.content)) {
+    return "Waiting for model response";
+  }
+  const capability = metadataText(log.metadata, "capability");
+  const method = metadataText(log.metadata, "method");
+  if (capability === "browser") {
+    if (/screenshot|observe|capture/i.test(method || "")) return "Capturing browser state and screenshot";
+    return "Waiting for browser action to return";
+  }
+  if (capability === "shell") return "Waiting for terminal output";
+  if (capability === "files") return "Waiting for file operation to finish";
+  return "Waiting for tool result";
+}
+
+function isLlmRequest(log: UILog): boolean {
+  return log.kind === "thinking" && /→\s*LLM\s*\(/i.test(log.content);
+}
+
+function isLlmResponse(log: UILog): boolean {
+  return log.kind === "thinking" && /LLM\s*→/i.test(log.content);
+}
+
 function AgentWorkingStatus({ agent, activity }: { agent: UIAgent; activity: UILog[] }) {
   const active = ["planned", "working", "blocked"].includes(agent.status);
   const [now, setNow] = useState(Date.now());
@@ -136,9 +206,23 @@ function AgentWorkingStatus({ agent, activity }: { agent: UIAgent; activity: UIL
 
   const startedAt = agent.startedAt ? Date.parse(agent.startedAt) : NaN;
   const startedMs = Number.isFinite(startedAt) ? startedAt : activity[0]?.createdAt ?? now;
-  const latest = [...activity].reverse().find((log) => log.kind === "activity") ?? activity.at(-1);
+  const orderedActivity = [...activity].sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
+  const latest = orderedActivity.at(-1);
+  const latestLlmRequest = [...orderedActivity].reverse().find(isLlmRequest);
+  const latestLlmResponse = [...orderedActivity].reverse().find(isLlmResponse);
+  const llmPending = Boolean(latestLlmRequest
+    && (latestLlmRequest.createdAt ?? 0) > (latestLlmResponse?.createdAt ?? 0));
+  const pendingLog = llmPending ? latestLlmRequest : latest;
   const latestMs = latest?.createdAt;
+  const pendingMs = pendingLog?.createdAt;
   const latestText = latest?.content.replace(/^🛠️\s*/, "") || "Waiting for first activity update.";
+  const waitingAfterTool = Boolean(latest && isToolCompletion(latest)
+    && metadataText(latest.metadata, "capability")
+    && metadataText(latest.metadata, "method"));
+  const latestPending = llmPending || waitingAfterTool || Boolean(latest && latest.kind === "activity" && isPendingActivity(latest, activity));
+  const waitingMs = pendingMs ? Math.max(0, now - pendingMs) : 0;
+  const modelTimeoutMs = modelTimeoutFromActivity(activity);
+  const modelTimeoutRemaining = modelTimeoutMs === null ? null : Math.max(0, modelTimeoutMs - Math.max(0, now - startedMs));
   const latestLabel = latest
     ? `Last update ${latestMs ? `${formatElapsed(now - latestMs)} ago` : "just now"}`
     : "Waiting for first update";
@@ -148,8 +232,59 @@ function AgentWorkingStatus({ agent, activity }: { agent: UIAgent; activity: UIL
       <span className="thread-live-dot" aria-hidden="true" />
       <span>Working for {formatElapsed(now - startedMs)}</span>
       <span className="thread-live-muted">{latestLabel}</span>
-      <span className="thread-live-action">{latestText}</span>
+      <span className="thread-live-action">{latestPending && pendingLog
+        ? `${waitingAfterTool && !llmPending
+          ? `Waiting for model response after ${toolLabel(latest?.metadata)}`
+          : activityWaitDescription(pendingLog)} · ${formatElapsed(waitingMs)}${modelTimeoutRemaining !== null ? ` · auto-timeout in ${formatElapsed(modelTimeoutRemaining)}` : ""}`
+        : latestText}</span>
+      {latest && waitingMs >= 30_000 && (
+        <span className="thread-live-warning">No new event for {formatElapsed(waitingMs)}. The last tool completed; YAAA is waiting for the model/provider to return the next update.</span>
+      )}
     </div>
+  );
+}
+
+function AgentBrainMap({ agents, logs }: { agents: UIAgent[]; logs: UILog[] }) {
+  return (
+    <section className="agent-brain-map" aria-label="YAAA and connected agents">
+      <div className="agent-brain-root">
+        <img src={logoImg} alt={ORCHESTRATOR_DISPLAY} />
+        <div>
+          <strong>{ORCHESTRATOR_DISPLAY}</strong>
+          <span>Mission brain · coordinating execution</span>
+        </div>
+        <span className="agent-brain-pulse" aria-hidden="true" />
+      </div>
+      <div className="agent-brain-connector" aria-hidden="true" />
+      {agents.length === 0 ? (
+        <div className="agent-brain-empty">Agents will appear here when YAAA starts the approved plan.</div>
+      ) : (
+        <div className="agent-brain-agents">
+          {agents.map((agent) => {
+            const identity = agentIdentity(agent.id, agent.role, agent.displayName, agent.handle);
+            const activity = getAgentActivity(agent, logs);
+            const latest = activity.at(-1);
+            return (
+              <div className={`agent-brain-card ${agent.status}`} key={agent.id}>
+                <div className="agent-brain-card-header">
+                  {agent.pokemonImage ? <img src={agent.pokemonImage} alt={identity.firstName} /> : <span className="agent-brain-avatar">◉</span>}
+                  <div>
+                    <strong>{identity.firstName}</strong>
+                    <span>{identity.roleLabel}</span>
+                  </div>
+                  <span className={`detail-status-pill ${agent.status}`}>{agent.status === "working" ? "working…" : agent.status}</span>
+                </div>
+                <div className="agent-brain-card-assignment">{agent.activeAssignment || agent.initialGoal || agent.subtaskId}</div>
+                <div className="agent-brain-card-now">
+                  <span>Latest log</span>
+                  <p>{latest?.content.replace(/^🛠️\s*/, "") || "Waiting for first activity…"}</p>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -194,6 +329,7 @@ function extractClarifyingQuestions(content: string): ClarifyingQuestion[] {
     .filter(Boolean);
   const questions: ClarifyingQuestion[] = [];
   const hasStructuredItems = lines.some((line) => /^\s*(?:[-*]|\d+[.)])\s+/.test(line));
+  const hasOptionsBlock = lines.some((line) => /^\s*options?\s*:/i.test(line));
   for (const line of lines) {
     const isListItem = /^\s*(?:[-*]|\d+[.)])\s+/.test(line);
     const text = line.replace(/^\s*(?:[-*]|\d+[.)])\s+/, "").trim();
@@ -201,7 +337,7 @@ function extractClarifyingQuestions(content: string): ClarifyingQuestion[] {
     // Unbulleted prose is often an introductory sentence. When a structured
     // list follows it, only the list's question prompts should become form
     // questions; the introduction must never become a radio option/question.
-    if (isQuestion && (isListItem || !hasStructuredItems)) {
+    if (isQuestion && (isListItem || !hasStructuredItems || hasOptionsBlock)) {
       questions.push({ question: text, options: [] });
       continue;
     }
@@ -219,17 +355,20 @@ function extractClarifyingQuestions(content: string): ClarifyingQuestion[] {
     if (item.options.length === 0) item.options = inferInlineOptions(item.question);
     // “Other” is a radio choice when combined with real choices, but when it
     // is the only option the question becomes a plain free-text field.
-    const hasOther = item.options.some(isOtherOption);
     const regularOptions = item.options.filter((option) => !isOtherOption(option));
-    item.options = regularOptions.length > 0 && hasOther ? [...regularOptions, "Other"] : regularOptions;
+    // Keep a free-form escape hatch for model-generated option lists even when
+    // the model forgot to include an explicit “Other” choice.
+    item.options = regularOptions.length > 0 ? [...regularOptions, "Other"] : regularOptions;
     return true;
   }).slice(0, 8);
 }
 
 function isExplicitClarification(content: string): boolean {
-  return /(?:^|\n)\s*(?:need\s+(?:a\s+few\s+)?clarifications?|clarifying questions?|questions for you|follow-up questions?)\s*:?/i.test(content)
+  return /(?:^|\n)\s*(?:(?:i\s+)?need\s+(?:a\s+few\s+)?clarifications?|clarifying questions?|questions for you|follow-up questions?)\s*:?/i.test(content)
     || /(?:^|\n)\s*options\s*:/i.test(content)
-    || extractClarifyingQuestions(content).some((item) => inferInlineOptions(item.question).length > 0);
+    || extractClarifyingQuestions(content).some((item) =>
+      inferInlineOptions(item.question).length > 0 || isLabeledQuestion(item.question),
+    );
 }
 
 function extractQuestionItems(content: string): string[] {
@@ -237,10 +376,16 @@ function extractQuestionItems(content: string): string[] {
 }
 
 function QuestionCarousel({
+  messageId,
   content,
+  submitted: submittedProp = false,
+  onSubmitted,
   onSubmit,
 }: {
+  messageId: string;
   content: string;
+  submitted?: boolean;
+  onSubmitted?: () => void;
   onSubmit: (message: string) => void;
 }) {
   const questions = useMemo(() => extractClarifyingQuestions(content), [content]);
@@ -251,7 +396,10 @@ function QuestionCarousel({
   // Once sent, the form is spent: it stays visible as a record of what was
   // answered, but every control is disabled so a second click (or an Enter in
   // the textarea) cannot send a duplicate set of answers.
-  const [submitted, setSubmitted] = useState(false);
+  const [submitted, setSubmitted] = useState(submittedProp);
+  useEffect(() => {
+    if (submittedProp) setSubmitted(true);
+  }, [submittedProp]);
 
   if (questions.length === 0) return null;
 
@@ -277,12 +425,14 @@ function QuestionCarousel({
       .filter(Boolean)
       .join("\n\n");
     setSubmitted(true);
+    onSubmitted?.();
     onSubmit(`Answers to your questions:\n\n${body}`);
   };
 
   return (
     <form
       className={`question-carousel${submitted ? " question-carousel-submitted" : ""}`}
+      data-question-id={messageId}
       onSubmit={submit}
       aria-label="Clarifying questions"
     >
@@ -308,9 +458,13 @@ function QuestionCarousel({
           ))}
         </fieldset>
       )}
-      {(currentQuestion.options.length === 0 || currentOption === "Other") && (
+      <>
         <label className="question-carousel-other-label">
-          {currentQuestion.options.length === 0 ? "Your answer" : "Other"}
+          {currentQuestion.options.length === 0
+            ? "Your answer"
+            : currentOption === "Other"
+              ? "Other"
+              : "Additional details (optional)"}
           <textarea
             className="question-carousel-answer"
             value={currentOther}
@@ -320,7 +474,7 @@ function QuestionCarousel({
             onChange={(event) => setOtherAnswers((prev) => ({ ...prev, [index]: event.target.value }))}
           />
         </label>
-      )}
+      </>
       <div className="question-carousel-actions">
         <button
           type="button"
@@ -355,7 +509,7 @@ function QuestionCarousel({
   );
 }
 
-function ActivityPreview({ log }: { log: UILog }) {
+function ActivityPreview({ log, activity = [] }: { log: UILog; activity?: UILog[] }) {
   const metadata = log.metadata;
   const screenshotPath = metadataText(metadata, "screenshotPath");
   const screenshotDataUrl = metadataText(metadata, "screenshotDataUrl");
@@ -365,35 +519,90 @@ function ActivityPreview({ log }: { log: UILog }) {
   const path = metadataText(metadata, "path");
   const stdout = metadataText(metadata, "stdout");
   const stderr = metadataText(metadata, "stderr");
+  const timedOut = metadata?.timedOut === true;
+  const durationMs = typeof metadata?.durationMs === "number" ? metadata.durationMs : null;
+  const expectedDurationMs = typeof metadata?.expectedDurationMs === "number" ? metadata.expectedDurationMs : null;
+  const observationPlan = metadata?.observationPlan && typeof metadata.observationPlan === "object"
+    ? metadata.observationPlan as Record<string, unknown>
+    : null;
+  const observationCapture = observationPlan && Array.isArray(observationPlan.capture)
+    ? observationPlan.capture.filter((item): item is string => typeof item === "string")
+    : [];
+  const capability = metadataText(metadata, "capability");
+  const method = metadataText(metadata, "method");
+  const pending = isPendingActivity(log, activity);
+  const mode = capability === "files" && /write|create|move|copy/i.test(method || "")
+    ? "file"
+    : capability === "shell"
+      ? "terminal"
+      : capability === "browser"
+        ? "browser"
+        : null;
   const title = metadataText(metadata, "title");
   const label = toolLabel(metadata);
   const results = Array.isArray(metadata?.results) ? metadata.results.slice(0, 3) : [];
-  const hasPreviewMedia = Boolean(screenshotPath || screenshotDataUrl);
+  const mediaSrc = screenshotDataUrl || (screenshotPath && /^(?:https?:|file:|data:|\/)/.test(screenshotPath)
+    ? previewImageSrc(screenshotPath)
+    : null);
+  const [mediaFailed, setMediaFailed] = useState(false);
+  useEffect(() => setMediaFailed(false), [screenshotDataUrl, screenshotPath]);
+  const hasPreviewMedia = Boolean(mediaSrc && !mediaFailed);
   const hasCommandTranscript = Boolean(command && (stdout || stderr));
-  const hasResultDetails = results.length > 0 || Boolean(stdout || stderr);
-  const showDetails = hasPreviewMedia || hasCommandTranscript || hasResultDetails;
+  const hasResultDetails = results.length > 0 || Boolean(stdout || stderr || title || query || url || path || metadataText(metadata, "progress"));
+  const showDetails = hasPreviewMedia || hasCommandTranscript || hasResultDetails || timedOut;
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (!pending) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [pending]);
+  const waitingFor = pending ? activityWaitDescription(log) : "";
 
   return (
-    <div className={`agent-space-action-row ${showDetails ? "with-details" : ""}`}>
-      <div className="agent-space-action-body">
-        <div className="agent-space-action-main">
-          {label && <span className="agent-space-tool-pill">{label}</span>}
-          <span className="agent-space-action-text">{log.content}</span>
-        </div>
+    <details className={`agent-space-log-card ${showDetails ? "with-details" : ""}`}>
+      <summary className="agent-space-log-summary">
+        <span className="agent-space-action-icon" aria-hidden="true">{log.kind === "thinking" ? "🧠" : log.kind === "activity" ? "🔧" : "•"}</span>
+        <span className="agent-space-action-body">
+          <span className="agent-space-action-main">
+            {label && <span className="agent-space-tool-pill">{label}</span>}
+            <span className="agent-space-action-text">{compactText(log.content)}</span>
+          </span>
+          {mode && <ExecutionModeIndicator mode={mode} pending={pending} hasScreenshot={hasPreviewMedia} metadata={metadata} />}
+          {pending && (
+            <span className="agent-space-action-pending" role="status">
+              <span className="agent-space-pending-dot" aria-hidden="true" />
+              <span>{waitingFor}</span>
+              <span>{formatElapsed(Math.max(0, now - (log.createdAt ?? now)))}</span>
+            </span>
+          )}
+        </span>
+        <span className="agent-space-log-toggle">Details</span>
+      </summary>
+      <div className="agent-space-log-content">
+        <div className="agent-space-log-markdown">{renderMarkdown(log.content)}</div>
         {showDetails && (
-          <div className={`agent-space-action-details ${screenshotDataUrl || screenshotPath ? "" : "no-thumbnail"}`}>
-            {(screenshotDataUrl || screenshotPath) && (
-              <img
-                className="agent-space-action-thumbnail"
-                src={screenshotDataUrl || previewImageSrc(screenshotPath || "")}
-                alt={title || query || url || "Tool preview"}
-              />
+          <div className={`agent-space-action-details ${hasPreviewMedia ? "" : "no-thumbnail"}`}>
+            {mediaSrc && !mediaFailed && (
+              <div className={`browser-screenshot-frame ${pending ? "pending" : ""}`}>
+                <img
+                  className="agent-space-action-thumbnail"
+                  src={mediaSrc}
+                  alt={title || query || url || "Tool preview"}
+                  onError={() => setMediaFailed(true)}
+                />
+                {pending && <span className="browser-screenshot-scanline" aria-label="Capturing browser screenshot" />}
+              </div>
             )}
             <div className="agent-space-action-meta">
+              {timedOut && <div className="agent-space-action-line timeout"><span>Timeout</span>{durationMs ? `Stopped after ${formatElapsed(durationMs)}` : "Command stopped by timeout"}</div>}
               {title && <div className="agent-space-action-title">{title}</div>}
               {query && results.length > 0 && <div className="agent-space-action-line"><span>Query</span>{query}</div>}
               {url && hasPreviewMedia && <div className="agent-space-action-line"><span>URL</span>{url}</div>}
               {path && hasPreviewMedia && <div className="agent-space-action-line"><span>Path</span>{path}</div>}
+              {metadataText(metadata, "progress") && <div className="agent-space-action-line"><span>Progress</span>{metadataText(metadata, "progress")}</div>}
+              {expectedDurationMs && <div className="agent-space-action-line"><span>LLM estimate</span>{formatElapsed(expectedDurationMs)}</div>}
+              {observationCapture.length > 0 && <div className="agent-space-action-line"><span>Evidence</span>{observationCapture.join(", ")}</div>}
+              {typeof observationPlan?.detachWhen === "string" && <div className="agent-space-action-line"><span>Detach when</span>{observationPlan.detachWhen}</div>}
               {command && <pre className="agent-space-command"><code>$ {command}</code></pre>}
               {stdout && <pre className="agent-space-output"><code>{stdout}</code></pre>}
               {stderr && <pre className="agent-space-output error"><code>{stderr}</code></pre>}
@@ -401,7 +610,13 @@ function ActivityPreview({ log }: { log: UILog }) {
                 <div className="agent-space-results">
                   {results.map((result, index) => {
                     const item = result && typeof result === "object" ? result as Record<string, unknown> : {};
-                    const resultTitle = typeof item.title === "string" ? item.title : `Result ${index + 1}`;
+                    const resultText = typeof result === "string" ? result : "";
+                    const resultPath = ["path", "relativePath", "filePath", "name", "filename"]
+                      .map((key) => item[key])
+                      .find((value): value is string => typeof value === "string" && value.trim().length > 0) ?? "";
+                    const resultTitle = typeof item.title === "string" && item.title.trim()
+                      ? item.title
+                      : resultPath || resultText || `Result ${index + 1}`;
                     const resultUrl = typeof item.url === "string" ? item.url : "";
                     const description = typeof item.description === "string" ? item.description : "";
                     return (
@@ -418,6 +633,49 @@ function ActivityPreview({ log }: { log: UILog }) {
           </div>
         )}
       </div>
+    </details>
+  );
+}
+
+function ExecutionModeIndicator({
+  mode,
+  pending,
+  hasScreenshot = false,
+  metadata,
+}: {
+  mode: "file" | "terminal" | "browser";
+  pending: boolean;
+  hasScreenshot?: boolean;
+  metadata?: Record<string, unknown>;
+}) {
+  const path = metadataText(metadata, "path") || metadataText(metadata, "command") || metadataText(metadata, "url");
+  if (mode === "file") {
+    return (
+      <div className={`execution-mode-indicator file-mode ${pending ? "pending" : "complete"}`}>
+        <span className="file-writing-glyph" aria-hidden="true">▤</span>
+        <span>{pending ? "Writing changes" : "File change recorded"}</span>
+        {path && <code title={path}>{path}</code>}
+        {pending && <span className="writing-shimmer" aria-hidden="true" />}
+      </div>
+    );
+  }
+  if (mode === "terminal") {
+    return (
+      <div className={`execution-mode-indicator terminal-mode ${pending ? "pending" : "complete"}`}>
+        <span className="terminal-prompt" aria-hidden="true">$</span>
+        <span className="terminal-animation-lines" aria-hidden="true"><i /><i /><i /></span>
+        <span>{pending ? "Terminal is running" : "Terminal update received"}</span>
+        {path && <code title={path}>{path}</code>}
+        {pending && <span className="terminal-cursor" aria-hidden="true" />}
+      </div>
+    );
+  }
+  const browserPending = pending && !hasScreenshot;
+  return (
+    <div className={`execution-mode-indicator browser-mode ${browserPending ? "pending" : "complete"}`}>
+      <span className={`browser-orbit ${browserPending ? "pending" : "complete"}`} aria-hidden="true"><i /></span>
+      <span>{browserPending ? "Observing browser" : hasScreenshot ? "Screenshot available" : "Browser state described"}</span>
+      {path && <code title={path}>{path}</code>}
     </div>
   );
 }
@@ -713,6 +971,7 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
   const [loadingHistory, setLoadingHistory] = useState(false);
   const activeHistoryRequestRef = useRef<string | null>(null);
   const [typedMessageIds, setTypedMessageIds] = useState<Set<string>>(new Set());
+  const [submittedQuestionIds, setSubmittedQuestionIds] = useState<Set<string>>(new Set());
   const [orchestratorModel, setOrchestratorModel] = useState(orchestratorModelForPreference());
 
   useEffect(() => {
@@ -741,6 +1000,14 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
   const [annotating, setAnnotating] = useState(false);
   const [viewerModal, setViewerModal] = useState<ViewerSpec | null>(null);
   const [expandedAgentArtifactGroups, setExpandedAgentArtifactGroups] = useState<Set<string>>(new Set());
+  const [agentArtifactPages, setAgentArtifactPages] = useState<Record<string, number>>({});
+  const [rightPanelPages, setRightPanelPages] = useState<Record<string, number>>({});
+
+  useEffect(() => {
+    setAgentArtifactPages({});
+    setRightPanelPages({});
+    setSubmittedQuestionIds(new Set());
+  }, [selectedTaskId, taskId]);
   const activeArtifactRequestRef = useRef(0);
 
   // Plan review modal: view the proposed orchestrator.md, comment on it, then
@@ -754,6 +1021,8 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
 
   // Sub-agent thread currently expanded into the full-screen thread view.
   const [openThreadAgentId, setOpenThreadAgentId] = useState<string | null>(null);
+  const [expandedThreadActivity, setExpandedThreadActivity] = useState(false);
+  const [expandedThreadResult, setExpandedThreadResult] = useState(false);
   const [agentWorkspaces, setAgentWorkspaces] = useState<Record<string, UIAgentWorkspaceSnapshot>>({});
 
   // User's name from onboarding profile
@@ -1279,10 +1548,10 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
         // Add live logs. System status logs are rendered inline
         // and cleared upon completion.
         logs.forEach((log) => {
-          // Sub-agent tool activity belongs to that agent's channel, but
-          // lightweight thinking should still stream into the mission so the
-          // user can see progress while a long run is active.
-          if (log.source === "agent" && log.kind === "activity") return;
+          // Sub-agent thoughts and tool activity belong to that agent's
+          // channel. The main workplace is YAAA's voice; Agent Space and the
+          // agent thread expose the worker's detailed stream separately.
+          if (log.source === "agent") return;
 
           let sender = "Agent";
           if (log.source === "system") sender = "System";
@@ -1496,11 +1765,66 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
     });
   };
 
+  const renderAgentArtifacts = (groupKey: string, entries: ArtifactExplorerEntry[], groupLabel: string) => {
+    const pageSize = 5;
+    const pageCount = Math.ceil(entries.length / pageSize);
+    const page = Math.min(agentArtifactPages[groupKey] ?? Math.max(0, pageCount - 1), Math.max(0, pageCount - 1));
+    const visibleEntries = entries.slice(page * pageSize, (page + 1) * pageSize);
+    return (
+      <>
+        {visibleEntries.map((art) => renderArtifactItem(art, groupLabel))}
+        {pageCount > 1 && (
+          <div className="artifact-pagination" role="navigation" aria-label={`${groupLabel} pagination`}>
+            <button
+              type="button"
+              className="artifact-pagination-button"
+              disabled={page === 0}
+              onClick={() => setAgentArtifactPages((current) => ({ ...current, [groupKey]: Math.max(0, page - 1) }))}
+            >
+              ← Older
+            </button>
+            <span className="artifact-pagination-status">Page {page + 1} of {pageCount} · {entries.length} documents</span>
+            <button
+              type="button"
+              className="artifact-pagination-button"
+              disabled={page >= pageCount - 1}
+              onClick={() => setAgentArtifactPages((current) => ({ ...current, [groupKey]: Math.min(pageCount - 1, page + 1) }))}
+            >
+              Newer →
+            </button>
+          </div>
+        )}
+      </>
+    );
+  };
+
+  const renderRightPanelList = <T,>(key: string, entries: T[], render: (entry: T) => ReactNode) => {
+    const pageSize = 5;
+    const pageCount = Math.ceil(entries.length / pageSize);
+    const page = Math.min(rightPanelPages[key] ?? Math.max(0, pageCount - 1), Math.max(0, pageCount - 1));
+    return (
+      <>
+        {entries.slice(page * pageSize, (page + 1) * pageSize).map(render)}
+        {pageCount > 1 && (
+          <div className="artifact-pagination right-panel-pagination" role="navigation" aria-label={`${key} pagination`}>
+            <button type="button" className="artifact-pagination-button" disabled={page === 0} onClick={() => setRightPanelPages((current) => ({ ...current, [key]: page - 1 }))}>← Older</button>
+            <span className="artifact-pagination-status">{page === pageCount - 1 ? "Latest page" : `Page ${page + 1}`} · {pageCount}</span>
+            <button type="button" className="artifact-pagination-button" disabled={page >= pageCount - 1} onClick={() => setRightPanelPages((current) => ({ ...current, [key]: page + 1 }))}>Newer →</button>
+          </div>
+        )}
+      </>
+    );
+  };
+
   // One collapsed card per spawned sub-agent: the assignment/handoff document
   // opens in the viewer, and "View channel" opens that agent's full sub-channel.
   const renderMissionThreadCard = ({ agent, activity, result, assignment }: (typeof missionThreads)[number]) => {
     const identity = labelForSender(agent.id);
     const resultText = result || (agent.status === "working" ? `YAAA assigned ${identity} to: ${assignment}` : "No result summary reported yet.");
+    const latestActivity = activity.at(-1);
+    const location = metadataText(latestActivity?.metadata, "path")
+      || metadataText(latestActivity?.metadata, "url")
+      || metadataText(latestActivity?.metadata, "command");
     return (
       <div className="mission-thread-card" key={`card-${agent.id}`}>
         <div className="slack-message-avatar mission-thread-avatar">
@@ -1509,11 +1833,33 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
         <div className="mission-thread-body">
           <div className="mission-thread-header">
             <span className="mission-thread-name">{identity}</span>
-            <span className={`detail-status-pill ${agent.status}`}>{agent.status}</span>
+            <span className={`detail-status-pill ${agent.status}`}>{agent.status === "working" ? "working…" : agent.status}</span>
           </div>
+          <AgentWorkingStatus agent={agent} activity={activity} />
+          {latestActivity && (
+            <details className="mission-thread-now-collapsible">
+              <summary>
+                <span className="mission-thread-now-label">Now</span>
+                <span className="mission-thread-now-preview" title={latestActivity.content}>
+                  {compactText(latestActivity.content.replace(/^🛠️\s*/, ""), 220)}
+                </span>
+                {location && <code title={location}>{location}</code>}
+                <span className="mission-thread-now-toggle">Details</span>
+              </summary>
+              <div className="mission-thread-now-details">
+                {renderMarkdown(latestActivity.content.replace(/^🛠️\s*/, ""))}
+              </div>
+            </details>
+          )}
           <div className="mission-thread-handoff mission-thread-result">
             <span className="mission-thread-handoff-label">Relevant result</span>
-            <div className="mission-thread-handoff-text">{resultText}</div>
+            <details className="mission-thread-result-collapsible">
+              <summary>
+                <span>{compactText(resultText)}</span>
+                <span className="mission-thread-result-toggle">Click to open</span>
+              </summary>
+              <div className="mission-thread-handoff-text">{renderMarkdown(resultText)}</div>
+            </details>
           </div>
         </div>
         <button
@@ -1548,6 +1894,14 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
     }
     return groups;
   }, [displayMessages]);
+
+  const intermediateProgress = useMemo(
+    () => logs
+      .filter((log) => (log.kind === "activity" || log.kind === "system") && log.metadata?.transient !== true)
+      .slice(-20)
+      .map((log) => ({ id: `progress-${log.id}`, content: log.content, time: log.time })),
+    [logs],
+  );
 
   return (
     <div className="dash-root fade-in-dashboard">
@@ -1817,6 +2171,7 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
                         key={group.id}
                         items={group.items.map((m) => ({ id: m.id, content: m.content, time: m.time }))}
                         live={running && !selectedTaskId && isLastGroup}
+                        intermediateSteps={isLastGroup ? intermediateProgress : []}
                       />
                     );
                   }
@@ -1914,7 +2269,14 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
                         <div className="slack-message-text">
                           {canAnswerQuestions ? (
                             <QuestionCarousel
+                              messageId={msg.id}
                               content={msg.content}
+                              submitted={submittedQuestionIds.has(msg.id)}
+                              onSubmitted={() => setSubmittedQuestionIds((previous) => {
+                                const next = new Set(previous);
+                                next.add(msg.id);
+                                return next;
+                              })}
                               onSubmit={(message) => continueMission(message, selectedTaskId || taskId || undefined)}
                             />
                           ) : (msg.id === displayMessages.filter(m => m.sender !== 'User' && m.kind === 'response').pop()?.id && !selectedTaskId && !msg.isHistorical && !typedMessageIds.has(msg.id) && !msg.content.includes("```yaaa-viewer") && !isLargeMarkdown(msg.content)) ? (
@@ -2043,81 +2405,13 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
               </div>
               <div className="agent-space-body">
                 <div className="agent-space-heading">Named agents, execution state, and activity</div>
-                {agents.length === 0 ? (
-                  <div className="agent-space-note">
-                    Confirm the plan so YAAA can create the sub-agents assigned to this mission.
-                  </div>
-                ) : (
-                  <>
-                    <details className="agent-space-block" key="yaaa-orchestrator">
-                      <summary className="agent-space-block-label" style={{ fontWeight: "bold" }}>
-                        <div style={{ display: "flex", alignItems: "center" }}>
-                          <img
-                            src={logoImg}
-                            alt={ORCHESTRATOR_DISPLAY}
-                            style={{ width: "16px", height: "16px", borderRadius: "2px", marginRight: "6px" }}
-                          />
-                          <span>{ORCHESTRATOR_DISPLAY} · {ORCHESTRATOR_MENTION}</span>
-                        </div>
-                        <span className="detail-status-pill completed">completed</span>
-                      </summary>
-                      <div className="agent-space-block-text">Model: {formatModelLabel(orchestratorModel)} (planner)</div>
-                      <div className="agent-space-block-text agent-space-block-note">Gemini Pro coordinates the mission plan; bounded agent work defaults to the lower-cost Gemini Flash model.</div>
-                      <div className="agent-space-block-text">Assigned to: Lead Orchestration</div>
-                      <div className="agent-space-block-text">Context window: {estimateOrchestratorUsedTokens(logs, goal).toLocaleString()} / 1,000,000 tokens used</div>
-                    </details>
-                    {agents.map((agent) => {
-                      const agentActivity = getAgentActivity(agent, logs);
-                      const identity = agentIdentity(agent.id, agent.role, agent.displayName, agent.handle);
-                      return (
-                      <details className="agent-space-block" key={agent.id}>
-                        <summary className="agent-space-block-label">
-                          <div style={{ display: "flex", alignItems: "center" }}>
-                            {agent.pokemonImage ? (
-                              <img src={agent.pokemonImage} alt={identity.firstName} style={{ width: "16px", height: "16px", borderRadius: "2px", marginRight: "6px", objectFit: "cover" }} />
-                            ) : null}
-                            <span>{identity.display} · {identity.mention}</span>
-                          </div>
-                          <span className={`detail-status-pill ${agent.status}`}>{agent.status}</span>
-                        </summary>
-                        <div className="agent-space-block-text">
-                          Model: {agent.model ? formatModelLabel(agent.model) : agent.modelRole}
-                        </div>
-                        {agent.modelReason ? (
-                          <div className="agent-space-block-text agent-space-block-note">{agent.modelReason}</div>
-                        ) : null}
-                        <div className="agent-space-block-text">Assigned to: {agent.subtaskId}</div>
-                        {agent.initialGoal ? (
-                          <div className="agent-space-block-text">Initial goal: {agent.initialGoal}</div>
-                        ) : null}
-                        {agent.activeAssignment && agent.activeAssignment !== agent.initialGoal ? (
-                          <div className="agent-space-block-text agent-space-block-note">YAAA assignment: {agent.activeAssignment}</div>
-                        ) : null}
-                        <div className="agent-space-block-text">Context window: {estimateUsedTokens(agent, logs, agentWorkspaces[agent.id]).toLocaleString()} / 1,000,000 tokens used</div>
-                        {agent.summary && <div className="agent-space-block-text">{agent.summary}</div>}
-                        <div className="agent-space-activity-heading">Activity ({agentActivity.length})</div>
-                        {agentActivity.length === 0 ? (
-                          <div className="agent-space-block-text">No execution activity reported yet.</div>
-                        ) : agentActivity.map((log) => (
-                          <div className="agent-space-action-row" key={log.id}>
-                            <span className="agent-space-action-icon" aria-hidden="true">💭</span>
-                            <span className="agent-space-action-text">{log.content}</span>
-                          </div>
-                        ))}
-                      </details>
-                      );
-                    })}
-                  </>
-                )}
+                <AgentBrainMap agents={visibleAgents} logs={logs} />
                 <details className="agent-space-block" data-testid="execution-activity">
-                  <summary className="agent-space-block-label">Execution activity</summary>
+                  <summary className="agent-space-block-label">All logs · LLM, tools, and agents</summary>
                   {logs.length === 0 ? (
                     <div className="agent-space-block-text">No agent activity yet.</div>
-                  ) : logs.map((log, index) => (
-                    <div className="agent-space-action-row" key={`${log.time}-${index}`}>
-                      <span className="agent-space-action-icon" aria-hidden="true">{log.source === "agent" ? "💭" : "🔧"}</span>
-                      <span className="agent-space-action-text">{log.content}</span>
-                    </div>
+                  ) : logs.map((log) => (
+                    <ActivityPreview log={log} activity={logs} key={log.id} />
                   ))}
                 </details>
               </div>
@@ -2149,7 +2443,7 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
                         <span className="mission-team-model">{formatModelLabel(orchestratorModel)}</span>
                       </div>
                     </div>
-                    {agents.map((agent) => {
+                    {renderRightPanelList("mission-team", agents, (agent) => {
                       const identity = agentIdentity(agent.id, agent.role, agent.displayName, agent.handle);
                       return (
                       <div className="mission-team-member" key={agent.id}>
@@ -2211,7 +2505,7 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
                                   </button>
                                   {expanded && (
                                     <div id={`agent-artifacts-${groupKey}`} className="artifact-agent-contents">
-                                      {entries.map((art) => renderArtifactItem(art, group.label))}
+                                      {renderAgentArtifacts(groupKey, entries, group.label)}
                                     </div>
                                   )}
                                 </div>
@@ -2219,7 +2513,7 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
                                 })}
                               </div>
                             )
-                            : group.entries.map((art) => renderArtifactItem(art, group.label))}
+                            : renderRightPanelList(`artifact-${group.id}`, group.entries, (art) => renderArtifactItem(art, group.label))}
                         </section>
                       ))}
                     </div>
@@ -2261,7 +2555,10 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
                     </div>
                   ) : (
                     <div className="subtask-list">
-                      {displaySubtasks.map((st) => (
+                      {renderRightPanelList(
+                        "subtasks",
+                        displaySubtasks as Array<{ id: string; title: string; capability?: string; state: string }>,
+                        (st) => (
                         <div key={st.id} className={`subtask-item ${st.state}`}>
                           <div className="subtask-dot-col">
                             <span className={`status-badge ${st.state}`} />
@@ -2278,7 +2575,8 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
                             </div>
                           </div>
                         </div>
-                      ))}
+                        ),
+                      )}
                     </div>
                   )}
                 </div>
@@ -2290,13 +2588,13 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
                     <div className="slack-section-empty">No capabilities assigned yet.</div>
                   ) : (
                     <div className="integration-list">
-                      {activeCapabilities.map((capability) => (
+                      {renderRightPanelList("integrations", activeCapabilities, (capability) => (
                         <div className="integration-row" key={capability}>
                           <span className="integration-name">{formatCapabilityLabel(capability)}</span>
                           <span className="integration-status connected">in plan</span>
                         </div>
                       ))}
-                      {mcpIntegrations.map((integration) => (
+                      {renderRightPanelList("mcp-integrations", mcpIntegrations, (integration) => (
                         <div className="integration-row" key={`mcp-${integration.definition.id}`}>
                           <span className="integration-name">{integration.definition.displayName}</span>
                           <span
@@ -2546,16 +2844,28 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
             <div className="artifact-preview-body">
               <div className="thread-section">
                 <div className="thread-section-title">Relevant result</div>
-                <div className="thread-handoff-doc">{openThread.result || "No result summary reported yet."}</div>
+                <button
+                  type="button"
+                  className={`thread-handoff-doc ${expandedThreadResult ? "is-expanded" : "is-collapsed"}`}
+                  onClick={() => setExpandedThreadResult((value) => !value)}
+                  title={expandedThreadResult ? "Collapse result" : "Expand result"}
+                >
+                  {renderMarkdown(openThread.result || "No result summary reported yet.")}
+                </button>
               </div>
               <div className="thread-section">
                 <div className="thread-section-title">Thread activity ({openThread.activity.length})</div>
                 {openThread.activity.length === 0 ? (
                   <div className="agent-space-block-text">No activity reported yet.</div>
                 ) : (
-                  openThread.activity.map((log) => (
-                    <ActivityPreview log={log} key={log.id} />
+                  (expandedThreadActivity ? openThread.activity : openThread.activity.slice(-8)).map((log) => (
+                    <ActivityPreview log={log} activity={openThread.activity} key={log.id} />
                   ))
+                )}
+                {openThread.activity.length > 8 && (
+                  <button type="button" className="agent-space-more" onClick={() => setExpandedThreadActivity((value) => !value)}>
+                    {expandedThreadActivity ? "Show latest activity" : `Show all ${openThread.activity.length} updates`}
+                  </button>
                 )}
               </div>
               <div className="thread-section">

@@ -62,13 +62,17 @@ Put content you generated inline in source.content; use source.path (task-relati
  */
 const TOOL_PROTOCOL = `
 
-You have native tools for files and, when granted to your role, command execution, web research, and Chromium browser automation. Call them directly — do not describe calls in prose or JSON. File tools include read_file, read_file_lines, write_file, write_file_lines, list_files, search_files, delete_path, delete_file_lines, create_directory, move_path, copy_path, path_metadata, file_screenshot, and generate_image. When you write a file, pass its full final contents (no placeholders); the runtime tracks produced file and image artifacts for you.
+You have native tools for files and, when granted to your role, command execution, web research, and Chromium browser automation. Call them directly — do not describe calls in prose or JSON. File tools include read_file, read_file_lines, write_file, write_file_lines, download_file, list_files, search_files, delete_path, delete_file_lines, create_directory, move_path, copy_path, path_metadata, file_screenshot, and generate_image. When you write or download a file, pass its final workspace-relative path; the runtime tracks produced file and image artifacts for you.
+
+When a task requires an original asset from a website, use download_file with the asset's direct HTTP(S) URL and a real extension such as .png, .jpg, .webp, or .pdf. Do not describe the asset in Markdown, take a screenshot as a substitute, or use generate_image when the requirement is to preserve the original source asset. After downloading, use list_files/path_metadata and record the actual path, MIME type, byte size, and checksum in your handoff.
 
 CRITICAL: Code should not be streamed or output as raw markdown blocks in your chat responses. Do not output implementation code in your prose text; write all source code and files directly to the workspace filesystem and simply refer to the file path(s) in your response.
 
 Before handing off any work, use the tools available to your role to verify the deliverable in the most relevant way you can reasonably infer: run tests/typecheck/lint/build/smoke commands when you changed code and have shell access; reopen/read generated files; inspect browser pages or screenshots for UI work; cite searched sources for research; list produced assets and check that referenced files exist. If code or a script generated an output, do not trust the planned or scripted filename blindly: inspect the generator, list/search the workspace after execution, use path_metadata on the discovered file, and record the actual output path plus the declared-to-discovered path mapping in handOff.md/proofOfWork.md. Do this after producing the work and before your final response. If a check cannot be run, fails because of an environment issue, or would be unsafe/destructive, state exactly what you tried or why you skipped it in your final summary or handoff. Never claim work is verified unless you actually ran a check or have concrete evidence.
 
 Browser automation is action/round-trip oriented, not a real-time test runner. For timers, splash screens, delayed transitions, games, animation timing, or performance windows, prefer browser_evaluate_script with one complete async script that performs the sequence and returns observations. Do not pretend repeated model calls provide reliable timing. If one injected script and available instrumentation are insufficient, tell the orchestrator exactly what cannot be proven and request shell-based tests or app instrumentation. For generated images, choose transparent background for cutouts, logos, stickers, icons, sprites, and overlays; choose opaque for full scenes, posters, and backgrounds.
+
+For browser research, if the target URL is known, open the browser with that URL or call browser_navigate immediately after opening it; never treat the initial blank/new-tab screenshot as the requested page. After observe_browser, use the returned controls list to click visible actions such as Close, Next, Accept, or Download; use the returned assetUrls list to identify direct HTTP(S) image/PDF URLs. If a page contains an original logo, photograph, PDF, or other binary asset, call download_file with a real extension and verify the saved file. A screenshot is evidence of a page, not a substitute for downloading the source asset.
 
 Work only inside the task workspace, never invent placeholder content, and keep outputs production quality. When the assignment is fully done, stop calling tools and reply with a short final message summarising what you produced and the verification evidence. If your role requires a stricter final format, such as JSON-only, include the same evidence inside that required format.${ARCH_INSTRUCTION}`;
 
@@ -87,9 +91,9 @@ ${ARCH_INSTRUCTION}`;
 export const AGENT_REGISTRY: Record<string, AgentTemplate> = {
   FilesAgent: {
     role: "FilesAgent",
-    systemPrompt: `You are an expert file management agent. Your job is to manipulate, write, read, search and organize files in the user's workspace.
+    systemPrompt: `You are an expert file management agent. Your job is to manipulate, write, read, search, download, and organize files in the user's workspace.
 
-You have native file tools: read_file, read_file_lines, write_file, write_file_lines, list_files, search_files, delete_path, delete_file_lines, create_directory, move_path, copy_path, path_metadata, file_screenshot, and generate_image. Call them directly — do not describe the calls in prose. When you write a file, always pass its complete final contents (no placeholders or TODOs); the runtime records each written file as a produced artifact automatically.
+You have native file tools: read_file, read_file_lines, write_file, write_file_lines, download_file, list_files, search_files, delete_path, delete_file_lines, create_directory, move_path, copy_path, path_metadata, file_screenshot, and generate_image. Call them directly — do not describe the calls in prose. Use download_file for original HTTP(S) binary assets and preserve their real extension; do not substitute a screenshot or generated image. When you write or download a file, always pass its complete final contents or final workspace-relative path; the runtime records produced files as artifacts automatically.
 
 Before handing off, verify the file work using the tools available to you: reopen/read generated files, list relevant folders, and confirm that referenced files exist. If a check cannot be run, state exactly why. Never claim work is verified without concrete evidence.
 
@@ -142,7 +146,7 @@ Findings are bugs addressed to YAAA. Never report passed without concrete eviden
   ResearcherAgent: {
     role: "ResearcherAgent",
     handle: "@researcher",
-    systemPrompt: `You are @researcher, a deep-dive analyst. You gather information, synthesize documents, and produce competitor and market analyses. Separate verified facts from assumptions, and cite the origin of every claim in your write-ups.${TOOL_PROTOCOL}`,
+    systemPrompt: `You are @researcher, a deep-dive analyst. You gather information, synthesize documents, and produce competitor and market analyses. Separate verified facts from assumptions, and cite the origin of every claim in your write-ups. When research requires original website images or binary files, download those source assets with download_file and verify the saved files.${TOOL_PROTOCOL}`,
     capabilities: ["files", "web", "browser"],
     riskCeiling: "low",
     modelRole: "worker",
@@ -160,7 +164,7 @@ Findings are bugs addressed to YAAA. Never report passed without concrete eviden
   DesignerAgent: {
     role: "DesignerAgent",
     handle: "@designer",
-    systemPrompt: `You are @designer, a visual designer. You execute graphic design, layout, and formatting for pamphlets, ad assets, and brand collateral. Specify exact spacing, type scale, and color values so output is reproducible. When a deliverable needs actual imagery, use the native generate_image tool to produce real PNG assets into the workspace (never leave placeholders), and reference the saved file paths in your layout.${TOOL_PROTOCOL}`,
+    systemPrompt: `You are @designer, a visual designer. You execute graphic design, layout, and formatting for pamphlets, ad assets, and brand collateral. Specify exact spacing, type scale, and color values so output is reproducible. When a deliverable needs original imagery from a source website, use download_file and preserve it; when new imagery is required, use generate_image to produce real PNG assets into the workspace (never leave placeholders), and reference the saved file paths in your layout.${TOOL_PROTOCOL}`,
     capabilities: ["files"],
     riskCeiling: "low",
     modelRole: "worker",

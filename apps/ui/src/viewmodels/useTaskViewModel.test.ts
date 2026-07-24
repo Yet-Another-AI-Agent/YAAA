@@ -277,8 +277,42 @@ describe("useTaskViewModel — mission continuity", () => {
       expect.arrayContaining([
         expect.objectContaining({ source: "agent", kind: "thinking", content: "Inspecting the existing files." }),
         expect.objectContaining({ source: "orchestrator", content: "Supervisor checked the current todo." }),
-      ]),
+    ]),
     );
+  });
+
+  it("renders execution events with the action, session, timeout, and model progress", async () => {
+    let onEvent: ((event: any) => void) | undefined;
+    vi.mocked(TaskModel.subscribeEvents).mockImplementation((eventHandler) => {
+      onEvent = eventHandler;
+      return () => {};
+    });
+    const { result } = renderHook(() => useTaskViewModel());
+
+    act(() => result.current.setGoal("Inspect a page"));
+    await act(async () => { await result.current.startTask(); });
+    act(() => onEvent?.({
+      topic: "task.task-123.agent.browser-agent.execution-attached",
+      data: {
+        kind: "browser",
+        method: "attach",
+        sessionId: "browser-session-1",
+        timeoutMs: 30_000,
+        progress: "Reconnecting to the existing browser session before checking the page.",
+      },
+    }));
+
+    expect(result.current.logs).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "activity",
+        content: expect.stringContaining("browser.attach attached"),
+      }),
+      expect.objectContaining({
+        kind: "activity",
+        content: expect.stringContaining("timeout 30s"),
+        metadata: expect.objectContaining({ executionEvent: "attached", capability: "browser" }),
+      }),
+    ]));
   });
 
   it("replays a fast plan update that arrived before the renderer subscribed", async () => {

@@ -14,6 +14,8 @@ interface ThinkingPanelProps {
    * panels show the latest line inline; finished panels collapse to a header.
    */
   live?: boolean;
+  /** Non-reasoning lifecycle/tool updates associated with the live thought. */
+  intermediateSteps?: ThinkingItem[];
 }
 
 /**
@@ -22,12 +24,13 @@ interface ThinkingPanelProps {
  * hidden behind a dropdown. Once done it collapses to a single header the user
  * can expand on demand.
  */
-export function ThinkingPanel({ items, live = false }: ThinkingPanelProps) {
+export function ThinkingPanel({ items, live = false, intermediateSteps = [] }: ThinkingPanelProps) {
   const [expanded, setExpanded] = React.useState(false);
 
   if (items.length === 0) return null;
 
   const last = items[items.length - 1];
+  const lastProgress = intermediateSteps[intermediateSteps.length - 1];
   const label = live ? "Thinking" : `Thought · ${items.length} step${items.length > 1 ? "s" : ""}`;
 
   return (
@@ -61,11 +64,19 @@ export function ThinkingPanel({ items, live = false }: ThinkingPanelProps) {
           {items.map((it) => (
             <p key={it.id} className="thinking-line">{it.content}</p>
           ))}
+          {intermediateSteps.length > 0 && (
+            <div className="thinking-intermediate-steps">
+              <div className="thinking-intermediate-label">Intermediate steps</div>
+              {intermediateSteps.map((step) => (
+                <p key={step.id} className="thinking-line thinking-progress-line">{step.content}</p>
+              ))}
+            </div>
+          )}
         </div>
       ) : (
-        live && (
-          <div className="thinking-preview" title={last.content}>
-            {last.content}
+        (live || lastProgress) && (
+          <div className="thinking-preview" title={(lastProgress || last).content}>
+            {lastProgress ? `↳ ${lastProgress.content}` : last.content}
           </div>
         )
       )}

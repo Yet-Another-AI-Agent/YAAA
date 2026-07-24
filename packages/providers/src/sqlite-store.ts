@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import type { IConversationStore, IQueueStore } from "@yaaa/interfaces";
+import type { ExecutionObservation, ExecutionSession } from "@yaaa/interfaces";
 import type {
   AgentMessage,
   AgentRun,
@@ -123,6 +124,24 @@ export class SqliteStore implements IConversationStore, IQueueStore {
         );
         CREATE INDEX IF NOT EXISTS idx_conversation_messages_thread_created
           ON conversation_messages(task_id, conversation_id, created_at ASC);
+        CREATE TABLE IF NOT EXISTS execution_sessions (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL,
+          data TEXT NOT NULL,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_execution_sessions_task
+          ON execution_sessions(task_id, updated_at ASC);
+        CREATE TABLE IF NOT EXISTS execution_observations (
+          task_id TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          sequence INTEGER NOT NULL,
+          data TEXT NOT NULL,
+          timestamp TEXT NOT NULL,
+          PRIMARY KEY (session_id, sequence)
+        );
+        CREATE INDEX IF NOT EXISTS idx_execution_observations_task_time
+          ON execution_observations(task_id, session_id, sequence DESC);
       `);
       this.connections.set(taskId, db);
       this.queueConnections.add(db);
@@ -157,6 +176,31 @@ export class SqliteStore implements IConversationStore, IQueueStore {
     fs.mkdirSync(legacyDir, { recursive: true });
     const legacyPath = path.join(legacyDir, "task.db");
     if (!fs.existsSync(legacyPath)) fs.writeFileSync(legacyPath, "");
+  }
+
+  async saveExecutionSession(session: ExecutionSession): Promise<void> {
+    const db = this.getDb(session.taskId);
+    db.prepare("INSERT OR REPLACE INTO execution_sessions (id, task_id, data, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)")
+      .run(session.id, session.taskId, JSON.stringify(session));
+  }
+
+  async getExecutionSessions(taskId: string): Promise<ExecutionSession[]> {
+    const db = this.getDb(taskId);
+    return (db.prepare("SELECT data FROM execution_sessions WHERE task_id = ? ORDER BY updated_at ASC").all(taskId) as { data: string }[])
+      .map((row) => JSON.parse(row.data) as ExecutionSession);
+  }
+
+  async saveExecutionObservation(taskId: string, observation: ExecutionObservation): Promise<void> {
+    const db = this.getDb(taskId);
+    db.prepare("INSERT OR REPLACE INTO execution_observations (task_id, session_id, sequence, data, timestamp) VALUES (?, ?, ?, ?, ?)")
+      .run(taskId, observation.sessionId, observation.sequence, JSON.stringify(observation), observation.timestamp);
+  }
+
+  async getExecutionObservations(taskId: string, sessionId: string, limit = 200): Promise<ExecutionObservation[]> {
+    const db = this.getDb(taskId);
+    const rows = db.prepare("SELECT data FROM execution_observations WHERE task_id = ? AND session_id = ? ORDER BY sequence DESC LIMIT ?")
+      .all(taskId, sessionId, Math.max(1, Math.min(limit, 200))) as { data: string }[];
+    return rows.reverse().map((row) => JSON.parse(row.data) as ExecutionObservation);
   }
 
   async saveMessage(taskId: string, message: AgentMessage): Promise<void> {

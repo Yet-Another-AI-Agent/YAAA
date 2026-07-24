@@ -58,6 +58,7 @@ describe("AGENT_REGISTRY", () => {
         "read_file_lines",
         "write_file",
         "write_file_lines",
+        "download_file",
         "delete_path",
         "delete_file_lines",
         "create_directory",
@@ -69,6 +70,11 @@ describe("AGENT_REGISTRY", () => {
         expect(agent.systemPrompt).toContain(toolName);
       }
     });
+  });
+
+  it("teaches asset-capable agents to preserve original binary downloads", () => {
+    expect(AGENT_REGISTRY.ResearcherAgent.systemPrompt).toContain("download_file");
+    expect(AGENT_REGISTRY.DesignerAgent.systemPrompt).toContain("download_file");
   });
 
   describe("blueprint roster", () => {

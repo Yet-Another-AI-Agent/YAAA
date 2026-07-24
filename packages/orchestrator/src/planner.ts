@@ -56,7 +56,7 @@ export const MODEL_TIERS = {
 
 /** Policy-level defaults used when the model advisor omits a model. */
 export const PREFERENCE_MODEL_DEFAULTS: Record<ModelPreference, string> = {
-  sota: "anthropic/claude-sonnet-4.5",
+  sota: "openai/gpt-5.5-pro",
   // Mesh exposes Gemini 3 Flash with the preview suffix. The unsuffixed id
   // returns 404 from Mesh and must never be emitted as a planner fallback.
   balanced: "google/gemini-3.1-pro-preview",
@@ -146,7 +146,7 @@ export function defaultModelReasonForSubtask(subtask: {
     return `Gemini 2.5 Pro is the base model for bounded ${subtask.capability} work and verification.`;
   }
   if (model === MODEL_TIERS.complex) {
-    return "Claude Opus 5 is reserved for high-risk or engineering-heavy work that benefits from the strongest available reasoning.";
+    return "Claude Opus 4.8 is reserved for high-risk or engineering-heavy work that benefits from the strongest reachable reasoning.";
   }
   return `Gemini 3.1 Pro is the medium-tier choice for ${subtask.capability} work.`;
 }
@@ -265,6 +265,7 @@ export class Planner {
 
     const systemPrompt = `You are a central Task Planner for YAAA.
 Your job is to create a detailed implementation methodology and a dependency-aware execution graph.
+Before the plan fields, estimate the planning work itself in planningEstimate: write a concise user-facing message explaining what YAAA is considering while generating the plan, list the main considerations, and give an expectedDurationMs estimate. This is an estimate only; deterministic runtime timeouts remain authoritative.
 Planning is a decision process that must be made explicit in the returned JSON. First write the detailed implementation goal: what must be built, changed, corrected, or verified, including the observable outcome. Then decompose it by answering: how many logically independent, executable steps exist; what does each step produce; and which previous steps must it depend on? Do not split work merely to create agents.
 For every step, evaluate every allowed agent role in the roster below. Mark whether each role is relevant and explain why briefly. Select exactly one role only when it logically fits the step, state the expectation for that role, and keep irrelevant roles marked false. Then choose the best reachable model for the selected role under the current model policy and explain why that model is the right quality/cost fit.
 The plan must explain the concrete approach, the number of substeps, which stages are sequential versus parallel, and the agent role/model required for every substep.
@@ -432,6 +433,13 @@ DO NOT output any conversational text before or after the JSON. Only return a va
       }
     }
     const plan = TaskPlanSchema.parse(rawJson);
+    if (!plan.planningEstimate) {
+      plan.planningEstimate = {
+        message: "YAAA is comparing task dependencies, verification needs, and the best model assignments before showing the plan.",
+        considerations: ["task decomposition", "dependencies", "verification", "model routing"],
+        expectedDurationMs: 30_000,
+      };
+    }
     for (const subtask of plan.subtasks) {
       if (!subtask.agentTemplate || !subtask.routingReason) {
         throw new Error(`Subtask ${subtask.id} is missing the required AI routing decision (agentTemplate and routingReason).`);

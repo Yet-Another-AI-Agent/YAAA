@@ -19,14 +19,14 @@ afterEach(() => {
 });
 
 describe("Workspace", () => {
-  it("builds a concise pre-plan acknowledgement that honors explicit agent count", () => {
-    expect(
-      buildStrategyAcknowledgement(
-        "spin 2 agents and one to write Python code and another to test",
-      ),
-    ).toBe(
-      "Got it — I’ll prepare a strategy using exactly 2 agents, preserving the roles you requested. You can review it before any agent starts.",
+  it("builds a pre-plan update that explains the planning factors", () => {
+    const acknowledgement = buildStrategyAcknowledgement(
+      "spin 2 agents and one to write Python code and another to test",
     );
+    expect(acknowledgement).toContain("exactly 2 agents");
+    expect(acknowledgement).toContain("dependencies");
+    expect(acknowledgement).toContain("verification steps");
+    expect(acknowledgement).toContain("plan for approval");
     expect(buildStrategyAcknowledgement("Build a Python tool")).toContain(
       "implementation strategy",
     );

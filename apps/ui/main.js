@@ -156,6 +156,12 @@ function forwardRuntimeEvent(taskId, event) {
         data: { topic: event.topic },
       });
       break;
+    case "execution":
+      emitTaskEvent(taskId, {
+        topic: `task.${taskId}.agent.${event.from}.execution-${event.event}`,
+        data: event.data,
+      });
+      break;
       case "result":
         emitTaskEvent(taskId, {
           topic: `task.${taskId}.agent.${event.from}.result`,

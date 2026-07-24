@@ -43,7 +43,7 @@ export function useTaskViewModel() {
   );
 
   // Delegate Logging Responsibility
-  const { logs, addLog, clearLogs, clearThoughts } = useLogState();
+  const { logs, addLog, clearLogs, clearThoughts, clearTransientLogs } = useLogState();
 
   // Delegate Approval Responsibility
   const { pendingApproval, setPendingApproval, resolveApproval } = useApprovalState(taskId, addLog);
@@ -126,6 +126,7 @@ export function useTaskViewModel() {
         }
 
         else if (topic.endsWith("agent_status")) {
+          clearTransientLogs();
           const index = agentsRef.current.findIndex((agent) => agent.id === data.id);
           const previous = index < 0 ? undefined : agentsRef.current[index];
           const nextAgents = index < 0
@@ -141,6 +142,7 @@ export function useTaskViewModel() {
         }
 
         else if (topic.includes("plan_updated")) {
+          clearTransientLogs();
           if (data && data.subtasks) {
             setSubtasks(data.subtasks);
             const producedArtifacts: UIArtifact[] = [];
@@ -200,20 +202,22 @@ export function useTaskViewModel() {
           const request = Array.isArray(data.messages)
             ? data.messages.map((message: any) => `${message.type}: ${message.content}`).join("\n\n")
             : "";
-          addLog("agent", `🧠 ${agentName} → LLM (turn ${data.turn}, ${data.model})\n${request}`, "thinking", { agentId: agentName });
+          addLog("agent", `🧠 ${agentName} → LLM (turn ${data.turn}, ${data.model})\n${request}`, "thinking", { agentId: agentName, persistent: true, llmEvent: "request" });
         }
 
         else if (topic.endsWith(".llm_response")) {
           const agentName = agentIdFromTopic(topic);
-          addLog("agent", `🧠 LLM → ${agentName} (turn ${data.turn}, ${data.model})\n${data.content || "(empty response)"}`, "thinking", { agentId: agentName });
+          addLog("agent", `🧠 LLM → ${agentName} (turn ${data.turn}, ${data.model})\n${data.content || "(empty response)"}`, "thinking", { agentId: agentName, persistent: true, llmEvent: "response" });
         }
 
         else if (topic.endsWith(".tool_requested")) {
+          clearTransientLogs();
           const agentName = agentIdFromTopic(topic);
           addLog("agent", `🛠️ ${agentName}: ${data.content}`, "activity", { ...(data.metadata ?? {}), agentId: agentName });
         }
 
         else if (/\.action_(requested|started|approved|denied|completed|failed)$/.test(topic)) {
+          clearTransientLogs();
           const agentName = agentIdFromTopic(topic);
           const status = topic.match(/\.action_([^\.]+)$/)?.[1] ?? "updated";
           const action = data?.capability && data?.method
@@ -224,6 +228,21 @@ export function useTaskViewModel() {
             ...(data ?? {}),
             agentId: agentName,
           });
+        }
+
+        else if (/\.execution-(attached|output|screenshot|detached|exited)$/.test(topic)) {
+          const agentName = agentIdFromTopic(topic);
+          const eventName = topic.match(/\.execution-([^\.]+)$/)?.[1] ?? "updated";
+          const capability = typeof data?.kind === "string" ? data.kind : "execution";
+          const method = typeof data?.method === "string" ? data.method : eventName;
+          const timeoutMs = typeof data?.timeoutMs === "number"
+            ? data.timeoutMs
+            : typeof data?.windowMs === "number" ? data.windowMs : undefined;
+          const timeoutLabel = timeoutMs ? `timeout ${Math.round(timeoutMs / 1000)}s` : "timeout n/a";
+          const sessionLabel = typeof data?.sessionId === "string" ? ` · session ${data.sessionId}` : "";
+          const progress = typeof data?.progress === "string" ? ` — ${data.progress}` : "";
+          const metadata = { ...(data ?? {}), capability, method, agentId: agentName, executionEvent: eventName };
+          addLog("agent", `⏱️ ${agentName}: ${capability}.${method} ${eventName}${sessionLabel} · ${timeoutLabel}${progress}`, "activity", metadata);
         }
 
         else if (topic.includes("topic_updated")) {
@@ -283,6 +302,7 @@ export function useTaskViewModel() {
         setSummary(resultData.summary);
         setRunning(false);
         setAwaitingConfirmation(restorePlanReview);
+        clearTransientLogs();
         // A queued follow-up is only a transient optimistic UI state. If the
         // backend has finished (or returned to conversation), there is no
         // remaining mailbox item that should keep the strip on screen.
@@ -345,6 +365,8 @@ export function useTaskViewModel() {
     setRunning(true);
     setGoal("");
     addLog("user", submitted, "response");
+    addLog("system", "Creating mission workspace…", "system", { transient: true });
+    addLog("system", "Connecting to YAAA and preparing the implementation plan…", "system", { transient: true });
 
     try {
       if (unsubscribeRef.current) {
@@ -354,7 +376,7 @@ export function useTaskViewModel() {
       // 1. Call Model to trigger task
       const newTaskId = await TaskModel.startTask(submitted);
       setTaskId(newTaskId);
-      addLog("system", `Task initialized. ID: ${newTaskId}. Listening to event stream...`);
+      addLog("system", `Task initialized. ID: ${newTaskId}. Listening to event stream...`, "system", { transient: true });
       loadTasks(); // Update list immediately once startTask runs and task gets created
 
       // 2. Subscribe to Model events and delegate actions
@@ -456,6 +478,14 @@ export function useTaskViewModel() {
       // runs wait until the orchestrator pickup event so queued work is not
       // shown twice or out of order.
       addLog("user", text, "response");
+      if (isQuestionAnswer) {
+        addLog(
+          "orchestrator",
+          "Reviewing your answers and deciding the next step…",
+          "thinking",
+          { persistent: true, progressKey: "follow-up-review" },
+        );
+      }
       addLog("system", "YAAA is reviewing your follow-up and continuing this mission in the same channel.");
     }
 

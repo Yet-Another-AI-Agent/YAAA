@@ -1,8 +1,9 @@
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import crypto from "node:crypto";
 import fg from "fast-glob";
-import type { IFiles } from "@yaaa/interfaces";
+import type { DownloadFileOptions, DownloadFileResult, IFiles } from "@yaaa/interfaces";
 import { isWithinAnyRoot, isWithinRoot, resolveFileRoots } from "@yaaa/shared";
 import { renderTextScreenshot } from "./screenshot.js";
 
@@ -104,6 +105,45 @@ export class FilesFs implements IFiles {
         await fs.writeFile(fullPath, content);
       }
     });
+  }
+
+  /** Download a bounded binary asset into the task workspace. */
+  async downloadFile(url: string, targetPath: string, options: DownloadFileOptions = {}): Promise<DownloadFileResult> {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new Error(`Invalid download URL: ${url}`);
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error(`Only http(s) download URLs are allowed: ${url}`);
+    }
+    const timeoutMs = Math.min(Math.max(options.timeoutMs ?? 60_000, 1_000), 120_000);
+    const maxBytes = Math.min(Math.max(options.maxBytes ?? 25 * 1024 * 1024, 1), 100 * 1024 * 1024);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(parsed, { signal: controller.signal, redirect: "follow" });
+      if (!response.ok) throw new Error(`Download failed with HTTP ${response.status}: ${url}`);
+      const declaredLength = Number(response.headers.get("content-length"));
+      if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+        throw new Error(`Download exceeds the ${maxBytes}-byte limit: ${url}`);
+      }
+      const bytes = Buffer.from(await response.arrayBuffer());
+      if (bytes.length > maxBytes) throw new Error(`Download exceeds the ${maxBytes}-byte limit: ${url}`);
+      await this.writeFile(targetPath, bytes);
+      return {
+        path: targetPath,
+        contentType: response.headers.get("content-type")?.split(";", 1)[0]?.trim() || "application/octet-stream",
+        bytes: bytes.length,
+        sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+      };
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") throw new Error(`Download timed out after ${timeoutMs}ms: ${url}`);
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async writeLines(targetPath: string, startLine: number, endLine: number, content: string): Promise<void> {

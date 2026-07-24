@@ -34,7 +34,7 @@ Format your output as a JSON block:
 \`\`\`json
 {
   "passed": true | false,
-  "summary": "Detailed summary: the reconciled verdict, how you resolved any verifier disagreement, what was achieved, and the key artifacts."
+  "summary": "Concise user-facing result in 1-3 sentences (maximum 500 characters). Mention the outcome and important notes only. Do not reproduce document contents, code, logs, handoff files, or internal reasoning; refer to deliverables by filename/path."
 }
 \`\`\`
 `;
@@ -50,7 +50,7 @@ ${factLog}
 Generated Artifacts:
 ${artifactsSummary}
 
-Evaluate and return the verification JSON.
+Evaluate and return the verification JSON. The summary is shown directly to the user, so keep it concise. Do not paste or paraphrase the contents of generated files. Mention only the relevant deliverable names/paths and any important limitation or follow-up.
 `;
 
     const responseRes = await this.gateway.chat(

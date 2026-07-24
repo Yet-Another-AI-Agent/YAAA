@@ -10,6 +10,8 @@ export interface OrchestratorMessage {
   from: "user" | "orchestrator" | "agent";
   /** Agent identity for agent-originated messages, retained across durable queue recovery. */
   agentId?: string;
+  kind?: "question" | "extension_request";
+  additionalMs?: number;
   content: string;
   createdAt: string;
 }
