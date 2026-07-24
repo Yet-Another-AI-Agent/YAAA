@@ -2,7 +2,7 @@ import os from "node:os";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import { FilesFs } from "./files-fs.js";
 
 describe("FilesFs", () => {
@@ -37,6 +37,29 @@ describe("FilesFs", () => {
     await filesFs.writeFile("sub/folder/nested.txt", "nested content");
     const content = await filesFs.readFile("sub/folder/nested.txt");
     expect(content).toBe("nested content");
+  });
+
+  it("downloads a bounded binary asset into the workspace and returns provenance", async () => {
+    const payload = Buffer.from([0, 1, 2, 3, 255]);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(payload, {
+      status: 200,
+      headers: { "content-type": "image/png", "content-length": String(payload.length) },
+    })));
+    const result = await filesFs.downloadFile("https://example.com/logo.png", "branding/logo.png");
+    expect(result).toMatchObject({ path: "branding/logo.png", contentType: "image/png", bytes: payload.length });
+    expect(result.sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(await fs.readFile(path.join(testDir, "branding/logo.png"))).toEqual(payload);
+    vi.unstubAllGlobals();
+  });
+
+  it("rejects non-http URLs and oversized assets", async () => {
+    await expect(filesFs.downloadFile("file:///tmp/secret", "secret.bin")).rejects.toThrow(/Only http\(s\)/);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(Buffer.alloc(8), {
+      status: 200,
+      headers: { "content-length": "8" },
+    })));
+    await expect(filesFs.downloadFile("https://example.com/large.bin", "large.bin", { maxBytes: 4 })).rejects.toThrow(/exceeds/);
+    vi.unstubAllGlobals();
   });
 
   it("should list files and folders correctly", async () => {

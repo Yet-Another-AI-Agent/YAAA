@@ -11,4 +11,14 @@ describe("CmdTool", () => {
     const result = await new CmdTool().execute("sleep 2", { timeoutMs: 20 });
     expect(result.timedOut).toBe(true);
   });
+
+  it("observes and detaches without terminating a durable terminal", async () => {
+    const tool = new CmdTool();
+    const session = tool.open();
+    tool.write(session.id, "printf durable", true);
+    const observed = await tool.observe(session.id, { windowMs: 1_000, maxLines: 20 });
+    expect(observed.output).toContain("durable");
+    expect(tool.detach(session.id)).toMatchObject({ id: session.id, detached: true, running: true });
+    tool.close(session.id);
+  });
 });

@@ -61,6 +61,33 @@ describe("mapBusEvent", () => {
     });
   });
 
+  it("maps LLM context and response topics for the live agent stream", () => {
+    expect(mapBusEvent(TASK, `task.${TASK}.agent.worker.llm_context`, {
+      from: "worker",
+      turn: 2,
+      model: "google/gemini-3.1-pro-preview",
+      messages: [{ type: "HumanMessage", content: "Inspect the workspace" }],
+    })).toEqual({
+      type: "llm-context",
+      from: "worker",
+      turn: 2,
+      model: "google/gemini-3.1-pro-preview",
+      messages: [{ type: "HumanMessage", content: "Inspect the workspace" }],
+    });
+    expect(mapBusEvent(TASK, `task.${TASK}.agent.worker.llm_response`, {
+      from: "worker",
+      turn: 2,
+      model: "google/gemini-3.1-pro-preview",
+      content: "The workspace is ready for inspection.",
+    })).toEqual({
+      type: "llm-response",
+      from: "worker",
+      turn: 2,
+      model: "google/gemini-3.1-pro-preview",
+      content: "The workspace is ready for inspection.",
+    });
+  });
+
   it("maps durable agent lifecycle records", () => {
     const agent = {
       id: "files-agent-1",

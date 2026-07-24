@@ -12,9 +12,10 @@ import type {
 } from "@yaaa/interfaces";
 import { Container, DurableEventQueue, MessageBus, PermissionEngine, orchestratorMailbox } from "@yaaa/platform";
 import type { IQueueStore } from "@yaaa/interfaces";
-import { SqliteStore, SqliteTaskReader, FilesFs, MeshGateway, CmdTool, WebSearchTool, ChromiumTool } from "@yaaa/providers";
+import { SqliteStore, SqliteTaskReader, FilesFs, MeshGateway, CmdTool, WebSearchTool, ChromiumTool, ExecutionSessionManager } from "@yaaa/providers";
 import type { MeshModelCatalogEntry } from "@yaaa/providers";
-import { buildPlannerModelMenu, catalogPrice, isEligible, renderPlannerModelMenu, resolveModelFromCatalog } from "./model-catalog.js";
+import { buildPlannerModelMenu, isEligible, renderPlannerModelMenu, resolveModelFromCatalog } from "./model-catalog.js";
+import { benchmarkRoleDefaults, selectBenchmarkModel } from "./benchmark-registry.js";
 import { ChatOpenAI } from "@langchain/openai";
 import { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { AIMessage, type BaseMessage } from "@langchain/core/messages";
@@ -112,100 +113,27 @@ function safePathSegment(value: string): string {
 }
 
 const PREFERENCE_DEFAULTS: Record<ModelPreference, string> = {
-  // Mesh may expose a newer Claude flagship under a different id; the live
-  // recommendation pass below replaces this when it can see the catalog.
-  sota: "anthropic/claude-sonnet-4.5",
+  sota: "openai/gpt-5.5-pro",
   balanced: "google/gemini-3.1-pro-preview",
-  "cost-effective": "google/gemini-2.5-pro-preview",
+  "cost-effective": "google/gemini-3.1-flash-lite-preview",
 };
-
-// SOTA uses the stronger reasoning tier; other policies keep orchestration on
-// the same model family selected by the user's setting.
-const ORCHESTRATOR_MODEL = "anthropic/claude-sonnet-4.5";
 
 function preferenceDefault(preference: ModelPreference | undefined): string {
   return PREFERENCE_DEFAULTS[preference ?? "balanced"];
 }
 
-function modelCandidates(catalog: MeshModelCatalogEntry[]): MeshModelCatalogEntry[] {
-  return catalog.filter(isEligible);
-}
-
-function fallbackPreferenceModel(catalog: MeshModelCatalogEntry[], preference: ModelPreference): MeshModelCatalogEntry | undefined {
-  const candidates = modelCandidates(catalog);
-  const named = preference === "sota"
-    ? candidates.filter((m) => /claude|opus|gpt-5|o[13]/i.test(`${m.id} ${m.name ?? ""}`)).sort((a, b) => (catalogPrice(b) ?? -1) - (catalogPrice(a) ?? -1))
-    : preference === "balanced"
-      ? candidates.filter((m) => /gemini-3(?:\.5)?-flash|gemini-2\.5-pro|sonnet|gpt-4/i.test(`${m.id} ${m.name ?? ""}`)).sort((a, b) => (catalogPrice(a) ?? Number.POSITIVE_INFINITY) - (catalogPrice(b) ?? Number.POSITIVE_INFINITY))
-      : candidates.filter((m) => /gemini-2\.5-pro/i.test(`${m.id} ${m.name ?? ""}`)).sort((a, b) => (catalogPrice(a) ?? Number.POSITIVE_INFINITY) - (catalogPrice(b) ?? Number.POSITIVE_INFINITY));
-  return named[0] ?? [...candidates].sort((a, b) => {
-    const aPrice = catalogPrice(a) ?? Number.POSITIVE_INFINITY;
-    const bPrice = catalogPrice(b) ?? Number.POSITIVE_INFINITY;
-    return preference === "sota" ? bPrice - aPrice : aPrice - bPrice;
-  })[0];
-}
-
-/**
- * One intermediate, catalog-aware model selection pass. The LLM receives the
- * complete subtask descriptions and the live searchable catalog, then chooses
- * one available model per subtask under the persisted user policy. Invalid or
- * unavailable recommendations are discarded in favour of deterministic policy
- * fallbacks, so a bad recommendation can never break a mission.
- */
+/** Apply the bundled benchmark policy. This is deliberately local and deterministic;
+ * the Mesh catalog is used only to intersect the candidates with live availability. */
 async function recommendPlanModels(
   plan: TaskPlan,
   preference: ModelPreference,
   catalog: MeshModelCatalogEntry[],
-  gateway: IMeshGateway,
 ): Promise<void> {
-  const candidates = modelCandidates(catalog);
-  if (!candidates.length) {
-    for (const subtask of plan.subtasks) {
-      subtask.model = preferenceDefault(preference);
-      subtask.modelReason = `YAAA applied the ${preference} setting; live model search was unavailable, so it used the configured default.`;
-    }
-    return;
-  }
-  const catalogText = candidates
-    .slice()
-    .sort((a, b) => (catalogPrice(a) ?? Number.POSITIVE_INFINITY) - (catalogPrice(b) ?? Number.POSITIVE_INFINITY))
-    .slice(0, 80)
-    .map((model) => `${model.id} | ${model.name ?? ""} | price=${catalogPrice(model) ?? "unknown"}`)
-    .join("\n");
-  const taskText = plan.subtasks.map((subtask) => JSON.stringify({
-    id: subtask.id,
-    title: subtask.title,
-    role: subtask.agentTemplate,
-    capability: subtask.capability,
-    risk: subtask.riskLevel,
-    successCriteria: subtask.successCriteria,
-    dependencies: subtask.dependsOn,
-  })).join("\n");
-  let recommendations: Record<string, { model?: string; reason?: string }> = {};
-  try {
-    const response = await gateway.chat([
-      {
-        role: "system",
-        content: `You are YAAA's model advisor. Choose the best available model for each exact subtask under the user's ${preference} policy. SOTA means maximum capability, balanced means capability/cost balance, and cost-effective means the cheapest adequate model. Return ONLY JSON object keyed by subtask id, with {"model":"exact catalog id","reason":"one sentence"}. Never invent ids.\n\nLIVE CATALOG:\n${catalogText}`,
-      },
-      { role: "user", content: `SUBTASKS:\n${taskText}` },
-    ], { modelRole: "utility", jsonMode: true, temperature: 0 });
-    const match = response.content.match(/\{[\s\S]*\}/);
-    if (match) recommendations = JSON.parse(match[0]);
-  } catch {
-    // Deterministic catalog fallback below is intentionally sufficient.
-  }
-  const available = new Set(candidates.map((model) => model.id));
   for (const subtask of plan.subtasks) {
-    const recommendation = recommendations[subtask.id];
-    const fallback = fallbackPreferenceModel(candidates, preference);
-    const selected = recommendation?.model && available.has(recommendation.model)
-      ? recommendation.model
-      : fallback?.id || preferenceDefault(preference);
-    subtask.model = selected;
-    subtask.modelReason = recommendation?.model && available.has(recommendation.model)
-      ? `YAAA's ${preference} model advisor selected ${selected} for this exact subtask. ${recommendation.reason ?? ""}`.trim()
-      : `YAAA selected ${selected} using the ${preference} policy after catalog validation.`;
+    const role = subtask.agentTemplate === "PlannerAgent" ? "planner" : subtask.agentTemplate === "QaTesterAgent" ? "verifier" : "worker";
+    const selected = selectBenchmarkModel(catalog, preference, role, subtask.capability as Parameters<typeof selectBenchmarkModel>[3]);
+    subtask.model = selected.model;
+    subtask.modelReason = selected.reason;
   }
 }
 
@@ -295,21 +223,24 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   orchestratorMailbox.attachQueue(config.taskId, durableQueue);
   const permissions = new PermissionEngine();
   const preference = config.modelPreference ?? "balanced";
-  const preferredDefault = preferenceDefault(preference);
-  const orchestratorModel = preference === "sota" ? ORCHESTRATOR_MODEL : preferredDefault;
+  const roleDefaults = benchmarkRoleDefaults(preference);
   const meshGateway = new MeshGateway({
     apiKey: config.apiKey,
+    modelPreference: preference,
     modelMapping: {
+      planner: roleDefaults.planner,
+      worker: roleDefaults.worker,
+      verifier: roleDefaults.verifier,
+      utility: roleDefaults.utility,
       ...(config.modelMapping as Record<ModelRole, string> | undefined),
-      planner: orchestratorModel,
-      worker: preferredDefault,
-      verifier: preferredDefault,
-      utility: orchestratorModel,
     },
     timeout: config.timeout,
     maxRetries: config.maxRetries,
   });
   const filesProvider = new FilesFs(config.workingDir);
+  const shellProvider = new CmdTool();
+  const browserProvider = new ChromiumTool(config.workingDir);
+  const executionSessions = new ExecutionSessionManager(store);
   const recordLlmEvent = async (topic: string, payload: unknown) => {
     await store.saveRuntimeEvent?.({
       id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
@@ -368,6 +299,12 @@ export function createRuntime(config: RuntimeConfig): Runtime {
     async writeFile(targetPath: string, content: string | Buffer): Promise<void> {
       assertActive();
       return filesProvider.writeFile(targetPath, content);
+    },
+    async downloadFile(url: string, targetPath: string, options?: { timeoutMs?: number; maxBytes?: number }) {
+      assertActive();
+      const result = await filesProvider.downloadFile(url, targetPath, options);
+      assertActive();
+      return result;
     },
     async writeLines(targetPath: string, startLine: number, endLine: number, content: string): Promise<void> {
       assertActive();
@@ -429,10 +366,10 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   // Role defaults, used both by the chat-model factory below and as the model
   // resolver's fallback when the planner's choice is unavailable.
   const WORKER_MODEL_DEFAULTS: Record<ModelRole, string> = {
-    planner: orchestratorModel,
-    worker: preferredDefault,
-    verifier: preferredDefault,
-    utility: orchestratorModel,
+    planner: roleDefaults.planner,
+    worker: roleDefaults.worker,
+    verifier: roleDefaults.verifier,
+    utility: roleDefaults.utility,
   };
 
   // YAAA reads Mesh's live catalog once per runtime, then resolves every agent's
@@ -480,11 +417,7 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   // import this one without a dependency cycle.
   scope.register("modelCatalogProvider", loadCatalog);
   scope.register("modelMenuProvider", async (): Promise<string> => {
-    // Keep the planner on the cost-safe Gemini lane by default. Other brands
-    // remain available through an explicit model/config override.
-    const menu = buildPlannerModelMenu(await loadCatalog(), {
-      brands: preference === "sota" ? ["anthropic"] : ["google"],
-    });
+    const menu = buildPlannerModelMenu(await loadCatalog());
     console.log("[YAAA] Planner model menu", { options: menu.length });
     return menu.length ? renderPlannerModelMenu(menu) : "";
   });
@@ -526,9 +459,10 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   scope.register("ChatModelFactory", chatModelFactory);
 
   scope.register("capability:files", files);
-  scope.register("capability:shell", new CmdTool());
+  scope.register("ExecutionSessionManager", executionSessions);
+  scope.register("capability:shell", shellProvider);
   scope.register("capability:web", new WebSearchTool());
-  scope.register("capability:browser", new ChromiumTool());
+  scope.register("capability:browser", browserProvider);
 
   if (config.onApproval) {
     permissions.registerApprovalHandler(config.onApproval);
@@ -545,6 +479,8 @@ export function createRuntime(config: RuntimeConfig): Runtime {
     `task.${taskId}.started`,
     `task.${taskId}.agent.*.lifecycle`,
     `task.${taskId}.agent.*.thought`,
+    `task.${taskId}.agent.*.llm_context`,
+    `task.${taskId}.agent.*.llm_response`,
     `task.${taskId}.agent.*.tool_requested`,
     `task.${taskId}.agent.*.action_requested`,
     `task.${taskId}.agent.*.action_started`,
@@ -552,6 +488,11 @@ export function createRuntime(config: RuntimeConfig): Runtime {
     `task.${taskId}.agent.*.action_denied`,
     `task.${taskId}.agent.*.action_completed`,
     `task.${taskId}.agent.*.action_failed`,
+    `task.${taskId}.agent.*.execution-attached`,
+    `task.${taskId}.agent.*.execution-output`,
+    `task.${taskId}.agent.*.execution-screenshot`,
+    `task.${taskId}.agent.*.execution-detached`,
+    `task.${taskId}.agent.*.execution-exited`,
   ];
   for (const pattern of patterns) {
     bus.subscribe(pattern, (topic, msg) => {
@@ -573,11 +514,46 @@ export function createRuntime(config: RuntimeConfig): Runtime {
     async plan(goal: string, context?: PlanContext): Promise<TaskPlan> {
       assertActive();
       emit({ type: "task-started", taskId });
+      emit({
+        type: "thought",
+        from: "orchestrator",
+        content: context?.priorSummary
+          ? "Reviewing your follow-up and the previous mission evidence before revising the strategy."
+          : "Preparing the implementation strategy and checking the task dependencies.",
+      });
+      const progressHeartbeat = setInterval(() => {
+        emit({
+          type: "thought",
+          from: "orchestrator",
+          content: context?.priorSummary
+            ? "The planner is still incorporating your follow-up into the revised strategy."
+            : "The planner is still evaluating the best execution path and model assignments.",
+        });
+      }, 12_000);
       const supervisor = new Supervisor(scope);
-      const plan = await supervisor.createPlan(goal, taskId, context);
-      await recommendPlanModels(plan, preference, await loadCatalog(), gateway);
-      assertActive();
-      return plan;
+      try {
+        const plan = await supervisor.createPlan(goal, taskId, context);
+        emit({
+          type: "thought",
+          from: "orchestrator",
+          content: `${plan.planningEstimate?.message || "The planner is finalizing the execution strategy."} Expected planning time: ${Math.ceil((plan.planningEstimate?.expectedDurationMs ?? 30_000) / 1000)}s. Considering: ${(plan.planningEstimate?.considerations ?? []).join(", ")}.`,
+        });
+        emit({
+          type: "thought",
+          from: "orchestrator",
+          content: "Strategy draft received. Validating subtasks, dependencies, and model assignments.",
+        });
+        await recommendPlanModels(plan, preference, await loadCatalog());
+        assertActive();
+        emit({
+          type: "thought",
+          from: "orchestrator",
+          content: "Strategy is ready. YAAA is preparing the plan review for you.",
+        });
+        return plan;
+      } finally {
+        clearInterval(progressHeartbeat);
+      }
     },
     async runPlan(plan: TaskPlan): Promise<TaskRunResult> {
       assertActive();
@@ -594,7 +570,10 @@ export function createRuntime(config: RuntimeConfig): Runtime {
     },
     dispose(): void {
       orchestratorMailbox.detachQueue(taskId);
-      store.closeAll();
+      void executionSessions.cleanupTask(taskId, (session) => {
+        if (session.kind === "shell") shellProvider.close(session.backendId);
+        else return browserProvider.close(session.backendId);
+      }).finally(() => store.closeAll());
       // Release the per-task scope so its providers don't linger after the run.
       scope.clear();
     },

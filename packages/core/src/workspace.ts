@@ -90,9 +90,9 @@ export interface ResumeProfile {
 export function buildStrategyAcknowledgement(goal: string): string {
   const requestedAgentCount = getRequestedAgentCount(goal);
   if (requestedAgentCount !== null) {
-    return `Got it — I’ll prepare a strategy using exactly ${requestedAgentCount} agents, preserving the roles you requested. You can review it before any agent starts.`;
+    return `I’ll prepare a strategy using exactly ${requestedAgentCount} agents and preserve the roles you requested. I’ll account for the deliverable, dependencies, required tools, model assignments, verification steps, and likely risks before showing you the plan for approval.`;
   }
-  return "Got it — I’ll prepare a concise implementation strategy for your review. No agents will start until you approve it.";
+  return "I’ll prepare an implementation strategy by mapping the deliverable, scope, dependencies, required tools, model and agent assignments, verification steps, and likely risks. I’ll show you the plan for approval before any agent starts.";
 }
 
 function buildClarificationFallback(goal: string): string {
@@ -535,9 +535,9 @@ export class Workspace {
   /**
    * Permanently purge a mission: remove its row from main.db and delete its
    * on-disk task directory (per-task SQLite databases, orchestrator.md,
-   * working files). Safe to call on a task that is still running — the
-   * caller is responsible for detaching its event stream first since this
-   * does not abort in-flight agent work, only its persisted state.
+   * working files). Safe to call on a task that is still running: running work
+   * is cancelled cooperatively and cleanup is deferred until its runtime closes
+   * SQLite.
    */
   deleteTask(taskId: string): void {
     const task = this.requireTask(taskId);
@@ -551,7 +551,14 @@ export class Workspace {
     } finally {
       db.close();
     }
-    fs.rmSync(task.path, { recursive: true, force: true });
+    // Do not remove a live task directory while its runtime still owns open
+    // SQLite handles. On macOS this turns the connection into a moved/read-only
+    // database (`SQLITE_READONLY_DBMOVED`) and floods the run with persistence
+    // failures. The active run observes deletedTasks, cancels cooperatively,
+    // closes its store in finally, and performs the cleanup there.
+    if (!this.activeTaskRuns.has(taskId)) {
+      fs.rmSync(task.path, { recursive: true, force: true });
+    }
   }
 
   private async withConversationCoordinator<T>(
@@ -1496,7 +1503,7 @@ export class Workspace {
       const messages: ChatMessage[] = [
         {
           role: "system",
-          content: `You are the YAAA team lead. Generate a friendly, concise, single-sentence response acknowledging the user's task request and stating that you will now prepare an implementation strategy for their review, and that no agents will start until they approve it. Use the term "strategy" or "implementation strategy". Do not include any other conversational filler.`,
+          content: `You are the YAAA team lead. Generate a friendly, concise user-facing planning update in 1-3 sentences. Explain how you are preparing the implementation strategy by mentioning only the relevant factors you will consider, such as the deliverable and scope, audience or constraints, dependencies, required tools, agent/model assignments, verification steps, and risks or time limits. Do not reveal private chain-of-thought or provide detailed hidden reasoning. End by making clear that the user will review and approve the plan before any agent starts. Use the term "strategy" or "implementation strategy".`,
         },
         { role: "user", content: `Goal: ${goal}` },
       ];

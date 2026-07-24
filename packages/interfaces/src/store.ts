@@ -7,6 +7,7 @@ import type {
   TaskPlan,
   RuntimeEvent,
 } from "@yaaa/shared";
+import type { ExecutionObservation, ExecutionSession } from "./execution.js";
 
 export interface IStore {
   initTaskDb(taskId: string): Promise<void>;
@@ -29,6 +30,11 @@ export interface IStore {
   /** Optional append-only journal. Implementations may add this incrementally. */
   saveRuntimeEvent?(event: RuntimeEvent): Promise<void>;
   getRuntimeEvents?(taskId: string, options?: { topic?: string; limit?: number }): Promise<RuntimeEvent[]>;
+
+  saveExecutionSession?(session: ExecutionSession): Promise<void>;
+  getExecutionSessions?(taskId: string): Promise<ExecutionSession[]>;
+  saveExecutionObservation?(taskId: string, observation: ExecutionObservation): Promise<void>;
+  getExecutionObservations?(taskId: string, sessionId: string, limit?: number): Promise<ExecutionObservation[]>;
 
 }
 

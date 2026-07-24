@@ -7,7 +7,7 @@ type ModelPreference = "sota" | "balanced" | "cost-effective";
 const OPTIONS: Array<{ value: ModelPreference; label: string; model: string; description: string }> = [
   { value: "cost-effective", label: "Base", model: "Gemini 2.5 Pro Preview or best reachable equivalent", description: "Use Gemini 2.5 Pro for the base performance tier." },
   { value: "balanced", label: "Medium", model: "Gemini 3.1 Pro Preview or best reachable equivalent", description: "Use Gemini 3.1 Pro for the medium performance tier." },
-  { value: "sota", label: "Full", model: "Claude Opus 5 or best reachable equivalent", description: "Use the strongest Claude reasoning tier for difficult work." },
+  { value: "sota", label: "Full", model: "Best available OpenAI GPT model from Mesh", description: "Use the strongest OpenAI GPT model currently offered by Mesh." },
 ];
 
 export function SettingsView({ onBack }: { onBack: () => void }) {

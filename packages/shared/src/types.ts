@@ -114,6 +114,8 @@ export interface MentionRoute {
 export interface TaskPlan {
   goal: string;
   subtasks: Subtask[];
+  /** LLM-provided estimate and user-facing explanation for plan generation. */
+  planningEstimate?: PlanningEstimate;
   /** Structured planning decisions shown in YAAA's implementation ledger. */
   planningAnalysis?: PlanningAnalysis;
   /** Detailed explanation of how YAAA will execute the work. */
@@ -126,6 +128,12 @@ export interface TaskPlan {
   verification?: VerificationPlan;
   /** Findings reported by independent verification agents back to YAAA. */
   verificationFindings?: VerificationFinding[];
+}
+
+export interface PlanningEstimate {
+  message: string;
+  considerations: string[];
+  expectedDurationMs: number;
 }
 
 export interface PlanningAnalysis {

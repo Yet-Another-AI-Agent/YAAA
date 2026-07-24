@@ -45,10 +45,59 @@ function rejectsTemperature(err: unknown): boolean {
 
 const MIN_API_ATTEMPTS = 3;
 
+// Kept in the provider as the last-resort runtime safety net. The core
+// benchmark registry normally prevents this path by intersecting its local
+// ranking with Mesh's live catalog; this covers a catalog race or a model being
+// retired between discovery and execution.
+const MODEL_FALLBACKS: Record<string, string[]> = {
+  "anthropic/claude-opus-4.8": ["anthropic/claude-opus-4.7", "anthropic/claude-sonnet-4.6"],
+  "anthropic/claude-opus-4.7": ["anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6"],
+  "google/gemini-3.1-pro-preview": ["google/gemini-2.5-pro-preview", "google/gemini-3-flash-preview"],
+  "anthropic/claude-sonnet-4.6": ["anthropic/claude-sonnet-4.5", "anthropic/claude-haiku-4.5"],
+  "google/gemini-3-flash-preview": ["google/gemini-2.5-pro-preview", "google/gemini-3.1-flash-lite-preview"],
+};
+
+function isModelUnavailable(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /\b404\b|model_not_found|not supported|invalid model/i.test(message);
+}
+
 function retryDelay(attempt: number): number {
   const configured = Number(process.env.YAAA_API_RETRY_DELAY_MS);
   const base = Number.isFinite(configured) && configured >= 0 ? configured : 250;
   return base * 2 ** (attempt - 1);
+}
+
+function selectBestOpenAIModel(catalog: MeshModelCatalogEntry[]): string | undefined {
+  const candidates = catalog.filter((model) => {
+    const identity = `${model.id} ${model.name ?? ""} ${model.brand ?? ""}`.toLowerCase();
+    return model.supports_tools !== false
+      && model.supports_completions_api !== false
+      && (model.model_type === undefined || model.model_type === "text")
+      && identity.includes("openai")
+      && identity.includes("gpt")
+      && !/(?:mini|nano|image|audio|embedding|realtime|chat|turbo)/i.test(identity);
+  });
+  const version = (model: MeshModelCatalogEntry): number => {
+    const match = `${model.id} ${model.name ?? ""}`.match(/gpt[^\d]*(\d+(?:\.\d+)?)/i);
+    return match ? Number(match[1]) : 0;
+  };
+  const proRank = (model: MeshModelCatalogEntry): number => /(?:^|[-\s])pro(?:$|[-\s])/i.test(`${model.id} ${model.name ?? ""}`) ? 1 : 0;
+  return [...candidates].sort((a, b) => version(b) - version(a) || proRank(b) - proRank(a) || a.id.localeCompare(b.id)).at(0)?.id;
+}
+
+function selectGeminiProModel(catalog: MeshModelCatalogEntry[], family: "2.5" | "3.1"): string | undefined {
+  return catalog
+    .filter((model) => {
+      const identity = `${model.id} ${model.name ?? ""} ${model.brand ?? ""}`.toLowerCase();
+      return model.supports_tools !== false
+        && model.supports_completions_api !== false
+        && (model.model_type === undefined || model.model_type === "text")
+        && identity.includes("google")
+        && identity.includes(`gemini-${family}-pro`);
+    })
+    .sort((a, b) => a.id.localeCompare(b.id))
+    .at(0)?.id;
 }
 
 async function retryApiCall<T>(label: string, operation: () => Promise<T>): Promise<T> {
@@ -117,10 +166,14 @@ export class MeshGateway implements IMeshGateway {
   private openai: OpenAI;
   private modelMapping: Record<ModelRole, string>;
   private isMockMode: boolean;
+  private modelPreference?: ModelPreference;
+  private bestOpenAIPromise?: Promise<string | undefined>;
+  private preferredGeminiPromise?: Promise<string | undefined>;
 
   constructor(config: MeshGatewayConfig = {}) {
     const apiKey = config.apiKey || process.env.MESH_API_KEY;
     this.isMockMode = !apiKey;
+    this.modelPreference = config.modelPreference;
     if (this.isMockMode) {
       console.log("ℹ️  [MeshGateway] MESH_API_KEY is not set. Running in MOCK Mode for testing.");
     }
@@ -137,26 +190,41 @@ export class MeshGateway implements IMeshGateway {
     // Default Mesh API routing mapping for various agent roles. The planner can
     // assign any supported provider/company model per subtask, while these are
     // only fallback role mappings when no explicit model was selected.
-    const orchestratorModel = config.modelPreference === "sota"
-      ? "anthropic/claude-sonnet-4.5"
-      : config.modelPreference === "balanced"
-        ? "google/gemini-3.1-pro-preview"
-        : "google/gemini-2.5-pro-preview";
+    const roleDefaults = config.modelPreference === "sota"
+      ? {
+          planner: "anthropic/claude-opus-4.8",
+          worker: "anthropic/claude-sonnet-4.6",
+          verifier: "anthropic/claude-haiku-4.5",
+          utility: "anthropic/claude-haiku-4.5",
+        }
+      : config.modelPreference === "cost-effective"
+        ? {
+            planner: "google/gemini-3.1-pro-preview",
+            worker: "google/gemini-3.1-flash-lite-preview",
+            verifier: "google/gemini-3.1-flash-lite-preview",
+            utility: "google/gemini-3.1-flash-lite-preview",
+          }
+        : {
+            planner: "google/gemini-3.1-pro-preview",
+            worker: "google/gemini-3-flash-preview",
+            verifier: "google/gemini-3-flash-preview",
+            utility: "google/gemini-3-flash-preview",
+          };
     this.modelMapping = {
-      planner: orchestratorModel,
-      worker: orchestratorModel,
-      verifier: orchestratorModel,
-      utility: orchestratorModel,
+      ...roleDefaults,
       ...config.modelMapping,
     };
-    // Mesh rejects the old speculative Claude 5 id with 404. Normalize it at
-    // the gateway boundary so stale settings cannot break utility/planner
-    // calls before the live catalog resolver gets a chance to run.
-    for (const role of Object.keys(this.modelMapping) as ModelRole[]) {
-      if (this.modelMapping[role] === "anthropic/claude-opus-5") {
-        this.modelMapping[role] = "anthropic/claude-sonnet-4.5";
-      }
+  }
+
+  private async resolveRoleModel(role: ModelRole, configured: string): Promise<string> {
+    if (role !== "planner" || this.isMockMode) return configured;
+    if (this.modelPreference === "sota") {
+      this.bestOpenAIPromise ??= this.listModels().then(selectBestOpenAIModel).catch(() => undefined);
+      return (await this.bestOpenAIPromise) || configured;
     }
+    const family = this.modelPreference === "cost-effective" ? "2.5" : "3.1";
+    this.preferredGeminiPromise ??= this.listModels().then((catalog) => selectGeminiProModel(catalog, family)).catch(() => undefined);
+    return (await this.preferredGeminiPromise) || configured;
   }
 
   /** Read Mesh's live, cross-provider catalog. Pricing and availability are
@@ -215,7 +283,7 @@ export class MeshGateway implements IMeshGateway {
       return { content };
     }
 
-    const model = options.model || this.modelMapping[options.modelRole];
+    const model = await this.resolveRoleModel(options.modelRole, options.model || this.modelMapping[options.modelRole]);
     try {
       const oaiTools = options.tools?.map((t) => ({
         type: "function" as const,
@@ -267,6 +335,17 @@ export class MeshGateway implements IMeshGateway {
         toolCalls,
       };
     } catch (err) {
+      const fallbacks = MODEL_FALLBACKS[model] ?? [];
+      if (isModelUnavailable(err) && fallbacks.length) {
+        for (const fallback of fallbacks) {
+          try {
+            console.warn(`[MeshGateway] ${model} was unavailable; falling back to ${fallback}`);
+            return await this.chat(messages, { ...options, model: fallback });
+          } catch (fallbackError) {
+            if (!isModelUnavailable(fallbackError)) throw fallbackError;
+          }
+        }
+      }
       console.error(`Mesh API call failed using model ${model} for role ${options.modelRole}:`, err);
       rethrowGatewayError(err);
     }
@@ -284,7 +363,7 @@ export class MeshGateway implements IMeshGateway {
       return;
     }
 
-    const model = options.model || this.modelMapping[options.modelRole];
+    const model = await this.resolveRoleModel(options.modelRole, options.model || this.modelMapping[options.modelRole]);
     try {
       const createStream = (includeTemperature: boolean) =>
         this.openai.chat.completions.create({

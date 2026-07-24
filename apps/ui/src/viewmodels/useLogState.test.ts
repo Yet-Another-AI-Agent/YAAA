@@ -63,6 +63,29 @@ describe("useLogState", () => {
     expect(result.current.logs).toEqual([]);
   });
 
+  it("clearTransientLogs removes only startup/progress entries", () => {
+    const { result } = renderHook(() => useLogState());
+
+    act(() => {
+      result.current.addLog("system", "starting", "system", { transient: true });
+      result.current.addLog("agent", "curl completed", "activity");
+    });
+
+    act(() => result.current.clearTransientLogs());
+
+    expect(result.current.logs.map((log) => log.content)).toEqual(["curl completed"]);
+  });
+
+  it("clearThoughts preserves persistent LLM request and response logs", () => {
+    const { result } = renderHook(() => useLogState());
+    act(() => {
+      result.current.addLog("agent", "LLM request", "thinking", { persistent: true });
+      result.current.addLog("agent", "temporary thought", "thinking");
+    });
+    act(() => result.current.clearThoughts());
+    expect(result.current.logs.map((log) => log.content)).toEqual(["LLM request"]);
+  });
+
   it("log entry has id, time, source, content fields", () => {
     const { result } = renderHook(() => useLogState());
 

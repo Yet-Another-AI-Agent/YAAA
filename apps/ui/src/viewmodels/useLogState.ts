@@ -47,7 +47,11 @@ export function useLogState() {
   };
 
   const clearThoughts = () => {
-    setLogs((prev) => prev.filter((log) => log.kind !== "thinking" && log.source !== "system"));
+    setLogs((prev) => prev.filter((log) => (log.kind !== "thinking" || log.metadata?.persistent === true) && log.source !== "system"));
+  };
+
+  const clearTransientLogs = () => {
+    setLogs((prev) => prev.filter((log) => log.metadata?.transient !== true));
   };
 
   return {
@@ -55,5 +59,6 @@ export function useLogState() {
     addLog,
     clearLogs,
     clearThoughts,
+    clearTransientLogs,
   };
 }
