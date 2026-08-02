@@ -1,0 +1,27 @@
+:root {
+  --bg-app: hsl(224 25% 8%);
+  --bg-card: hsl(222 22% 12% / .7);
+  --surface: hsl(222 22% 12%);
+  --border-color: hsl(220 20% 20% / .5);
+  --text-primary: hsl(0 0% 96%);
+  --text-secondary: hsl(220 15% 70%);
+  --text-muted: hsl(220 10% 45%);
+  --color-primary: hsl(242 85% 65%);
+  --color-success: hsl(145 80% 45%);
+  --color-danger: hsl(0 85% 60%);
+}
+
+.chat-v2-light {
+  --bg-app: hsl(0 0% 98%);
+  --bg-card: hsl(0 0% 100%);
+  --surface: hsl(0 0% 100%);
+  --border-color: hsl(220 13% 82%);
+  --text-primary: hsl(224 25% 12%);
+  --text-secondary: hsl(220 15% 32%);
+  --text-muted: hsl(220 10% 48%);
+  --color-primary: hsl(242 65% 52%);
+  --color-success: hsl(145 65% 34%);
+  --color-danger: hsl(0 65% 48%);
+}
+
+html, body { background: var(--bg-app); color: var(--text-primary); }

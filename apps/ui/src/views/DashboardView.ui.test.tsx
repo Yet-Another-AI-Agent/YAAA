@@ -324,8 +324,8 @@ describe("DashboardView", () => {
     render(<DashboardView viewModel={makeViewModel({
       taskId: "task-1",
       subtasks: [
-        { id: "task-1", title: "Write a file", capability: "files", dependsOn: [], riskLevel: "low", successCriteria: "", state: "pending" },
-        { id: "task-2", title: "Verify it", capability: "verify", dependsOn: [], riskLevel: "low", successCriteria: "", state: "pending" },
+        { id: "task-1", title: "Write a file", roles: ["FilesAgent"], capabilities: ["files"], dependsOn: [], riskLevel: "low", successCriteria: "", state: "pending" },
+        { id: "task-2", title: "Verify it", roles: ["QaTesterAgent"], capabilities: ["verify"], dependsOn: [], riskLevel: "low", successCriteria: "", state: "pending" },
       ],
     })} />);
 
@@ -872,7 +872,7 @@ describe("DashboardView", () => {
     render(<DashboardView viewModel={makeViewModel({
       taskId: "task-1",
       awaitingConfirmation: true,
-      subtasks: [{ id: "s1", title: "Do the thing", capability: "files", dependsOn: [], riskLevel: "low", successCriteria: "", state: "pending" }],
+      subtasks: [{ id: "s1", title: "Do the thing", roles: ["FilesAgent"], capabilities: ["files"], dependsOn: [], riskLevel: "low", successCriteria: "", state: "pending" }],
       confirmPlan,
     })} />);
 
@@ -902,7 +902,7 @@ describe("DashboardView", () => {
       awaitingConfirmation: true,
       running: false,
       tasks,
-      subtasks: [{ id: "s1", title: "Do the thing", capability: "files", dependsOn: [], riskLevel: "low", successCriteria: "", state: "pending" }],
+      subtasks: [{ id: "s1", title: "Do the thing", roles: ["FilesAgent"], capabilities: ["files"], dependsOn: [], riskLevel: "low", successCriteria: "", state: "pending" }],
       logs: [{ id: "plan", time: "10:00", source: "orchestrator", content: "[plan-proposal] Implementation plan ready for review.", kind: "response" }],
     })} />);
 
@@ -928,7 +928,7 @@ describe("DashboardView", () => {
       },
     ]);
     (window as any).electronAPI.readTaskOrchestrator.mockResolvedValue(
-      "# Plan\n\n## [subtask-1] Build the tool\n- Capability: `files`",
+      "# Plan\n\n## [subtask-1] Build the tool\n- Roles: `FilesAgent`\n- Capabilities: `files`",
     );
 
     render(<DashboardView viewModel={makeViewModel({ tasks, confirmPlan })} />);
@@ -970,7 +970,7 @@ describe("DashboardView", () => {
   it("opens a spawned agent's thread and returns via the back button", () => {
     render(<DashboardView viewModel={makeViewModel({
       taskId: "task-1",
-      subtasks: [{ id: "research", title: "Investigate the repo", capability: "browser", dependsOn: [], riskLevel: "low", successCriteria: "Findings documented", state: "running" }],
+      subtasks: [{ id: "research", title: "Investigate the repo", roles: ["ResearcherAgent"], capabilities: ["browser"], dependsOn: [], riskLevel: "low", successCriteria: "Findings documented", state: "running" }],
       agents: [{
         id: "browser-agent-abcd",
         handle: "@researcher-1",

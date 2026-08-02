@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  assembleContextPacket,
   buildAgentBrief,
   buildMissionSummary,
   budgetLines,
@@ -62,29 +63,25 @@ describe("buildAgentBrief", () => {
     expect(brief).toContain("agent-workspaces/a/handOff.md");
   });
 
-  it("renders the hands-on, proof, and handoff contract paths", () => {
+  it("renders the hands-on and handoff contract paths", () => {
     const brief = buildAgentBrief({
       ...base,
       handsOnPath: "agent-workspaces/a/handsOn.md",
-      proofOfWorkPath: "agent-workspaces/a/proofOfWork.md",
       handOffPath: "agent-workspaces/a/handOff.md",
     });
     expect(brief).toContain("## Handoff contract");
     expect(brief).toContain("agent-workspaces/a/handsOn.md");
-    expect(brief).toContain("agent-workspaces/a/proofOfWork.md");
     expect(brief).toContain("agent-workspaces/a/handOff.md");
   });
 
   it("requires an exit checklist before the agent stops", () => {
     const brief = buildAgentBrief({
       ...base,
-      proofOfWorkPath: "agent-workspaces/a/proofOfWork.md",
       handOffPath: "agent-workspaces/a/handOff.md",
     });
     expect(brief).toContain("## Exit checklist");
     expect(brief).toContain("deliverable exists as a concrete file/artifact");
     expect(brief).toContain("Do not exit immediately after web.search");
-    expect(brief).toContain("agent-workspaces/a/proofOfWork.md");
     expect(brief).toContain("agent-workspaces/a/handOff.md");
   });
 
@@ -122,6 +119,157 @@ describe("buildAgentBrief", () => {
 
   it("exposes a sane default budget", () => {
     expect(DEFAULT_MAX_DEPENDENCY_CHARS).toBeGreaterThan(1000);
+  });
+
+  it("renders the planner-owned sequential action contract without dumping history", () => {
+    const brief = buildAgentBrief({
+      ...base,
+      executionContract: {
+        requiredArtifacts: ["index.html", "game.js"],
+        targetWorkspace: "the canonical task workspace",
+        expectedNextActions: ["read graph scope", "write missing files"],
+        dependencyGraph: [{ subtaskId: "task-1", dependsOn: [] }],
+        preflight: { runOncePerAssignment: true, targetPaths: ["game.js"] },
+        completionSignals: ["Both files exist"],
+        noProgress: { correctionAfter: 1, stopAfter: 2 },
+        actionQueue: { useWhen: ["dependent file operations"], maxActions: 4, maxDepth: 2, stopOnError: true },
+        verificationSurface: "files",
+      },
+    });
+    expect(brief).toContain("## Execution contract");
+    expect(brief).toContain("Expected next actions: read graph scope; write missing files");
+    expect(brief).toContain("max 4 actions, depth 2");
+  });
+
+  it("fits a planner-selected context budget while retaining the assignment contract", () => {
+    const brief = buildAgentBrief({
+      ...base,
+      maxContextChars: 900,
+      dependencyOutputs: [{ id: "s1", title: "Large dependency", summary: "x".repeat(3000) }],
+      workspaceArtifactPaths: Array.from({ length: 20 }, (_, i) => `generated/${i}.js`),
+    });
+    expect(brief.length).toBeLessThanOrEqual(900);
+    expect(brief).toContain("## Mission goal");
+    expect(brief).toContain("## Success criteria");
+    expect(brief).toContain("## Exit checklist");
+  });
+
+  it("does not leak verifier-only evidence or unrelated durable sections into a worker packet", () => {
+    const packet = assembleContextPacket({
+      role: "worker",
+      missionGoal: "Build the requested app",
+      subtaskTitle: "Implement the app shell",
+      successCriteria: "The app shell exists",
+      subSubtasks: [
+        { id: "shell.1", title: "Create the app shell", state: "running" },
+        { id: "shell.2", title: "Verify the app shell", state: "pending" },
+      ],
+      dependencyOutputs: [{ id: "unrelated", title: "Unrelated sibling", summary: "x".repeat(20_000) }],
+      workspaceArtifactPaths: ["app/index.html", "private/transcript.json"],
+      skills: [{ id: "canvas", name: "Canvas", category: "graphics", description: "Draw shapes" } as any],
+      contextPolicy: {
+        maxInputTokens: 1_000,
+        maxDependencyChars: 200,
+        maxHistoryTurns: 2,
+        maxFileExcerptLines: 40,
+        includeFullSkillDocs: false,
+        allowOnDemandReads: true,
+        allowedTools: ["read_file"],
+      },
+    });
+
+    expect(packet.role).toBe("worker");
+    expect(packet.activeStep).toContain("shell.1");
+    expect(packet.dependencySummary[0].length).toBeLessThan(300);
+    expect(packet.omittedSections).toContain("full-transcript");
+    expect(packet.omittedSections).toContain("full-skill-documents");
+    expect(packet.omittedSections).toContain("unrelated-sibling-results");
+    expect(packet.omittedSections).not.toContain("verification-target");
+  });
+
+  it("retains the assignment contract when a large durable packet is hard-capped", () => {
+    const brief = buildAgentBrief({
+      role: "worker",
+      missionGoal: "Ship the feature",
+      subtaskTitle: "Implement the bounded change",
+      successCriteria: "The targeted file passes its checks",
+      dependencyOutputs: Array.from({ length: 40 }, (_, index) => ({
+        id: `dependency-${index}`,
+        title: `Dependency ${index}`,
+        summary: "large result ".repeat(500),
+      })),
+      skills: Array.from({ length: 10 }, (_, index) => ({
+        id: `skill-${index}`,
+        name: `Skill ${index}`,
+        category: "code",
+        description: "skill description",
+        content: "full skill document ".repeat(500),
+      } as any)),
+      contextPolicy: {
+        maxInputTokens: 750,
+        maxDependencyChars: 400,
+        maxHistoryTurns: 1,
+        maxFileExcerptLines: 20,
+        includeFullSkillDocs: false,
+        allowOnDemandReads: true,
+        allowedTools: [],
+      },
+      maxContextChars: 1_200,
+    });
+
+    expect(brief.length).toBeLessThanOrEqual(1_200);
+    expect(brief).toContain("## Mission goal");
+    expect(brief).toContain("## Your subtask");
+    expect(brief).toContain("## Success criteria");
+    expect(brief).toContain("## Exit checklist");
+    expect(brief).toContain("durable mission state remains persisted");
+    expect(brief).not.toContain("full skill document");
+  });
+});
+
+describe("assembleContextPacket", () => {
+  it("selects role-specific durable facts without copying the transcript", () => {
+    const packet = assembleContextPacket({
+      role: "verifier",
+      missionGoal: "Ship the game",
+      subtaskTitle: "Verify the battle screen",
+      successCriteria: "The battle screen is reachable",
+      subSubtasks: [{ id: "s.1", title: "Open the app", state: "running" }],
+      dependencyOutputs: [{ id: "s", title: "Build", summary: "Created game.js" }],
+      skills: [{ id: "browser", name: "Browser", category: "browser", description: "Inspect pages", content: "full docs" } as any],
+      contextPolicy: {
+        maxInputTokens: 6000,
+        maxDependencyChars: 3000,
+        maxHistoryTurns: 4,
+        maxFileExcerptLines: 120,
+        includeFullSkillDocs: false,
+        allowOnDemandReads: true,
+        allowedTools: ["open_browser"],
+      },
+    });
+    expect(packet.role).toBe("verifier");
+    expect(packet.activeStep).toContain("s.1");
+    expect(packet.dependencySummary).toEqual(["[s] Build: Created game.js"]);
+    expect(packet.selectedSkillIds).toEqual(["browser"]);
+    expect(packet.omittedSections).toContain("full-transcript");
+    expect(packet.omittedSections).toContain("full-skill-documents");
+    expect(buildAgentBrief({
+      role: "verifier",
+      missionGoal: "Ship the game",
+      subtaskTitle: "Verify the battle screen",
+      successCriteria: "The battle screen is reachable",
+      executionContract: {
+        requiredArtifacts: ["game.js"],
+        targetWorkspace: "workspace",
+        expectedNextActions: [],
+        dependencyGraph: [],
+        preflight: { runOncePerAssignment: true, targetPaths: [] },
+        completionSignals: ["screen reachable"],
+        noProgress: { correctionAfter: 1, stopAfter: 2 },
+        actionQueue: { useWhen: [], maxActions: 2, maxDepth: 1, stopOnError: true },
+        verificationSurface: "browser",
+      },
+    })).toContain("## Verification target");
   });
 });
 

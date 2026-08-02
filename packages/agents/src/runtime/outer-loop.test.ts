@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { container, PermissionEngine, orchestratorMailbox } from "@yaaa/platform";
+import { container, PermissionEngine, orchestratorMailbox, agentControl } from "@yaaa/platform";
 import type { IBus, IStore, ModelRole } from "@yaaa/interfaces";
-import type { TaskPlan } from "@yaaa/shared";
+import type { TaskPlan, AgentRun } from "@yaaa/shared";
 import { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { AIMessage, type BaseMessage } from "@langchain/core/messages";
 import type { ChatResult } from "@langchain/core/outputs";
@@ -110,8 +110,8 @@ describe("OuterLoop Manager", () => {
     const plan: TaskPlan = {
       goal: "Run test task",
       subtasks: [
-        { id: "task-1", title: "Write file facts", capability: "files", dependsOn: [], riskLevel: "low", successCriteria: "file exists", state: "pending" },
-        { id: "task-2", title: "Verify task facts contents", capability: "verify", dependsOn: ["task-1"], riskLevel: "low", successCriteria: "facts verified", state: "pending" },
+        { id: "task-1", title: "Write file facts", roles: ["FilesAgent"], capabilities: ["files"], dependsOn: [], riskLevel: "low", successCriteria: "file exists", state: "pending" },
+        { id: "task-2", title: "Verify task facts contents", roles: ["QaTesterAgent"], capabilities: ["verify"], dependsOn: ["task-1"], riskLevel: "low", successCriteria: "facts verified", state: "pending" },
       ],
     };
 
@@ -119,6 +119,8 @@ describe("OuterLoop Manager", () => {
 
     expect(mockStore.savePlan).toHaveBeenCalledWith("task-123", plan);
     expect(mockStore.saveLedgerEntry).toHaveBeenCalled();
+    expect(plan.subtasks[0].subSubtasks?.every((step) => step.state === "completed")).toBe(true);
+    expect(plan.subtasks[1].subSubtasks?.every((step) => step.state === "completed")).toBe(true);
     expect(mockBus.publish).toHaveBeenCalledWith(
       "task.task-123.started",
       expect.objectContaining({ kind: "status", state: "working" }),
@@ -137,7 +139,97 @@ describe("OuterLoop Manager", () => {
     expect(dependentBrief).toContain("handOff.md");
   });
 
-  it("answers a queued message even when no worker is active yet", async () => {
+  it("passes complete mission context through the real outer-to-inner execution path", async () => {
+    const taskId = "task-e2e-assignment-context";
+    const mission = "Create a 5-slide educational Betta fish presentation for children";
+    const criteria = "The final presentation contains five age-appropriate slides and is saved as betta_fish.pptx";
+    const plan: TaskPlan = {
+      goal: mission,
+      subtasks: [
+        {
+          id: "subtask-1",
+          title: "Draft content",
+        roles: ["FilesAgent"],
+        capabilities: ["files"],
+          dependsOn: [],
+          riskLevel: "low",
+          successCriteria: criteria,
+          state: "pending",
+        },
+      ],
+    };
+
+    let modelTurn = 0;
+    responder = async () => {
+      modelTurn += 1;
+      return modelTurn === 1
+        ? toolCall("write_file", { path: "betta_fish.pptx", content: "non-empty test artifact" })
+        : finalMessage("Assignment understood and completed with the required evidence.");
+    };
+
+    await expect(outerLoop.run(taskId, plan)).resolves.not.toThrow();
+
+    const firstModelRequest = captured[0]?.messages.map((message) => String(message.content)).join("\n") ?? "";
+    expect(firstModelRequest).toContain("## Assignment at a glance");
+    expect(firstModelRequest).toContain(mission);
+    expect(firstModelRequest).toContain("Draft content");
+    expect(firstModelRequest).toContain(criteria);
+    expect(firstModelRequest).toContain("Current micro-step:");
+    expect(firstModelRequest).toContain("Do not claim that context is missing");
+  });
+
+  it("passes composite roles and the union of capabilities to one inner-loop agent", async () => {
+    const runInnerLoop = vi.spyOn(outerLoop as any, "runInnerLoop").mockResolvedValue({
+      summary: "Composite assignment completed.",
+      artifacts: [{ path: "deliverable.md", mimeType: "text/markdown", description: "Composite output" }],
+    });
+    const plan: TaskPlan = {
+      goal: "Create and verify a composite deliverable",
+      subtasks: [{
+        id: "composite-1",
+        title: "Create and verify the composite deliverable",
+        roles: ["DocumentAgent", "FilesAgent"],
+        capabilities: ["files", "shell", "verify"],
+        dependsOn: [],
+        riskLevel: "low",
+        successCriteria: "deliverable.md exists",
+        state: "pending",
+      }],
+    };
+
+    await expect(outerLoop.run("task-composite-assignment", plan)).resolves.not.toThrow();
+
+    expect(runInnerLoop).toHaveBeenCalledWith(expect.objectContaining({
+      templateName: "DocumentAgent",
+      roleNames: ["DocumentAgent", "FilesAgent"],
+      capabilities: ["files", "shell", "verify"],
+    }));
+    const savedAgents = (mockStore.saveAgent as any).mock.calls.map((call: any[]) => call[1]);
+    expect(new Set(savedAgents.map((agent: any) => agent.id)).size).toBe(1);
+  });
+
+  it("does not require a final PPTX from an upstream outline subtask", () => {
+    const researchSubtask: any = {
+      id: "subtask-1",
+      title: "Research and draft advanced Betta fish presentation outline",
+          roles: ["ResearcherAgent"],
+          capabilities: ["browser"],
+      dependsOn: [],
+      riskLevel: "low",
+      successCriteria: "A file named 'outline.md' exists containing content for exactly 5 slides",
+      state: "pending",
+    };
+
+    const gaps = (outerLoop as any).requiredArtifactGaps(
+      researchSubtask,
+      [{ path: "outline.md" }],
+      "Create a 5-slide PowerPoint presentation with generated images",
+    );
+
+    expect(gaps).toEqual([]);
+  });
+
+  it("does not emit an acknowledgement when a queued message arrives before a worker", async () => {
     const taskId = "task-queued-without-worker";
     mockStore.getAgents = vi.fn().mockResolvedValue([]);
     orchestratorMailbox.post({
@@ -150,10 +242,11 @@ describe("OuterLoop Manager", () => {
 
     await outerLoop.run(taskId, singleSubtaskPlan());
 
-    expect(mockBus.publish).toHaveBeenCalledWith(
-      `task.${taskId}.started`,
-      expect.objectContaining({ note: expect.stringContaining("I’m here") }),
-    );
+    const notes = (mockBus.publish as any).mock.calls
+      .filter((call: any[]) => call[0] === `task.${taskId}.started`)
+      .map((call: any[]) => call[1]?.note ?? "")
+      .join("\n");
+    expect(notes).not.toContain("I’m here");
     orchestratorMailbox.clear(taskId);
   });
 
@@ -162,6 +255,13 @@ describe("OuterLoop Manager", () => {
     mockStore.getAgents = vi.fn().mockResolvedValue([
       { id: "sub-agent-1", handle: "@researcher-1", status: "working", taskId },
     ]);
+    supervisorGateway.chat.mockResolvedValueOnce({
+      content: JSON.stringify({
+        recipientIds: [],
+        reply: "Preserve the existing API and verify the compatibility path before migrating.",
+        reason: "The worker needs a concrete compatibility decision.",
+      }),
+    });
     orchestratorMailbox.post({
       id: "agent-question-1",
       taskId,
@@ -179,9 +279,12 @@ describe("OuterLoop Manager", () => {
         kind: "info_reply",
         from: "orchestrator",
         to: "sub-agent-1",
-        answer: expect.stringContaining("@researcher-1"),
+        answer: expect.stringContaining("@researcher-1 Preserve the existing API"),
       }),
     );
+    const reply = (mockBus.publish as any).mock.calls
+      .find((call: any[]) => call[0] === `task.${taskId}.agent_message` && call[1]?.kind === "info_reply")?.[1];
+    expect(reply.answer).not.toContain("safest evidence-based path");
     orchestratorMailbox.clear(taskId);
   });
 
@@ -217,8 +320,8 @@ describe("OuterLoop Manager", () => {
     const plan: TaskPlan = {
       goal: "Run test task",
       subtasks: [
-        { id: "task-1", title: "Write file facts", capability: "files", dependsOn: [], riskLevel: "low", successCriteria: "file exists", state: "pending" },
-        { id: "task-2", title: "Verify facts", capability: "verify", dependsOn: ["task-1"], riskLevel: "low", successCriteria: "facts verified", state: "pending" },
+        { id: "task-1", title: "Write file facts", roles: ["FilesAgent"], capabilities: ["files"], dependsOn: [], riskLevel: "low", successCriteria: "file exists", state: "pending" },
+        { id: "task-2", title: "Verify facts", roles: ["QaTesterAgent"], capabilities: ["verify"], dependsOn: ["task-1"], riskLevel: "low", successCriteria: "facts verified", state: "pending" },
       ],
     };
 
@@ -263,8 +366,8 @@ describe("OuterLoop Manager", () => {
     const plan: TaskPlan = {
       goal: "Run test task",
       subtasks: [
-        { id: "task-1", title: "Write file facts", capability: "files", dependsOn: [], riskLevel: "low", successCriteria: "file exists", state: "pending" },
-        { id: "task-2", title: "Verify facts", capability: "verify", dependsOn: ["task-1"], riskLevel: "low", successCriteria: "facts verified", state: "pending" },
+        { id: "task-1", title: "Write file facts", roles: ["FilesAgent"], capabilities: ["files"], dependsOn: [], riskLevel: "low", successCriteria: "file exists", state: "pending" },
+        { id: "task-2", title: "Verify facts", roles: ["QaTesterAgent"], capabilities: ["verify"], dependsOn: ["task-1"], riskLevel: "low", successCriteria: "facts verified", state: "pending" },
       ],
     };
 
@@ -289,8 +392,8 @@ describe("OuterLoop Manager", () => {
     const deadlockedPlan: TaskPlan = {
       goal: "Deadlock task",
       subtasks: [
-        { id: "task-1", title: "Task 1", capability: "files", dependsOn: ["task-2"], riskLevel: "low", successCriteria: "done", state: "pending" },
-        { id: "task-2", title: "Task 2", capability: "files", dependsOn: ["task-1"], riskLevel: "low", successCriteria: "done", state: "pending" },
+        { id: "task-1", title: "Task 1", roles: ["FilesAgent"], capabilities: ["files"], dependsOn: ["task-2"], riskLevel: "low", successCriteria: "done", state: "pending" },
+        { id: "task-2", title: "Task 2", roles: ["FilesAgent"], capabilities: ["files"], dependsOn: ["task-1"], riskLevel: "low", successCriteria: "done", state: "pending" },
       ],
     };
 
@@ -303,8 +406,8 @@ describe("OuterLoop Manager", () => {
     const failingPlan: TaskPlan = {
       goal: "Failing task",
       subtasks: [
-        { id: "task-1", title: "Failing subtask", capability: "files", dependsOn: [], riskLevel: "low", successCriteria: "done", state: "pending" },
-        { id: "task-2", title: "Dependent pending subtask", capability: "files", dependsOn: ["task-1"], riskLevel: "low", successCriteria: "done", state: "pending" },
+        { id: "task-1", title: "Failing subtask", roles: ["FilesAgent"], capabilities: ["files"], dependsOn: [], riskLevel: "low", successCriteria: "done", state: "pending" },
+        { id: "task-2", title: "Dependent pending subtask", roles: ["FilesAgent"], capabilities: ["files"], dependsOn: ["task-1"], riskLevel: "low", successCriteria: "done", state: "pending" },
       ],
     };
 
@@ -320,7 +423,7 @@ describe("OuterLoop Manager", () => {
   const singleSubtaskPlan = (): TaskPlan => ({
     goal: "Kill switch task",
     subtasks: [
-      { id: "task-1", title: "Write the report file", capability: "files", dependsOn: [], riskLevel: "low", successCriteria: "report exists", state: "pending" },
+      { id: "task-1", title: "Write the report file", roles: ["FilesAgent"], capabilities: ["files"], dependsOn: [], riskLevel: "low", successCriteria: "report exists", state: "pending" },
     ],
   });
 
@@ -353,12 +456,154 @@ describe("OuterLoop Manager", () => {
     expect(exitedAgents).toHaveLength(3);
   });
 
+  it("does not spawn a replacement agent for a deterministic provider 400", async () => {
+    responder = async () => {
+      throw new Error("400 text content blocks must be non-empty; invalid tool-call transcript");
+    };
+
+    await expect(outerLoop.run("task-provider-400", singleSubtaskPlan())).rejects.toThrow(
+      "Task execution failed due to subtask failure.",
+    );
+
+    const savedAgents = (mockStore.saveAgent as any).mock.calls.map((c: any[]) => c[1]);
+    expect(new Set(savedAgents.map((agent: any) => agent.id)).size).toBe(1);
+    expect(savedAgents.some((agent: any) => agent.status === "exited")).toBe(true);
+
+    const statusNotes = (mockBus.publish as any).mock.calls
+      .filter((call: any[]) => call[0] === "task.task-provider-400.started")
+      .map((call: any[]) => call[1]?.note ?? "")
+      .join("\n");
+    expect(statusNotes).toContain("provider request error");
+    expect(statusNotes).not.toContain("spawning a replacement");
+  });
+
+  it("does not turn an inner-loop no-progress stop into a replacement agent", async () => {
+    const runInnerLoop = vi.spyOn(outerLoop as any, "runInnerLoop").mockResolvedValue({
+      incomplete: true,
+      stopReason: "no-progress",
+      summary: "Agent stopped by supervisor. Reason: No progress budget exhausted for this assignment.",
+      artifacts: [{ path: "agent-workspaces/pikachu-1/incompleteWork.md", mimeType: "text/markdown", description: "Failure evidence" }],
+      runtimeEvidence: "- files.file_multi: failed - Unknown action in file_multi execution",
+    });
+
+    await expect(outerLoop.run("task-no-progress-replacement", singleSubtaskPlan())).rejects.toThrow(
+      "Task execution failed due to subtask failure.",
+    );
+
+    expect(runInnerLoop).toHaveBeenCalledTimes(1);
+    const savedAgents = (mockStore.saveAgent as any).mock.calls.map((c: any[]) => c[1]);
+    expect(new Set(savedAgents.map((agent: any) => agent.id)).size).toBe(1);
+    expect(supervisorGateway.chat).not.toHaveBeenCalled();
+    const statusNotes = (mockBus.publish as any).mock.calls
+      .filter((call: any[]) => call[0] === "task.task-no-progress-replacement.started")
+      .map((call: any[]) => call[1]?.note ?? "")
+      .join("\n");
+    expect(statusNotes).not.toContain("spawning a replacement");
+  });
+
+  it("does not spawn a replacement when the required tool permission is denied", async () => {
+    const runInnerLoop = vi.spyOn(outerLoop as any, "runInnerLoop").mockResolvedValue({
+      incomplete: true,
+      permissionBlocked: true,
+      permissionBlockReasons: ["Permission denied: agent pikachu-1 is not permitted to execute files.writeFile"],
+      summary: "The required write operation was denied.",
+      artifacts: [{ path: "agent-workspaces/pikachu-1/handOff.md", mimeType: "text/markdown", description: "Permission blocker" }],
+    });
+
+    await expect(outerLoop.run("task-permission-blocked", singleSubtaskPlan())).rejects.toThrow(
+      "Task execution failed due to subtask failure.",
+    );
+
+    expect(runInnerLoop).toHaveBeenCalledTimes(1);
+    const savedAgents = (mockStore.saveAgent as any).mock.calls.map((call: any[]) => call[1]);
+    expect(new Set(savedAgents.map((agent: any) => agent.id)).size).toBe(1);
+    expect(supervisorGateway.chat).not.toHaveBeenCalled();
+    const notes = (mockBus.publish as any).mock.calls
+      .filter((call: any[]) => call[0] === "task.task-permission-blocked.started")
+      .map((call: any[]) => call[1]?.note ?? "")
+      .join("\n");
+    expect(notes).toContain("blocked by a permission/capability denial");
+    expect(notes).toContain("No replacement agent was spawned");
+  });
+
+  it("does not spawn a replacement when a worker refuses the provided assignment context", async () => {
+    const runInnerLoop = vi.spyOn(outerLoop as any, "runInnerLoop").mockResolvedValue({
+      incomplete: true,
+      summary: "I don't have enough context to complete this assignment. Please provide the full task details.",
+      artifacts: [{ path: "agent-workspaces/researcher-1/handOff.md", mimeType: "text/markdown", description: "Blocker evidence" }],
+    });
+    supervisorGateway.chat.mockResolvedValueOnce({
+      content: JSON.stringify({ action: "fail", reason: "Worker refused the supplied assignment context." }),
+    });
+    const plan: TaskPlan = {
+      goal: "Create a PowerPoint presentation with images",
+      subtasks: [{
+        id: "research-outline",
+        title: "Research and draft the presentation outline",
+        roles: ["ResearcherAgent"],
+        capabilities: ["browser"],
+        dependsOn: [],
+        riskLevel: "low",
+        successCriteria: "A file named 'outline.md' exists containing content for exactly 5 slides",
+        state: "pending",
+      }],
+    };
+
+    await expect(outerLoop.run("task-context-refusal", plan)).rejects.toThrow(
+      "Task execution failed due to subtask failure.",
+    );
+
+    expect(runInnerLoop).toHaveBeenCalledTimes(1);
+    const savedAgents = (mockStore.saveAgent as any).mock.calls.map((call: any[]) => call[1]);
+    expect(new Set(savedAgents.map((agent: any) => agent.id)).size).toBe(1);
+    expect(supervisorGateway.chat).toHaveBeenCalledTimes(1);
+    const notes = (mockBus.publish as any).mock.calls
+      .filter((call: any[]) => call[0] === "task.task-context-refusal.started")
+      .map((call: any[]) => call[1]?.note ?? "")
+      .join("\n");
+    expect(notes).toContain("Supervisor reviewed");
+    expect(notes).toContain("Worker refused the supplied assignment context");
+    expect(new Set(savedAgents.map((agent: any) => agent.id)).size).toBe(1);
+  });
+
+  it("stops instead of looping when artifact gaps meet a context-refusal response", async () => {
+    const runInnerLoop = vi.spyOn(outerLoop as any, "runInnerLoop").mockResolvedValue({
+      incomplete: true,
+      summary: "I don't see the assignment details. Please provide the complete task details.",
+      artifacts: [{ path: "agent-workspaces/refusal-1/handOff.md", mimeType: "text/markdown", description: "Blocker evidence" }],
+    });
+    supervisorGateway.chat.mockResolvedValueOnce({
+      content: JSON.stringify({ action: "redirect", handsOn: "Please try the same assignment again.", reason: "Deliverable is missing." }),
+    });
+    const plan: TaskPlan = {
+      goal: "Create a 5-slide presentation",
+      subtasks: [{
+        id: "presentation",
+        title: "Create the presentation",
+        roles: ["DocumentAgent"],
+        capabilities: ["files"],
+        dependsOn: [],
+        riskLevel: "low",
+        successCriteria: "A presentation.pptx file exists",
+        state: "pending",
+      }],
+    };
+
+    await expect(outerLoop.run("task-context-refusal-with-gap", plan)).rejects.toThrow(
+      "Task execution failed due to subtask failure.",
+    );
+    expect(runInnerLoop).toHaveBeenCalledTimes(1);
+    const savedAgents = (mockStore.saveAgent as any).mock.calls.map((call: any[]) => call[1]);
+    expect(new Set(savedAgents.map((agent: any) => agent.id)).size).toBe(1);
+    expect((mockStore.savePlan as any).mock.calls.at(-1)?.[1].subtasks[0].state).toBe("failed");
+  });
+
   it("runs independent ready subtasks concurrently", async () => {
     const parallelPlan: TaskPlan = {
       goal: "Parallel task",
       subtasks: [
-        { id: "task-a", title: "Independent A", capability: "files", dependsOn: [], riskLevel: "low", successCriteria: "a done", state: "pending" },
-        { id: "task-b", title: "Independent B", capability: "files", dependsOn: [], riskLevel: "low", successCriteria: "b done", state: "pending" },
+        { id: "task-a", title: "Independent A", roles: ["FilesAgent"], capabilities: ["files"], dependsOn: [], riskLevel: "low", successCriteria: "a done", state: "pending" },
+        { id: "task-b", title: "Independent B", roles: ["FilesAgent"], capabilities: ["files"], dependsOn: [], riskLevel: "low", successCriteria: "b done", state: "pending" },
       ],
     };
 
@@ -497,6 +742,31 @@ describe("OuterLoop Manager", () => {
     expect(mockBus.publish).toHaveBeenCalledWith(
       "task.task-course-correct.started",
       expect.objectContaining({ note: expect.stringMatching(/Supervisor checked.*redirect/i) }),
+    );
+  });
+
+  it("switches away from a model that the provider reports as unavailable", async () => {
+    const unavailableModel = "anthropic/claude-sonnet-4.6";
+    const fallbackModel = "anthropic/claude-sonnet-4.5";
+    container.register("modelResolver", async (requested?: string) => ({
+      model: requested || fallbackModel,
+      reason: requested ? "requested test model" : "fallback test model",
+    }));
+    const usedModels: string[] = [];
+    responder = async (role) => {
+      usedModels.push(role);
+      if (role === unavailableModel) throw new Error("503 The model provider is temporarily unavailable. Please try again shortly.");
+      return finalMessage("Built with the fallback model.");
+    };
+    const plan = singleSubtaskPlan();
+    plan.subtasks[0].model = unavailableModel;
+
+    await expect(outerLoop.run("task-model-unavailable", plan)).resolves.not.toThrow();
+
+    expect(usedModels).toEqual([unavailableModel, fallbackModel]);
+    expect(mockBus.publish).toHaveBeenCalledWith(
+      "task.task-model-unavailable.started",
+      expect.objectContaining({ note: expect.stringContaining("is unavailable") }),
     );
   });
 
@@ -643,6 +913,213 @@ describe("OuterLoop Manager", () => {
       expect(roles[2]).toBe("worker");
     } finally {
       delete process.env.YAAA_BACKUP_MODEL;
+    }
+  });
+
+  it("intercepts user control commands (e.g. force kill jigglypuff) and executes them directly instead of forwarding raw text", async () => {
+    const taskId = "task-control-command";
+    const publishedNotes: string[] = [];
+    (mockBus.publish as any).mockImplementation((topic: string, payload: any) => {
+      if (payload?.note) publishedNotes.push(payload.note);
+    });
+
+    const agent: AgentRun = {
+      id: "jigglypuff-5",
+      handle: "@jigglypuff-5",
+      displayName: "FilesAgent",
+      taskId,
+      subtaskId: "task-1",
+      role: "FilesAgent",
+      modelRole: "worker",
+      status: "working",
+      startedAt: new Date().toISOString(),
+    };
+    (mockStore.getAgents as any).mockResolvedValue([agent]);
+
+    orchestratorMailbox.post({
+      id: "user-msg-1",
+      taskId,
+      from: "user",
+      content: "force kill jigglypuff",
+      createdAt: new Date().toISOString(),
+    });
+
+    await outerLoop["processQueuedMessages"](taskId, true);
+
+    expect(publishedNotes.some((note) => note.includes("Force killed @jigglypuff-5"))).toBe(true);
+    expect(agent.status).toBe("exited");
+  });
+
+  it("intercepts model upgrade commands (e.g. upgrade jigglypuff to claude-3-5-sonnet) and posts switch_model directive to sub-agent on the fly", async () => {
+    const taskId = "task-model-upgrade";
+    const publishedNotes: string[] = [];
+    (mockBus.publish as any).mockImplementation((topic: string, payload: any) => {
+      if (payload?.note) publishedNotes.push(payload.note);
+    });
+
+    const agent: AgentRun = {
+      id: "jigglypuff-5",
+      handle: "@jigglypuff-5",
+      displayName: "FilesAgent",
+      taskId,
+      subtaskId: "task-1",
+      role: "FilesAgent",
+      modelRole: "worker",
+      status: "working",
+      startedAt: new Date().toISOString(),
+    };
+    (mockStore.getAgents as any).mockResolvedValue([agent]);
+
+    orchestratorMailbox.post({
+      id: "user-msg-upgrade",
+      taskId,
+      from: "user",
+      content: "upgrade jigglypuff to claude-3-5-sonnet",
+      createdAt: new Date().toISOString(),
+    });
+
+    await outerLoop["processQueuedMessages"](taskId, true);
+
+    expect(publishedNotes.some((note) => note.includes("Dynamically switched model for @jigglypuff-5 to 'claude-3-5-sonnet'"))).toBe(true);
+    expect(agent.model).toBe("claude-3-5-sonnet");
+  });
+
+  it("evaluates periodic sub-agent checkpoints in real-time and issues supervisor course corrections", async () => {
+    const taskId = "task-checkpoint-eval";
+    const publishedNotes: string[] = [];
+    (mockBus.publish as any).mockImplementation((topic: string, payload: any) => {
+      if (payload?.note) publishedNotes.push(payload.note);
+    });
+
+    const agent: AgentRun = {
+      id: "jigglypuff-5",
+      handle: "@jigglypuff-5",
+      displayName: "FilesAgent",
+      taskId,
+      subtaskId: "task-1",
+      role: "FilesAgent",
+      modelRole: "worker",
+      status: "working",
+      startedAt: new Date().toISOString(),
+    };
+    (mockStore.getAgents as any).mockResolvedValue([agent]);
+
+    (outerLoop["supervisor"].assess as any) = vi.fn().mockResolvedValue({
+      action: "redirect",
+      handsOn: "Focus on creating the CSS animation keyframes first.",
+      reason: "Agent was spending too many turns scanning documentation.",
+    });
+
+    const plan = singleSubtaskPlan();
+    await outerLoop.handlePeriodicCheckpoint(
+      taskId,
+      {
+        agentId: "jigglypuff-5",
+        turn: 5,
+        checkpointPath: "agent-workspaces/jigglypuff-5/checkpoint.md",
+        summary: "Turn 5 progress report: reading docs",
+      },
+      plan,
+    );
+
+    expect(publishedNotes.some((note) => note.includes("Course correcting"))).toBe(true);
+  });
+
+  it("auto-triggers checkpointing when a sub-subtask completes and notifies the Outer Loop", async () => {
+    const taskId = "task-subsubtask-test";
+    const publishedNotes: string[] = [];
+    (mockBus.publish as any).mockImplementation((topic: string, payload: any) => {
+      if (payload?.note) publishedNotes.push(payload.note);
+    });
+
+    const subSubtask = { id: "subtask-1.1", title: "Generate animated SVG keyframes", state: "pending" as const };
+    const allSubSubtasks = [subSubtask, { id: "subtask-1.2", title: "Mount DOM canvas listener", state: "pending" as const }];
+
+    await outerLoop["innerLoop"].triggerSubSubtaskCheckpoint({
+      taskId,
+      agentId: "pikachu-1",
+      templateName: "DesignerAgent",
+      agentWorkspace: "agent-workspaces/pikachu-1",
+      subSubtask,
+      allSubSubtasks,
+    });
+
+    expect(subSubtask.state).toBe("completed");
+    expect(publishedNotes.some((note) => note.includes("completed sub-subtask subtask-1.1"))).toBe(true);
+  });
+
+  it("allows a later sub-subtask to complete without advancing past the active step", async () => {
+    const allSubSubtasks = [
+      { id: "generate-pptx.1", title: "Generate presentation", state: "running" as const },
+      { id: "generate-pptx.2", title: "Create the PPTX file", state: "pending" as const },
+      { id: "generate-pptx.3", title: "Verify slide count", state: "pending" as const },
+    ];
+
+    await outerLoop["innerLoop"].triggerSubSubtaskCheckpoint({
+      taskId: "task-out-of-order-subtask",
+      agentId: "pikachu-1",
+      templateName: "DocumentAgent",
+      agentWorkspace: "agent-workspaces/pikachu-1",
+      subSubtask: allSubSubtasks[2],
+      allSubSubtasks,
+    });
+
+    expect(allSubSubtasks.map((step) => step.state)).toEqual(["running", "pending", "completed"]);
+  });
+
+  it("E2E Case 1: Intercepts natural language low model request ('use smaller model') and resolves to cost-effective utility role without forwarding text", async () => {
+    const taskId = "task-e2e-low-model";
+    const publishedNotes: string[] = [];
+    (mockBus.publish as any).mockImplementation((topic: string, payload: any) => {
+      if (payload?.note) publishedNotes.push(payload.note);
+    });
+
+    const agent: AgentRun = {
+      id: "jigglypuff-5",
+      handle: "@jigglypuff-5",
+      displayName: "FilesAgent",
+      taskId,
+      subtaskId: "task-1",
+      role: "FilesAgent",
+      modelRole: "worker",
+      status: "working",
+      startedAt: new Date().toISOString(),
+    };
+    (mockStore.getAgents as any).mockResolvedValue([agent]);
+
+    orchestratorMailbox.post({
+      id: "user-msg-low",
+      taskId,
+      from: "user",
+      content: "use smaller model",
+      createdAt: new Date().toISOString(),
+    });
+
+    await outerLoop["processQueuedMessages"](taskId, true);
+
+    // Verify control action intercepted
+    expect(publishedNotes.some((note) => note.includes("Dynamically switched model for @jigglypuff-5 to 'utility'"))).toBe(true);
+    expect(agent.model).toBe("utility");
+    // Verify text prompt was NOT forwarded as an agent info_reply
+    expect(publishedNotes.some((note) => note.includes("routed it to the active agents"))).toBe(false);
+  });
+
+  it("E2E Case 2: Dynamic model switch in execution loop updates activeModel and overrides static worker default", async () => {
+    const taskId = "task-e2e-dynamic-switch";
+    const agentId = "jigglypuff-5";
+    agentControl.clear(agentId);
+
+    agentControl.post(agentId, {
+      type: "switch_model",
+      newModel: "utility",
+      reason: "User requested cost-effective tier",
+    });
+
+    const directives = agentControl.drain(agentId);
+    expect(directives.length).toBe(1);
+    expect(directives[0].type).toBe("switch_model");
+    if (directives[0].type === "switch_model") {
+      expect(directives[0].newModel).toBe("utility");
     }
   });
 });

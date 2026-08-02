@@ -69,12 +69,23 @@ describe("AGENT_REGISTRY", () => {
       ]) {
         expect(agent.systemPrompt).toContain(toolName);
       }
+      expect(agent.systemPrompt).toContain("file_multi");
+      expect(agent.systemPrompt).toContain("targeted line-range");
     });
   });
 
   it("teaches asset-capable agents to preserve original binary downloads", () => {
     expect(AGENT_REGISTRY.ResearcherAgent.systemPrompt).toContain("download_file");
     expect(AGENT_REGISTRY.DesignerAgent.systemPrompt).toContain("download_file");
+  });
+
+  it("gives every non-verifier specialist the bounded code/file workflow reference", () => {
+    for (const [name, template] of entries) {
+      if (name === "VerifierAgent" || name === "QaTesterAgent" || name === "CvTesterAgent") continue;
+      expect(template.systemPrompt, name).toContain("code-generation-skill");
+      expect(template.systemPrompt, name).toContain("file_multi");
+      expect(template.systemPrompt, name).toContain("handOff.md");
+    }
   });
 
   describe("blueprint roster", () => {
@@ -122,8 +133,7 @@ describe("AGENT_REGISTRY", () => {
     it("routes verification subtasks to the QA tester", () => {
       expect(
         selectAgentTemplate({
-          capability: "verify",
-          title: "Verify summary contents",
+          roles: ["QaTesterAgent"], capabilities: ["verify"],
         }),
       ).toBe("QaTesterAgent");
     });
@@ -131,24 +141,22 @@ describe("AGENT_REGISTRY", () => {
     it("uses the planner's structured visual-verification assignment", () => {
       expect(
         selectAgentTemplate({
-          capability: "verify",
-          title: "Verify the GUI screenshot alignment",
-          agentTemplate: "CvTesterAgent",
+          roles: ["CvTesterAgent"], capabilities: ["verify"],
         }),
       ).toBe("CvTesterAgent");
     });
 
     it("routes docs subtasks to the document specialist", () => {
-      expect(selectAgentTemplate({ capability: "docs", title: "Create a PPT deck" })).toBe("DocumentAgent");
+      expect(selectAgentTemplate({ roles: ["DocumentAgent"], capabilities: ["docs"] })).toBe("DocumentAgent");
     });
 
     it("does not infer a specialist from title keywords", () => {
-      expect(selectAgentTemplate({ capability: "files", title: "Docker React research database" })).toBe("FilesAgent");
+      expect(selectAgentTemplate({ roles: ["FilesAgent"], capabilities: ["files"] })).toBe("FilesAgent");
     });
 
     it("accepts every valid planner-selected specialist", () => {
       for (const agentTemplate of ["PrincipalSweAgent", "UiArchitectAgent", "GraphicsEngineerAgent", "ResearcherAgent", "AdStrategistAgent", "DesignerAgent", "DocumentAgent", "DevOpsAgent"]) {
-        expect(selectAgentTemplate({ capability: "files", agentTemplate })).toBe(agentTemplate);
+        expect(selectAgentTemplate({ roles: [agentTemplate], capabilities: ["files"] })).toBe(agentTemplate);
       }
     });
   });
@@ -178,6 +186,7 @@ describe("AGENT_REGISTRY", () => {
       expect(agent.systemPrompt).toContain("file_screenshot");
       expect(agent.systemPrompt).not.toContain("delete_path");
       expect(agent.systemPrompt).not.toContain("write_file_lines");
+      expect(agent.systemPrompt).not.toContain("file_multi");
     });
   });
 });

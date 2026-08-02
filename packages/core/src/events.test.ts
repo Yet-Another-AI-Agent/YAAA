@@ -12,6 +12,21 @@ describe("mapBusEvent", () => {
     });
   });
 
+  it("forwards sub-subtask completion with its parent identity", () => {
+    const payload = {
+      kind: "sub_subtask_completed",
+      taskId: TASK,
+      agentId: "pikachu-1",
+      subtaskId: "task-1",
+      subSubtask: { id: "task-1.2", title: "Create the artifact", state: "completed" },
+      allSubSubtasks: [],
+    };
+    expect(mapBusEvent(TASK, `task.${TASK}.sub_subtask_completed`, payload)).toEqual({
+      type: "sub-subtask-completed",
+      data: payload,
+    });
+  });
+
   it("maps a result agent_message to a result event", () => {
     const msg = {
       kind: "result",

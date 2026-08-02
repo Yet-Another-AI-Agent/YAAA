@@ -15,7 +15,7 @@ import type { IQueueStore } from "@yaaa/interfaces";
 import { SqliteStore, SqliteTaskReader, FilesFs, MeshGateway, CmdTool, WebSearchTool, ChromiumTool, ExecutionSessionManager } from "@yaaa/providers";
 import type { MeshModelCatalogEntry } from "@yaaa/providers";
 import { buildPlannerModelMenu, isEligible, renderPlannerModelMenu, resolveModelFromCatalog } from "./model-catalog.js";
-import { benchmarkRoleDefaults, selectBenchmarkModel } from "./benchmark-registry.js";
+import { benchmarkRoleDefaults, isBaseModel, selectBenchmarkModel } from "./benchmark-registry.js";
 import { ChatOpenAI } from "@langchain/openai";
 import { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { AIMessage, type BaseMessage } from "@langchain/core/messages";
@@ -130,8 +130,8 @@ async function recommendPlanModels(
   catalog: MeshModelCatalogEntry[],
 ): Promise<void> {
   for (const subtask of plan.subtasks) {
-    const role = subtask.agentTemplate === "PlannerAgent" ? "planner" : subtask.agentTemplate === "QaTesterAgent" ? "verifier" : "worker";
-    const selected = selectBenchmarkModel(catalog, preference, role, subtask.capability as Parameters<typeof selectBenchmarkModel>[3]);
+    const role = subtask.roles.some((item) => item.includes("Tester")) ? "verifier" : "worker";
+    const selected = selectBenchmarkModel(catalog, preference, role, subtask.capabilities[0] as Parameters<typeof selectBenchmarkModel>[3]);
     subtask.model = selected.model;
     subtask.modelReason = selected.reason;
   }
@@ -401,7 +401,11 @@ export function createRuntime(config: RuntimeConfig): Runtime {
     // Fall back to the configured role defaults before the catalog's cheapest
     // entry: the cheapest of hundreds of tool-capable models is a free or tiny
     // one, which is not a sane model to run an unattended agent on.
-    const resolution = resolveModelFromCatalog(await loadCatalog(), requested, [
+    const liveCatalog = await loadCatalog();
+    const resolutionCatalog = preference === "cost-effective"
+      ? liveCatalog.filter((model) => isBaseModel(model.id))
+      : liveCatalog;
+    const resolution = resolveModelFromCatalog(resolutionCatalog, requested && (preference !== "cost-effective" || isBaseModel(requested)) ? requested : undefined, [
       ...new Set(Object.values({ ...WORKER_MODEL_DEFAULTS, ...(config.modelMapping ?? {}) })),
     ]);
     console.log("[YAAA] Mesh model resolution", {
@@ -475,6 +479,8 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   // Bridge internal bus topics to the typed, frontend-facing event stream.
   const patterns = [
     `task.${taskId}.plan_updated`,
+    `task.${taskId}.sub_subtask_completed`,
+    `task.${taskId}.sub_subtask_added`,
     `task.${taskId}.agent_message`,
     `task.${taskId}.started`,
     `task.${taskId}.agent.*.lifecycle`,
@@ -496,6 +502,14 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   ];
   for (const pattern of patterns) {
     bus.subscribe(pattern, (topic, msg) => {
+      // Agent questions/replies are part of the durable mission conversation.
+      // Previously they were emitted to the live UI only, so reopening the
+      // task made sub-agent communication disappear from the main view.
+      if (topic === `task.${taskId}.agent_message` && msg && ["help_request", "info_request", "info_reply"].includes(msg.kind)) {
+        void store.saveMessage(taskId, msg).catch((error) => {
+          console.warn(`[YAAA:Runtime:${taskId}] failed to persist agent message`, error);
+        });
+      }
       const event = mapBusEvent(taskId, topic, msg);
       if (event?.type === "agent-status") {
         const subtask = activePlan?.subtasks.find(
@@ -521,29 +535,47 @@ export function createRuntime(config: RuntimeConfig): Runtime {
           ? "Reviewing your follow-up and the previous mission evidence before revising the strategy."
           : "Preparing the implementation strategy and checking the task dependencies.",
       });
+      const planningPhases = context?.priorSummary
+        ? [
+            "Planning phase 1/5: reviewing the existing mission evidence and the new request.",
+            "Planning phase 2/5: identifying the remaining deliverables and acceptance criteria.",
+            "Planning phase 3/5: rebuilding the dependency graph around completed work.",
+            "Planning phase 4/5: selecting roles, skills, and reachable models for the remaining work.",
+            "Planning phase 5/5: defining verification, action queues, and correction limits.",
+          ]
+        : [
+            "Planning phase 1/5: extracting concrete deliverables and acceptance criteria.",
+            "Planning phase 2/5: decomposing the request into independently executable subtasks.",
+            "Planning phase 3/5: mapping dependencies and deciding which work can run in parallel.",
+            "Planning phase 4/5: assigning agent roles, skills, and reachable models.",
+            "Planning phase 5/5: defining verification, action queues, and correction limits.",
+          ];
+      emit({ type: "thought", from: "orchestrator", content: planningPhases[0] });
+      let planningPhaseIndex = 1;
       const progressHeartbeat = setInterval(() => {
         emit({
           type: "thought",
           from: "orchestrator",
-          content: context?.priorSummary
-            ? "The planner is still incorporating your follow-up into the revised strategy."
-            : "The planner is still evaluating the best execution path and model assignments.",
+          content: `${planningPhases[planningPhaseIndex % planningPhases.length]} The planner is still working; the plan is not ready for review yet.`,
         });
-      }, 12_000);
+        planningPhaseIndex += 1;
+      }, 6_000);
       const supervisor = new Supervisor(scope);
       try {
         const plan = await supervisor.createPlan(goal, taskId, context);
         emit({
           type: "thought",
           from: "orchestrator",
-          content: `${plan.planningEstimate?.message || "The planner is finalizing the execution strategy."} Expected planning time: ${Math.ceil((plan.planningEstimate?.expectedDurationMs ?? 30_000) / 1000)}s. Considering: ${(plan.planningEstimate?.considerations ?? []).join(", ")}.`,
+          content: "Planning response received. YAAA is validating the plan sections and measurable outcomes.",
         });
         emit({
           type: "thought",
           from: "orchestrator",
-          content: "Strategy draft received. Validating subtasks, dependencies, and model assignments.",
+          content: `Plan sections found: ${plan.subtasks.length} subtask${plan.subtasks.length === 1 ? "" : "s"}, ${plan.executionGraph?.length ?? 0} dependency stage${(plan.executionGraph?.length ?? 0) === 1 ? "" : "s"}, and ${plan.verification?.stages?.length ?? 0} verification check${(plan.verification?.stages?.length ?? 0) === 1 ? "" : "s"}.`,
         });
+        emit({ type: "thought", from: "orchestrator", content: "Checking that every subtask has one capability, a suitable role, and a reachable model." });
         await recommendPlanModels(plan, preference, await loadCatalog());
+        emit({ type: "thought", from: "orchestrator", content: "Model assignments and execution policy validated. Preparing the plan review." });
         assertActive();
         emit({
           type: "thought",
@@ -558,9 +590,19 @@ export function createRuntime(config: RuntimeConfig): Runtime {
     async runPlan(plan: TaskPlan): Promise<TaskRunResult> {
       assertActive();
       activePlan = plan;
+      emit({
+        type: "thought",
+        from: "orchestrator",
+        content: "Approval received. Loading the saved plan and preparing the first execution stage.",
+      });
       const supervisor = new Supervisor(scope);
       const result = await supervisor.runPlan(plan, taskId);
       assertActive();
+      emit({
+        type: "thought",
+        from: "orchestrator",
+        content: "Implementation stages finished. Running final verification and assembling the deliverable summary.",
+      });
       emit({ type: "complete", result });
       return result;
     },

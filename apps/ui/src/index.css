@@ -51,6 +51,7 @@ body {
   min-height: 100vh;
 }
 
+
 /* ═══════════════════════════════════════════════
    CURSOR GLOW SPOTLIGHT
    Tracks --gx / --gy set by CursorGlow.tsx via rAF
@@ -393,6 +394,30 @@ body {
   display: flex;
   gap: 1rem;
   justify-content: flex-end;
+}
+
+.artifact-inline-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.75rem;
+  padding: 0.55rem 0.9rem;
+  border: 1px solid var(--border-color-glow);
+  border-radius: 8px;
+  background: rgba(92, 105, 255, 0.12);
+  color: var(--color-primary);
+  font: inherit;
+  font-weight: 650;
+  line-height: 1.2;
+  cursor: pointer;
+  transition: var(--transition-smooth);
+}
+
+.artifact-inline-link:hover {
+  background: rgba(92, 105, 255, 0.22);
+  border-color: var(--color-primary);
+  color: var(--text-primary);
+  box-shadow: 0 0 12px rgba(92, 105, 255, 0.24);
 }
 
 .btn-approve {
@@ -1364,6 +1389,58 @@ body {
   background: hsl(220, 15%, 20%);
   color: var(--text-secondary);
   border: 1px solid var(--border-color);
+}
+
+.subtask-progress-container {
+  margin-top: 0.5rem;
+  width: 100%;
+}
+
+.subtask-progress-track {
+  height: 6px;
+  width: 100%;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.subtask-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #6366f1, #a855f7);
+  border-radius: 4px;
+  transition: width 0.3s ease;
+}
+
+.subtask-item.completed .subtask-progress-fill {
+  background: #22c55e;
+}
+
+.sub-subtask-list {
+  margin-top: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding-left: 0.35rem;
+  border-left: 2px solid rgba(255, 255, 255, 0.08);
+}
+
+.sub-subtask-item {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.sub-subtask-item.completed {
+  color: #4ade80;
+  text-decoration: line-through;
+  opacity: 0.85;
+}
+
+.sub-subtask-item.running {
+  color: #a78bfa;
+  font-weight: 500;
 }
 
 .risk-tag {
@@ -3371,6 +3448,7 @@ body {
 
 .mission-team-status.planned { background: var(--color-warning); }
 .mission-team-status.working { background: var(--color-success); box-shadow: 0 0 8px var(--color-success-glow); }
+.mission-team-status.online { background: var(--color-success); box-shadow: 0 0 8px var(--color-success-glow); }
 .mission-team-status.blocked { background: var(--color-warning); }
 .mission-team-status.completed,
 .mission-team-status.exited { background: var(--text-muted); }

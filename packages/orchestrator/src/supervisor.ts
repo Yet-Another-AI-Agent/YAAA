@@ -45,7 +45,7 @@ export class Supervisor {
 
     console.log("\n[Orchestrator] Task Strategy Generated:");
     for (const subtask of plan.subtasks) {
-      console.log(` - [${subtask.id}] ${subtask.title} (Capability: ${subtask.capability}, Depends: [${subtask.dependsOn.join(", ")}])`);
+      console.log(` - [${subtask.id}] ${subtask.title} (Roles: ${subtask.roles.join(" + ")}; Capabilities: ${subtask.capabilities.join(", ")}; Depends: [${subtask.dependsOn.join(", ")}])`);
     }
     console.log("");
 

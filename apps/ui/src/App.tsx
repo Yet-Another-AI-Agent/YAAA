@@ -10,6 +10,7 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const viewModel = useTaskViewModel();
 
+
   return (
     <>
       <CursorGlow />

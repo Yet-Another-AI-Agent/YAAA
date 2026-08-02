@@ -16,6 +16,14 @@ function agentIdFromTopic(topic: string): string {
   return agentIndex >= 0 && parts[agentIndex + 1] ? parts[agentIndex + 1] : "agent";
 }
 
+// These are internal phase markers, not useful user-facing progress. The
+// execution state, agent cards, tool activity, and final result remain visible;
+// suppressing these repetitive bridge messages keeps the conversation focused.
+function isInternalExecutionNote(note: unknown): boolean {
+  const text = String(note ?? "").trim();
+  return /^(?:Request received\. Checking whether clarification is needed|Approval received\. Loading the saved plan|Execution dispatcher ready\.|(?:🧭 )?Dependency stage ready:|Starting subtask:|🧩 Assigning )/i.test(text);
+}
+
 export function useTaskViewModel() {
   const [goal, setGoal] = useState("");
   // The mission text actually submitted for the active channel. Kept separate
@@ -56,6 +64,7 @@ export function useTaskViewModel() {
   const queuedMessagesRef = useRef<UIQueuedMessage[]>([]);
   const pickedUpMessageIdsRef = useRef<Set<string>>(new Set());
   const pickedUpMessageContentsRef = useRef<Set<string>>(new Set());
+  const receivedEventIdsRef = useRef<Set<string>>(new Set());
 
   // Queue state belongs to the ViewModel. Runtime events carry identity and
   // content, so the view never has to infer state from a formatted log line.
@@ -106,14 +115,28 @@ export function useTaskViewModel() {
       unsubscribeRef.current();
     }
     const handleEvent = (eventData: { topic: string; data: any }) => {
+        const eventId = (eventData as any)?.eventId;
+        if (typeof eventId === "string") {
+          if (receivedEventIdsRef.current.has(eventId)) return;
+          receivedEventIdsRef.current.add(eventId);
+          // Keep this bounded for long-lived Electron windows while retaining
+          // enough IDs to cover the replay buffer.
+          if (receivedEventIdsRef.current.size > 250) {
+            const oldest = receivedEventIdsRef.current.values().next().value;
+            if (oldest) receivedEventIdsRef.current.delete(oldest);
+          }
+        }
         const { topic, data } = eventData;
 
         if (topic.includes("chat-message") || data?.type === "chat-message") {
           const message = data?.message ?? data;
           if (message?.kind === "help_request" || message?.kind === "info_request") {
+            const sourceAgent = agentsRef.current.find((agent) => agent.id === message.from);
+            const sourceHandle = sourceAgent?.handle?.replace(/^@/, "")
+              ?? String(message.from ?? message.agentId ?? "agent").replace(/^@/, "");
             addLog(
               "agent",
-              `[${message.from ?? message.agentId ?? "agent"}] @yaaa ${message.problem ?? message.question}`,
+              `@${sourceHandle} @yaaa ${message.problem ?? message.question}`,
               "response",
               { agentId: message.from ?? message.agentId },
             );
@@ -141,7 +164,7 @@ export function useTaskViewModel() {
           }
         }
 
-        else if (topic.includes("plan_updated")) {
+        else if (topic.includes("plan_updated") || topic.includes("sub_subtask_completed") || topic.includes("sub_subtask_added")) {
           clearTransientLogs();
           if (data && data.subtasks) {
             setSubtasks(data.subtasks);
@@ -176,6 +199,27 @@ export function useTaskViewModel() {
                 );
               }
             }
+          } else if (data?.subSubtask) {
+            // A sub-agent completion can arrive before the next full plan
+            // snapshot. Apply the authoritative child update locally so the
+            // UI does not wait for (or lose) the parent plan_updated event.
+            const parentId = data.subtaskId
+              || String(data.subSubtask.id).split(".").slice(0, -1).join(".");
+            const incoming = Array.isArray(data.allSubSubtasks)
+              ? data.allSubSubtasks
+              : [data.subSubtask];
+            setSubtasks((previous) => previous.map((subtask: any) => {
+              if (subtask.id !== parentId) return subtask;
+              const existing = Array.isArray(subtask.subSubtasks) ? subtask.subSubtasks : [];
+              const merged = existing.map((step: any) => {
+                const update = incoming.find((candidate: any) => candidate.id === step.id);
+                return update ? { ...step, ...update } : step;
+              });
+              for (const update of incoming) {
+                if (!merged.some((step: any) => step.id === update.id)) merged.push(update);
+              }
+              return { ...subtask, subSubtasks: merged };
+            }));
           }
         }
 
@@ -199,9 +243,8 @@ export function useTaskViewModel() {
 
         else if (topic.endsWith(".llm_context")) {
           const agentName = agentIdFromTopic(topic);
-          const request = Array.isArray(data.messages)
-            ? data.messages.map((message: any) => `${message.type}: ${message.content}`).join("\n\n")
-            : "";
+          const request = data.displaySummary
+            || `Context: ${data.messageCount ?? "?"} messages${typeof data.contextChars === "number" ? ` / ${data.contextChars.toLocaleString()} chars` : ""}`;
           addLog("agent", `🧠 ${agentName} → LLM (turn ${data.turn}, ${data.model})\n${request}`, "thinking", { agentId: agentName, persistent: true, llmEvent: "request" });
         }
 
@@ -213,7 +256,11 @@ export function useTaskViewModel() {
         else if (topic.endsWith(".tool_requested")) {
           clearTransientLogs();
           const agentName = agentIdFromTopic(topic);
-          addLog("agent", `🛠️ ${agentName}: ${data.content}`, "activity", { ...(data.metadata ?? {}), agentId: agentName });
+          const queue = data.metadata?.actionQueue;
+          const queueNote = queue && typeof queue.count === "number"
+            ? ` · queued ${queue.count}: ${Array.isArray(queue.actions) ? queue.actions.join(" → ") : "actions"}`
+            : "";
+          addLog("agent", `🛠️ ${agentName}: ${data.content}${queueNote}`, "activity", { ...(data.metadata ?? {}), agentId: agentName });
         }
 
         else if (/\.action_(requested|started|approved|denied|completed|failed)$/.test(topic)) {
@@ -265,6 +312,7 @@ export function useTaskViewModel() {
 
         else if (topic.includes("started") || topic.includes("completed") || topic.includes("failed")) {
           if (data && data.note) {
+            if (isInternalExecutionNote(data.note)) return;
             const queuedPickup = String(data.note).match(/^📬 Processing queued user message:\s*(.*)$/s);
             if (queuedPickup) {
               const content = queuedPickup[1].trim();
@@ -411,7 +459,10 @@ export function useTaskViewModel() {
         try {
           attachTaskEventStream(targetTaskId);
           await TaskModel.recordPlanReview(targetTaskId, "Accepted the implementation plan.", "user");
-          await TaskModel.confirmTask(targetTaskId);
+          const confirmation = await TaskModel.confirmTask(targetTaskId);
+          if (confirmation?.status === "error") {
+            throw new Error((confirmation as any).error || "The saved plan could not be started.");
+          }
           loadTasks();
         } catch (err: any) {
           addLog("system", `Unable to start approved mission: ${err.message}`);

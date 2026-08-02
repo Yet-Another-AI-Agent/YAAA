@@ -1,12 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ModelPreference } from "@yaaa/shared";
+import type { ModelPreference, CapabilityValue } from "@yaaa/shared";
 import type { MeshModelCatalogEntry } from "@yaaa/providers";
 import { catalogPrice, isEligible } from "./model-catalog.js";
 
 export type BenchmarkRole = "orchestrator" | "planner" | "worker" | "verifier" | "utility";
-export type BenchmarkCapability = "docs" | "browser" | "shell" | "files" | "integration" | "verify";
+export type BenchmarkCapability = CapabilityValue;
 export type BenchmarkProfile = {
   modelId: string;
   benchmarks: { arena?: number; reasoning?: number; coding?: number; toolUse?: number };
@@ -20,6 +20,13 @@ export type BenchmarkProfile = {
   fallbackOrder: number;
 };
 type Registry = { schemaVersion: number; source: string; scoreMethod?: string; snapshotDate: string; models: BenchmarkProfile[] };
+
+/** Base is intentionally restricted to small Nano/Lite families. It must
+ * never broaden to Claude, Pro, or other mid/SOTA models when a budget model
+ * is unavailable. */
+export function isBaseModel(modelId: string): boolean {
+  return /(?:nano|flash-lite|lite)/i.test(modelId);
+}
 
 const registryPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "benchmarks.json");
 let cached: Registry | undefined;
@@ -85,14 +92,16 @@ export function selectBestAvailableOpenAI(catalog: MeshModelCatalogEntry[]): str
 }
 
 export function benchmarkRoleDefaults(preference: ModelPreference): Record<BenchmarkRole, string> {
+  if (preference === "cost-effective") {
+    const base = "google/gemini-3.1-flash-lite-preview";
+    return { orchestrator: base, planner: base, worker: base, verifier: base, utility: base };
+  }
   const registry = loadBenchmarkRegistry();
   const choose = (role: BenchmarkRole, capability: BenchmarkCapability): string => {
     const profiles = registry.models.filter((model) => model.roles.includes(role) && model.toolSupport);
     const policy = preference === "sota"
       ? profiles.filter((model) => model.tier === "sota")
-      : preference === "cost-effective"
-        ? profiles.filter((model) => model.tier === "cost-effective").concat(profiles.filter((model) => model.tier === "mid"))
-        : profiles.filter((model) => model.tier === "mid");
+      : profiles.filter((model) => model.tier === "mid");
     return [...(policy.length ? policy : profiles)].sort((a, b) => score(b, capability) - score(a, capability) || a.fallbackOrder - b.fallbackOrder)[0]?.modelId ?? "google/gemini-2.5-pro-preview";
   };
   return {
@@ -112,6 +121,24 @@ export function selectBenchmarkModel(
 ): { model: string; reason: string; fallbacks: string[] } {
   const profiles = loadBenchmarkRegistry().models.filter((profile) => profile.roles.includes(role) && profile.toolSupport);
   const available = new Map(catalog.filter(isEligible).map((model) => [model.id, model]));
+  if (preference === "cost-effective") {
+    const baseCandidates = [...available.values()].filter((model) => isBaseModel(model.id));
+    const selectedBase = baseCandidates.sort((a, b) => (catalogPrice(a) ?? Infinity) - (catalogPrice(b) ?? Infinity) || a.id.localeCompare(b.id))[0];
+    const fallbackIds = baseCandidates.map((model) => model.id);
+    if (selectedBase) {
+      return {
+        model: selectedBase.id,
+        fallbacks: fallbackIds.filter((id) => id !== selectedBase.id),
+        reason: `Base policy restricted selection to available Nano/Lite models; selected ${selectedBase.id}.`,
+      };
+    }
+    const baseDefault = benchmarkRoleDefaults(preference)[role];
+    return {
+      model: baseDefault,
+      fallbacks: [],
+      reason: `Base policy found no available Nano/Lite model; retained the strict Base default ${baseDefault} rather than selecting Claude or another larger model.`,
+    };
+  }
   const eligible = profiles.filter((profile) => available.has(profile.modelId));
   if (preference === "sota") {
     const bestOpenAI = selectBestAvailableOpenAI(catalog);
@@ -123,15 +150,12 @@ export function selectBenchmarkModel(
       };
     }
   }
-  const policy = preference === "sota" ? "sota" : preference === "cost-effective" ? "cost-effective" : "mid";
+  const policy = preference === "sota" ? "sota" : "mid";
   const preferred = eligible.filter((profile) => profile.tier === policy);
   const pool = preferred.length
     ? preferred
-    : preference === "cost-effective"
-      ? eligible.filter((profile) => profile.tier === "mid").concat(eligible.filter((profile) => profile.tier === "sota"))
-      : eligible;
+    : eligible;
   const ranked = [...pool].sort((a, b) => {
-    if (preference === "cost-effective") return (catalogPrice(available.get(a.modelId)!) ?? Infinity) - (catalogPrice(available.get(b.modelId)!) ?? Infinity) || score(b, capability) - score(a, capability) || a.fallbackOrder - b.fallbackOrder;
     return score(b, capability) - score(a, capability) || a.fallbackOrder - b.fallbackOrder;
   });
   const fallbackPool = [...eligible].sort((a, b) => a.fallbackOrder - b.fallbackOrder).map((profile) => profile.modelId);

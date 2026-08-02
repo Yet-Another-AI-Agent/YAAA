@@ -69,6 +69,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke("save-onboarding-profile", profile),
   parseResume: (text) => ipcRenderer.invoke("parse-resume", text),
   openWorkingFolder: (taskId) => ipcRenderer.invoke("open-working-folder", taskId),
+  openAgentWorkspace: (taskId, agentId) =>
+    ipcRenderer.invoke("open-agent-workspace", { taskId, agentId }),
   rePlanWithFeedback: (taskId, feedback) =>
     ipcRenderer.invoke("replan-with-feedback", { taskId, feedback }),
 });

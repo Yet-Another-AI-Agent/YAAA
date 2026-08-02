@@ -1,6 +1,6 @@
 import type { IMeshGateway, IBus, ChatMessage } from "@yaaa/interfaces";
 import { container, type Container } from "@yaaa/platform";
-import { TaskPlanSchema, type TaskPlan, type PlanExecutionStage, type ModelPreference, type VerificationPlan, type PlanningAnalysis, type PlanningRoleAssessment } from "@yaaa/shared";
+import { Capability, TaskPlanSchema, type TaskPlan, type PlanExecutionStage, type ModelPreference, type VerificationPlan, type PlanningAnalysis, getMatchingSkills, getSkill } from "@yaaa/shared";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,7 +29,7 @@ function readArchitectureDoc(): string {
 
 const archDoc = readArchitectureDoc();
 const ARCH_INSTRUCTION = archDoc
-  ? `\n\nHere is the system architecture of the application we are running within:\n\n${archDoc}`
+  ? `\n\nHere is the bounded system architecture reference. Use the graph/files tools later for exact code details:\n\n${archDoc.slice(0, 6_000)}${archDoc.length > 6_000 ? "\n[…architecture reference truncated; exact implementation details are not planning context]" : ""}`
   : "";
 
 /** Optional context threaded into planning so the planner is not memoryless. */
@@ -60,7 +60,7 @@ export const PREFERENCE_MODEL_DEFAULTS: Record<ModelPreference, string> = {
   // Mesh exposes Gemini 3 Flash with the preview suffix. The unsuffixed id
   // returns 404 from Mesh and must never be emitted as a planner fallback.
   balanced: "google/gemini-3.1-pro-preview",
-  "cost-effective": "google/gemini-2.5-pro-preview",
+  "cost-effective": "google/gemini-3.1-flash-lite-preview",
 };
 
 const PLANNER_CAPABILITIES = new Set([
@@ -72,31 +72,56 @@ const PLANNER_CAPABILITIES = new Set([
   "verify",
 ]);
 
-/**
- * A subtask has one execution capability because that value selects its
- * permission scope. Older/planner-model responses sometimes emit a comma-
- * separated list instead. Preserve the plan while choosing the capability
- * that best matches the routed agent template.
- */
-function normalizePlannerCapability(value: unknown, agentTemplate?: string): unknown {
-  const candidates = (Array.isArray(value) ? value : String(value ?? "").split(","))
-    .map((candidate) => String(candidate).trim().toLowerCase())
-    .filter(Boolean);
-  if (candidates.length <= 1) return value;
+// Planner output is model-authored, so tolerate common aliases but normalize
+// them before the execution contract reaches the permission filter. The
+// runtime exposes execute_command; leaving shell_exec or execute_shell_command
+// in a populated allowlist silently removes the real shell tool.
+const TOOL_ALIASES: Record<string, string> = {
+  shell_exec: "execute_command",
+  execute_shell_command: "execute_command",
+  shell_execute: "execute_command",
+  readFile: "read_file",
+  writeFile: "write_file",
+  readFileLines: "read_file_lines",
+  writeFileLines: "write_file_lines",
+  fileMulti: "file_multi",
+  files_read: "read_file",
+  files_write: "write_file",
+  files_read_lines: "read_file_lines",
+  files_write_lines: "write_file_lines",
+  files_multi: "file_multi",
+  shell_execute_command: "execute_command",
+  shell_open_terminal: "open_terminal",
+  shell_read_terminal: "read_terminal",
+  browser_multi_action: "browser_multi",
+  browser_search: "web_search",
+};
 
-  const preferredByTemplate: Record<string, string> = {
-    FilesAgent: "files",
-    ResearcherAgent: "browser",
-    QaTesterAgent: "verify",
-    CvTesterAgent: "verify",
-    DocumentAgent: "docs",
-    DesignerAgent: "docs",
-    DevOpsAgent: "shell",
-  };
-  const preferred = agentTemplate ? preferredByTemplate[agentTemplate] : undefined;
-  return preferred && candidates.includes(preferred)
-    ? preferred
-    : candidates.find((candidate) => PLANNER_CAPABILITIES.has(candidate)) ?? value;
+const RUNTIME_TOOL_NAMES = new Set([
+  "read_skill", "code_review_graph_preflight", "read_file", "read_file_lines", "write_file", "write_file_lines",
+  "download_file", "list_files", "search_files", "delete_path", "delete_file_lines", "create_directory", "move_path",
+  "copy_path", "path_metadata", "file_screenshot", "generate_image", "file_multi", "complete_sub_subtask", "add_sub_subtask",
+  "ask_orchestrator", "request_extension", "execute_command", "open_terminal", "write_terminal", "read_terminal",
+  "observe_terminal", "detach_terminal", "attach_terminal", "list_terminals", "navigate_terminal", "resize_terminal",
+  "terminate_terminal", "terminal_screenshot", "web_search", "fetch_web_page", "web_results_screenshot", "open_browser",
+  "browser_navigate", "browser_navigate_and_wait", "browser_click", "browser_type", "browser_fill_form", "browser_select",
+  "browser_press", "browser_hover", "browser_reload", "browser_refresh", "browser_back", "browser_go_back",
+  "browser_go_back_times", "browser_forward", "browser_go_front", "browser_go_front_times", "browser_wait", "browser_content",
+  "observe_browser", "attach_browser", "detach_browser", "browser_evaluate_script", "browser_screenshot", "browser_multi",
+  "close_browser", "canvas_commenter", "qa_coverage_checker", "cv_tester",
+]);
+
+function normalizeAllowedTools(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return Array.from(new Set(value
+    .map((tool) => String(tool).trim())
+    .filter(Boolean)
+    .map((tool) => {
+      const withoutNamespace = tool.replace(/^(?:files|shell|browser|web)\./, "");
+      const normalized = TOOL_ALIASES[tool] ?? TOOL_ALIASES[withoutNamespace] ?? withoutNamespace;
+      return RUNTIME_TOOL_NAMES.has(normalized) ? normalized : "";
+    })
+    .filter(Boolean)));
 }
 
 /** Agent templates whose work is engineering-heavy enough to warrant the top tier. */
@@ -112,18 +137,18 @@ const COMPLEX_AGENT_TEMPLATES = new Set([
  * fallback that collapsed nearly every subtask onto one mid-tier model.
  */
 export function defaultModelForSubtask(subtask: {
-  capability: string;
+  capabilities: string[];
   riskLevel?: string;
-  agentTemplate?: string;
+  roles: string[];
 }, preference: ModelPreference = "balanced"): string {
   if (preference === "sota" || preference === "cost-effective") return PREFERENCE_MODEL_DEFAULTS[preference];
   // High-stakes or engineering-heavy work gets the strongest tier.
   if (subtask.riskLevel === "high") return MODEL_TIERS.complex;
-  if (subtask.agentTemplate && COMPLEX_AGENT_TEMPLATES.has(subtask.agentTemplate)) {
+  if (subtask.roles.some((role) => COMPLEX_AGENT_TEMPLATES.has(role))) {
     return MODEL_TIERS.complex;
   }
   // Simple, well-bounded file ops and verification go to the cheapest tier.
-  if (subtask.capability === "verify" || subtask.capability === "files") {
+  if (subtask.capabilities.some((capability) => capability === "verify" || capability === "files")) {
     return MODEL_TIERS.simple;
   }
   // Everything else (docs, browser, integration, shell content work) is mid-tier.
@@ -132,23 +157,23 @@ export function defaultModelForSubtask(subtask: {
 
 /** Explain the cost/capability tradeoff behind the model shown at agent creation. */
 export function defaultModelReasonForSubtask(subtask: {
-  capability: string;
+  capabilities: string[];
   riskLevel?: string;
-  agentTemplate?: string;
+  roles: string[];
 }, model: string, preference: ModelPreference = "balanced"): string {
   if (preference === "sota") {
-    return `The SOTA setting selects the strongest reachable model for ${subtask.capability} work to maximize performance and reasoning quality.`;
+    return `The SOTA setting selects the strongest reachable model for ${subtask.roles.join(" + ")} work to maximize performance and reasoning quality.`;
   }
   if (preference === "cost-effective") {
-    return `The Cost Effective setting selects the lowest-cost adequate model for ${subtask.capability} work; the assignment remains bounded by the step's success criteria.`;
+    return `The Cost Effective setting selects the lowest-cost adequate model for ${subtask.roles.join(" + ")} work; the assignment remains bounded by the step's success criteria.`;
   }
   if (model === MODEL_TIERS.simple) {
-    return `Gemini 2.5 Pro is the base model for bounded ${subtask.capability} work and verification.`;
+    return `Gemini 2.5 Pro is the base model for bounded ${subtask.roles.join(" + ")} work and verification.`;
   }
   if (model === MODEL_TIERS.complex) {
     return "Claude Opus 4.8 is reserved for high-risk or engineering-heavy work that benefits from the strongest reachable reasoning.";
   }
-  return `Gemini 3.1 Pro is the medium-tier choice for ${subtask.capability} work.`;
+  return `Gemini 3.1 Pro is the medium-tier choice for ${subtask.roles.join(" + ")} work.`;
 }
 
 const NUMBER_WORDS: Record<string, number> = {
@@ -267,11 +292,14 @@ export class Planner {
 Your job is to create a detailed implementation methodology and a dependency-aware execution graph.
 Before the plan fields, estimate the planning work itself in planningEstimate: write a concise user-facing message explaining what YAAA is considering while generating the plan, list the main considerations, and give an expectedDurationMs estimate. This is an estimate only; deterministic runtime timeouts remain authoritative.
 Planning is a decision process that must be made explicit in the returned JSON. First write the detailed implementation goal: what must be built, changed, corrected, or verified, including the observable outcome. Then decompose it by answering: how many logically independent, executable steps exist; what does each step produce; and which previous steps must it depend on? Do not split work merely to create agents.
-For every step, evaluate every allowed agent role in the roster below. Mark whether each role is relevant and explain why briefly. Select exactly one role only when it logically fits the step, state the expectation for that role, and keep irrelevant roles marked false. Then choose the best reachable model for the selected role under the current model policy and explain why that model is the right quality/cost fit.
+For every step, select the complete set of cooperating agent roles, capabilities, and specialized skills required by that step. Use one subtask with multiple roles when the work shares one workspace and execution history; do not split merely because multiple roles are needed. Give one concise routing reason describing the role composition. Then choose the best reachable model for the composite assignment and explain that choice briefly.
 The plan must explain the concrete approach, the number of substeps, which stages are sequential versus parallel, and the agent role/model required for every substep.
 Verification is a first-class part of the plan. Add a verification plan with explicit artifact, automated, visual, and/or research checks as appropriate. For each check, state the exact capability/tool required, whether that capability is available to the assigned agent, what the check can prove, and its limitation. If a visual screenshot check is possible, require it; if it is not possible, require the verifier to research or describe the strongest effective fallback and report the unproven claim as a bug/limitation to YAAA.
-Each subtask represents a step in a task graph and must declare exactly one primary 'capability', dependencies, riskLevel, and success criteria. The capability is singular because it selects the agent's permission scope. If a step involves files plus shell/browser work, choose the dominant primary capability and describe the additional work in the title and success criteria; never output a comma-separated capability list or array.
-You must also choose the best agentTemplate from the allowed roster and explain that choice in routingReason. Explain the model choice in modelReason using one concise sentence focused on capability and cost.
+The first planning response must also include an executionContract. It is an LLM-generated policy for this task, not a hardcoded workflow: list required artifacts, the target workspace, expected next actions, the dependency graph, exact paths needing one-time preflight, measurable completion signals, no-progress correction/stop thresholds, when a sequential action queue is appropriate, its maximum action count/depth and stop-on-error behavior, the correct verification surface (files, Electron, browser, shell, or none), and a contextPolicy describing the maximum useful context, dependency evidence, history turns, file excerpt size, whether full skill docs are needed, whether on-demand reads are allowed, and the exact tool names needed for this assignment. Use the runtime's canonical tool names (for example execute_command, not shell_exec; file_multi is file-only). Do not place shell, browser, or web actions inside a file batch. The runtime will validate and enforce these bounds, but must not invent task-specific steps.
+Each subtask represents a step in a task graph and must declare non-empty 'roles' and 'capabilities' arrays, dependencies, riskLevel, a concise 'summary' of the work/deliverable, and success criteria. The capabilities array determines the union of permission-scoped tools available to the one composite worker. If multiple roles share one workspace and history, keep them in one subtask; use separate subtasks only when work genuinely requires independent agents or artifact handoffs. Connect independent subtasks with dependsOn only when one consumes another's artifact.
+Every subtask title and success criterion must be a well-defined outcome: use an action verb, identify the artifact or behavior, and include a measurable acceptance condition when one exists. Do not generate procedural fragments such as "Execute build commands and validate process output for..." or subjectless criteria such as "uses bullet points". A worker's sub-subtasks follow the same rule and must be independently completable goals, not model turns or tool calls.
+For every subtask, include a 'skills' array containing the ids of the specialized skills that exact role must consult before using tools (for example 'code-generation-skill', 'ppt-skill', 'pdf-skill', 'web-access-skill', 'word-skill', 'canvas-skill', '3d-graphics-skill', or 'chart-skill'). Include all relevant skills for that subtask, but do not attach skills needed only by another role; do not invent ids. Code tasks should use 'code-generation-skill'; add a graphics/document/web skill only when that specialized output is actually required.
+You must choose one or more roles from the allowed roster and explain the composition in routingReason. Explain the model choice in modelReason using one concise sentence focused on the combined role and capability requirements.
 You MUST assign every subtask an explicit 'model', chosen from the models this account can actually reach right now:
 ${modelRubric}
 Make this semantic decision from the complete subtask, not by matching isolated keywords. Do not default every subtask to the same model: match each one to the difficulty of its own work so the plan stays cost-aware. Use a model id exactly as written above.
@@ -286,10 +314,10 @@ Execution contract:
 - Preserve the requested role split in subtask titles and use dependencies to express handoffs between those agents.
 ${requestedAgentCount ? `- This user explicitly requested exactly ${requestedAgentCount} agents, so this plan MUST contain exactly ${requestedAgentCount} subtasks.` : ""}
 
-Available capabilities (choose exactly one string per subtask):
+Available capabilities (choose one or more strings per subtask):
 - "files", "browser", "shell", "integration", "docs", and "verify".
 
-Allowed agentTemplate values:
+Allowed role values:
 - FilesAgent: general file and document work
 - VerifierAgent: read-only independent artifact/evidence verification
 - DocumentAgent: reports, Markdown documents, PowerPoint/PPTX, slide outlines, speaker notes, spreadsheets, and non-code content artifacts
@@ -328,12 +356,23 @@ You MUST return a JSON object that strictly adheres to this structure:
       "subtaskId": "subtask-1",
       "independentExecution": true,
       "dependencyReason": "No dependency because...",
-      "consideredRoles": [{"agentTemplate":"ResearcherAgent","relevant":true,"rationale":"..."},{"agentTemplate":"DocumentAgent","relevant":false,"rationale":"..."}],
       "selectedRole": "ResearcherAgent",
       "roleExpectation": "What this role must deliver",
       "selectedModel": "${MODEL_TIERS.medium}",
       "modelReason": "Why this model fits this role and step under the current settings"
     }]
+  },
+  "executionContract": {
+    "contextPolicy": {"maxInputTokens": 6000, "maxDependencyChars": 3000, "maxHistoryTurns": 4, "maxFileExcerptLines": 120, "includeFullSkillDocs": false, "allowOnDemandReads": true, "allowedTools": ["code_review_graph_preflight", "read_skill", "read_file", "read_file_lines", "write_file", "write_file_lines", "file_multi", "complete_sub_subtask", "add_sub_subtask"]},
+    "requiredArtifacts": ["index.html", "style.css", "game.js"],
+    "targetWorkspace": "task working directory",
+    "expectedNextActions": ["Read the graph scope", "Create only missing artifacts", "Run verification"],
+    "dependencyGraph": [{"subtaskId":"subtask-1","dependsOn":[]}],
+    "preflight": {"runOncePerAssignment": true, "targetPaths": ["index.html"]},
+    "completionSignals": ["The required artifact exists and the stated acceptance criteria have evidence."],
+    "noProgress": {"correctionAfter": 1, "stopAfter": 2},
+    "actionQueue": {"useWhen": ["Related file operations are sequentially dependent or share one workspace."], "maxActions": 16, "maxDepth": 2, "stopOnError": true},
+    "verificationSurface": "files"
   },
   "methodology": "Detailed implementation methodology covering discovery, decisions, execution, verification, and how evidence changes the next step.",
   "executionGraph": [
@@ -350,22 +389,24 @@ You MUST return a JSON object that strictly adheres to this structure:
     {
       "id": "subtask-1",
       "title": "Create a detailed study on...",
-      "capability": "files",
+      "summary": "Gather and synthesize the required facts into a referenced report.",
+      "roles": ["FilesAgent"],
+      "capabilities": ["files"],
       "dependsOn": [],
       "riskLevel": "low",
       "successCriteria": "A text file battery_facts.txt exists with information.",
-      "agentTemplate": "ResearcherAgent",
       "routingReason": "The subtask requires gathering and validating factual information.",
+      "skills": [],
       "model": "${MODEL_TIERS.simple}"
     },
     {
       "id": "subtask-2",
       "title": "Verify study contents and formatting",
-      "capability": "verify",
+      "roles": ["QaTesterAgent"],
+      "capabilities": ["verify"],
       "dependsOn": ["subtask-1"],
       "riskLevel": "low",
       "successCriteria": "Verification status reports success.",
-      "agentTemplate": "QaTesterAgent",
       "routingReason": "Independent functional verification is required.",
       "modelReason": "Gemini Flash is the cost-efficient fit for bounded verification.",
       "model": "${MODEL_TIERS.simple}"
@@ -381,7 +422,7 @@ DO NOT output any conversational text before or after the JSON. Only return a va
     ];
 
     const finalize = (raw: string): TaskPlan => {
-      const plan = this.parseAndValidate(raw, requestedAgentCount, context?.modelPreference ?? "balanced");
+      const plan = this.parseAndValidate(raw, requestedAgentCount, context?.modelPreference ?? "balanced", taskId);
       if (context?.correctionGoal?.trim() && plan.planningAnalysis) {
         plan.planningAnalysis.implementationGoal = [
           `Corrective implementation goal: ${context.correctionGoal.trim()}`,
@@ -421,18 +462,42 @@ DO NOT output any conversational text before or after the JSON. Only return a va
     }
   }
 
-  private parseAndValidate(output: string, requestedAgentCount: number | null, modelPreference: ModelPreference = "balanced"): TaskPlan {
+  private parseAndValidate(output: string, requestedAgentCount: number | null, modelPreference: ModelPreference = "balanced", taskId?: string): TaskPlan {
     const jsonMatch = output.match(/```json\s*([\s\S]*?)\s*```/) || output.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
       throw new Error("No JSON code block found in model output.");
     }
     const rawJson = JSON.parse(jsonMatch[1] || jsonMatch[0]);
-    if (rawJson && Array.isArray(rawJson.subtasks)) {
-      for (const subtask of rawJson.subtasks) {
-        subtask.capability = normalizePlannerCapability(subtask.capability, subtask.agentTemplate);
-      }
-    }
     const plan = TaskPlanSchema.parse(rawJson);
+    plan.executionContract ??= {
+      contextPolicy: { maxInputTokens: 6000, maxDependencyChars: 3000, maxHistoryTurns: 4, maxFileExcerptLines: 120, includeFullSkillDocs: false, allowOnDemandReads: true, allowedTools: [] },
+      requiredArtifacts: [],
+      targetWorkspace: "task working directory",
+      expectedNextActions: [],
+      dependencyGraph: plan.subtasks.map((subtask) => ({ subtaskId: subtask.id, dependsOn: subtask.dependsOn ?? [] })),
+      preflight: { runOncePerAssignment: true, targetPaths: [] },
+      completionSignals: ["All required artifacts exist and the declared success criteria have evidence."],
+      noProgress: { correctionAfter: 1, stopAfter: 2 },
+      actionQueue: { useWhen: ["Related sequential operations share one workspace."], maxActions: 16, maxDepth: 2, stopOnError: true },
+      verificationSurface: plan.verification?.stages?.some((stage) => stage.kind === "visual") ? "electron" : "files",
+    };
+    // Models may return a partial execution contract. Keep the durable plan
+    // valid and make the context policy explicit before workers are spawned.
+    // An empty tool list means "planner did not constrain tools"; it is kept
+    // distinct from a populated allowlist so the runtime never guesses a
+    // task-specific tool set.
+    plan.executionContract.contextPolicy ??= {
+      maxInputTokens: 6000,
+      maxDependencyChars: 3000,
+      maxHistoryTurns: 4,
+      maxFileExcerptLines: 120,
+      includeFullSkillDocs: false,
+      allowOnDemandReads: true,
+      allowedTools: [],
+    };
+    plan.executionContract.contextPolicy.allowedTools = normalizeAllowedTools(
+      plan.executionContract.contextPolicy.allowedTools,
+    );
     if (!plan.planningEstimate) {
       plan.planningEstimate = {
         message: "YAAA is comparing task dependencies, verification needs, and the best model assignments before showing the plan.",
@@ -441,8 +506,9 @@ DO NOT output any conversational text before or after the JSON. Only return a va
       };
     }
     for (const subtask of plan.subtasks) {
-      if (!subtask.agentTemplate || !subtask.routingReason) {
-        throw new Error(`Subtask ${subtask.id} is missing the required AI routing decision (agentTemplate and routingReason).`);
+      subtask.summary = subtask.summary?.trim() || `${subtask.title}. Deliverable: ${subtask.successCriteria}`.slice(0, 320);
+      if (subtask.roles.length === 0 || subtask.capabilities.length === 0 || !subtask.routingReason) {
+        throw new Error(`Subtask ${subtask.id} is missing the required composite routing decision (roles, capabilities, and routingReason).`);
       }
       if (!subtask.model) {
         // Tier the default by the subtask's shape instead of defaulting almost
@@ -453,9 +519,33 @@ DO NOT output any conversational text before or after the JSON. Only return a va
       if (!subtask.modelReason) {
         subtask.modelReason = defaultModelReasonForSubtask(subtask, subtask.model, modelPreference);
       }
+      // Role names are routing metadata, not evidence that a specialized
+      // document skill is needed. For example, DocumentAgent contains "doc".
+      const skillQuery = `${subtask.title} ${subtask.successCriteria}`;
+      const inferredSkills = getMatchingSkills(skillQuery).map((skill) => skill.id);
+      const explicitSkills = (subtask.skills ?? []).filter((skillId) => Boolean(getSkill(skillId)));
+      const relevantSkills = inferredSkills.length > 0
+        ? explicitSkills.filter((skillId) => inferredSkills.includes(skillId))
+        : explicitSkills;
+      subtask.skills = Array.from(new Set([...relevantSkills, ...inferredSkills]));
+      if (taskId) {
+        void this.bus.publish(`task.${taskId}.agent.planner.thought`, {
+          kind: "thought",
+          from: "planner",
+          content: `Skill routing — ${subtask.id}: ${subtask.skills.length > 0 ? subtask.skills.join(", ") : "none required"}. Matching uses explicit technology/output terms; generic “graphics”, “line”, and “graph” do not attach 3D or chart skills.`,
+          metadata: {
+            event: "skill_routing",
+            subtaskId: subtask.id,
+            selectedSkills: subtask.skills,
+          },
+        });
+      }
     }
     if (!plan.methodology?.trim()) plan.methodology = buildFallbackMethodology(plan);
-    if (!plan.executionGraph?.length) plan.executionGraph = deriveExecutionGraph(plan);
+    // The graph is deterministic from dependsOn. Never trust a stale or
+    // contradictory graph emitted by the model; regenerate it so the UI and
+    // executor agree on what is serial versus parallel.
+    plan.executionGraph = deriveExecutionGraph(plan);
     plan.planningAnalysis = normalizePlanningAnalysis(plan, plan.planningAnalysis, modelPreference);
     plan.verification = normalizeVerificationPlan(plan, plan.verification);
     if (
@@ -470,35 +560,21 @@ DO NOT output any conversational text before or after the JSON. Only return a va
   }
 }
 
-const ALL_AGENT_TEMPLATES = [
-  "FilesAgent", "VerifierAgent", "PrincipalSweAgent", "UiArchitectAgent",
-  "GraphicsEngineerAgent", "ResearcherAgent", "AdStrategistAgent", "DesignerAgent",
-  "DocumentAgent", "DevOpsAgent", "QaTesterAgent", "CvTesterAgent",
-];
-
 function buildFallbackPlanningAnalysis(plan: TaskPlan, modelPreference: ModelPreference): PlanningAnalysis {
   return {
     implementationGoal: plan.goal,
     decompositionRationale: "YAAA derived the smallest dependency-aware graph from the available subtasks. Steps with no dependencies may run independently; dependent steps wait for their listed predecessors.",
     modelPolicy: `Current settings policy: ${modelPreference}. Each selected model is the best reachable quality/cost fit for its step and role under this policy.`,
     stepReviews: plan.subtasks.map((subtask) => {
-      const selectedRole = subtask.agentTemplate ?? "FilesAgent";
-      const consideredRoles: PlanningRoleAssessment[] = ALL_AGENT_TEMPLATES.map((agentTemplate) => ({
-        agentTemplate,
-        relevant: agentTemplate === selectedRole,
-        rationale: agentTemplate === selectedRole
-          ? (subtask.routingReason ?? "This role matches the step's primary capability and expected deliverable.")
-          : "Not selected because this role is not the best fit for the step's primary capability and deliverable.",
-      }));
+      const selectedRole = subtask.roles.join(" + ");
       return {
         subtaskId: subtask.id,
         independentExecution: subtask.dependsOn.length === 0,
         dependencyReason: subtask.dependsOn.length === 0
           ? "This step has no predecessor evidence requirement and can start independently."
           : `This step depends on ${subtask.dependsOn.join(", ")} because it consumes their evidence or artifacts.`,
-        consideredRoles,
         selectedRole,
-        roleExpectation: subtask.successCriteria,
+        roleExpectation: subtask.summary || subtask.successCriteria,
         selectedModel: subtask.model ?? defaultModelForSubtask(subtask, modelPreference),
         modelReason: subtask.modelReason ?? defaultModelReasonForSubtask(subtask, subtask.model ?? defaultModelForSubtask(subtask, modelPreference), modelPreference),
       };
@@ -521,13 +597,9 @@ function normalizePlanningAnalysis(
       const fallbackReview = fallback.stepReviews.find((review) => review.subtaskId === subtask.id)!;
       const review = provided.stepReviews.find((candidate) => candidate.subtaskId === subtask.id);
       if (!review) return fallbackReview;
-      const providedRoles = new Map(review.consideredRoles.map((role) => [role.agentTemplate, role]));
       return {
         ...fallbackReview,
         ...review,
-        consideredRoles: ALL_AGENT_TEMPLATES.map((agentTemplate) =>
-          providedRoles.get(agentTemplate) ?? fallbackReview.consideredRoles.find((role) => role.agentTemplate === agentTemplate)!,
-        ),
       };
     }),
   };
@@ -574,18 +646,18 @@ function buildFallbackMethodology(plan: TaskPlan): string {
 }
 
 function buildFallbackVerificationPlan(plan: TaskPlan): VerificationPlan {
-  const verifyIds = plan.subtasks.filter((subtask) => subtask.capability === "verify" || /TesterAgent$/.test(subtask.agentTemplate ?? "")).map((subtask) => subtask.id);
-  const visualPossible = plan.subtasks.some((subtask) => subtask.agentTemplate === "CvTesterAgent" || subtask.agentTemplate === "QaTesterAgent" || subtask.capability === "browser");
-  const automatedPossible = plan.subtasks.some((subtask) => subtask.agentTemplate === "QaTesterAgent" || subtask.capability === "shell");
+  const verifyIds = plan.subtasks.filter((subtask) => subtask.capabilities.includes("verify") || subtask.roles.some((role) => /TesterAgent$/.test(role))).map((subtask) => subtask.id);
+  const visualPossible = plan.subtasks.some((subtask) => subtask.roles.some((role) => ["CvTesterAgent", "QaTesterAgent"].includes(role)) || subtask.capabilities.includes("browser"));
+  const automatedPossible = plan.subtasks.some((subtask) => subtask.roles.includes("QaTesterAgent") || subtask.capabilities.includes("shell"));
   const targetIds = verifyIds.length ? verifyIds : plan.subtasks.map((subtask) => subtask.id);
   return {
     required: true,
     strategy: "YAAA must inspect the concrete deliverable, run the strongest safe automated checks available, and use screenshot/browser verification for visual work when the assigned tools support it.",
     stages: [
-      { id: "artifact-inspection", kind: "artifact", targetSubtaskIds: targetIds, capability: "files", method: "Reopen produced files, confirm referenced assets exist, and compare the deliverable against success criteria.", available: true, limitation: "File inspection proves contents and existence, not rendered visual appearance.", fallback: "Record the unproven visual risk as a finding for YAAA." },
-      { id: "automated-checks", kind: "automated", targetSubtaskIds: targetIds, capability: "shell", method: "Run non-destructive tests, type checks, builds, or smoke commands relevant to the deliverable.", available: automatedPossible, limitation: "Automated checks do not prove visual layout or user-perceived behavior.", fallback: "Research or inspect the strongest available static evidence and report the missing proof." },
-      { id: "visual-check", kind: "visual", targetSubtaskIds: targetIds, capability: "browser", method: "Open the result in the browser and capture a screenshot or screencast when the task has a rendered UI or visual artifact.", available: visualPossible, limitation: "Browser automation cannot reliably prove timers, animation timing, performance windows, or unavailable external state.", fallback: "Use one complete browser evaluation sequence if possible; otherwise report the limitation and research an effective verification method." },
-      ...(!visualPossible ? [{ id: "visual-research-fallback", kind: "research" as const, targetSubtaskIds: targetIds, capability: "verify" as const, method: "Research and explain the strongest effective verification method for the unrendered or inaccessible visual claim.", available: true, limitation: "Research explains a verification method but cannot prove the local rendered result.", fallback: "Report the unproven visual claim as an open bug/limitation to YAAA." }] : []),
+      { id: "artifact-inspection", kind: "artifact", targetSubtaskIds: targetIds, capability: Capability.Files, method: "Reopen produced files, confirm referenced assets exist, and compare the deliverable against success criteria.", available: true, limitation: "File inspection proves contents and existence, not rendered visual appearance.", fallback: "Record the unproven visual risk as a finding for YAAA." },
+      { id: "automated-checks", kind: "automated", targetSubtaskIds: targetIds, capability: Capability.Shell, method: "Run non-destructive tests, type checks, builds, or smoke commands relevant to the deliverable.", available: automatedPossible, limitation: "Automated checks do not prove visual layout or user-perceived behavior.", fallback: "Research or inspect the strongest available static evidence and report the missing proof." },
+      { id: "visual-check", kind: "visual", targetSubtaskIds: targetIds, capability: Capability.Browser, method: "Open the result in the browser and capture a screenshot or screencast when the task has a rendered UI or visual artifact.", available: visualPossible, limitation: "Browser automation cannot reliably prove timers, animation timing, performance windows, or unavailable external state.", fallback: "Use one complete browser evaluation sequence if possible; otherwise report the limitation and research an effective verification method." },
+      ...(!visualPossible ? [{ id: "visual-research-fallback", kind: "research" as const, targetSubtaskIds: targetIds, capability: Capability.Verify, method: "Research and explain the strongest effective verification method for the unrendered or inaccessible visual claim.", available: true, limitation: "Research explains a verification method but cannot prove the local rendered result.", fallback: "Report the unproven visual claim as an open bug/limitation to YAAA." }] : []),
     ],
     toolLimitations: [
       "A file screenshot is not equivalent to a browser-rendered screenshot.",

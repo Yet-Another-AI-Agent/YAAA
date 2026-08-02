@@ -27,7 +27,7 @@ describe("Planner", () => {
   // however many hundreds the account could actually reach.
   describe("model rubric", () => {
     const planStub = `\`\`\`json
-{"goal":"g","subtasks":[{"id":"task-1","title":"t","capability":"files","dependsOn":[],"riskLevel":"low","successCriteria":"s","agentTemplate":"FilesAgent","routingReason":"r","model":"anthropic/claude-haiku-4.5"}]}
+{"goal":"g","subtasks":[{"id":"task-1","title":"t","roles":["FilesAgent"],"capabilities":["files"],"dependsOn":[],"riskLevel":"low","successCriteria":"s","routingReason":"r","model":"anthropic/claude-haiku-4.5"}]}
 \`\`\``;
     const systemPromptOf = () => (mockGateway.chat as any).mock.calls[0][0][0].content as string;
 
@@ -70,11 +70,11 @@ describe("Planner", () => {
     {
       "id": "task-1",
       "title": "Gather facts",
-      "capability": "files",
+      "roles": ["ResearcherAgent"],
+      "capabilities": ["files", "browser"],
       "dependsOn": [],
       "riskLevel": "low",
       "successCriteria": "facts.txt exists",
-      "agentTemplate": "ResearcherAgent",
       "routingReason": "The work requires gathering and synthesizing facts.",
       "model": "google/gemini-2.5-flash"
     }
@@ -89,7 +89,11 @@ describe("Planner", () => {
     expect(plan.subtasks.length).toBe(1);
     expect(plan.subtasks[0].id).toBe("task-1");
     expect(plan.planningAnalysis?.implementationGoal).toContain("Write report");
-    expect(plan.planningAnalysis?.stepReviews[0].consideredRoles.length).toBeGreaterThan(1);
+    expect(plan.planningAnalysis?.stepReviews[0].selectedRole).toBe("ResearcherAgent");
+    expect(plan.subtasks[0].summary).toContain("Gather facts");
+    expect(plan.executionContract?.targetWorkspace).toBe("task working directory");
+    expect(plan.executionContract?.dependencyGraph).toEqual([{ subtaskId: "task-1", dependsOn: [] }]);
+    expect(plan.executionContract?.actionQueue.maxActions).toBeGreaterThan(0);
     expect(plan.verification?.required).toBe(true);
     expect(plan.verification?.stages.map((stage) => stage.kind)).toContain("artifact");
     expect(plan.verification?.toolLimitations.join(" ")).toContain("rendered");
@@ -97,7 +101,7 @@ describe("Planner", () => {
 
   it("applies the selected model policy when a model is omitted", async () => {
     (mockGateway.chat as any).mockResolvedValue({
-      content: '```json\n{"goal":"g","subtasks":[{"id":"task-1","title":"t","capability":"files","dependsOn":[],"riskLevel":"low","successCriteria":"s","agentTemplate":"FilesAgent","routingReason":"bounded file work"}]}\n```',
+      content: '```json\n{"goal":"g","subtasks":[{"id":"task-1","title":"t","roles":["FilesAgent"],"capabilities":["files"],"dependsOn":[],"riskLevel":"low","successCriteria":"s","routingReason":"bounded file work"}]}\n```',
     });
 
     const sota = await planner.plan("g", undefined, { modelPreference: "sota" });
@@ -113,25 +117,37 @@ describe("Planner", () => {
     (mockGateway.chat as any).mockResolvedValue({
       content: `\`\`\`json
 {"goal":"g","subtasks":[
-  {"id":"files","title":"Create files and run supporting commands","capability":"files, shell, browser","dependsOn":[],"riskLevel":"low","successCriteria":"the files exist","agentTemplate":"FilesAgent","routingReason":"bounded file work","model":"google/gemini-2.5-flash"},
-  {"id":"verify","title":"Verify files and inspect the browser output","capability":"verify, files, browser","dependsOn":["files"],"riskLevel":"low","successCriteria":"verification passes","agentTemplate":"QaTesterAgent","routingReason":"independent verification","model":"google/gemini-2.5-flash"}
+  {"id":"files","title":"Create files and run supporting commands","roles":["FilesAgent"],"capabilities":["files","shell","browser"],"dependsOn":[],"riskLevel":"low","successCriteria":"the files exist","routingReason":"bounded composite file work","model":"google/gemini-2.5-flash"},
+  {"id":"verify","title":"Verify files and inspect the browser output","roles":["QaTesterAgent"],"capabilities":["verify","files","browser"],"dependsOn":["files"],"riskLevel":"low","successCriteria":"verification passes","routingReason":"independent composite verification","model":"google/gemini-2.5-flash"}
 ]}
 \`\`\``,
     });
 
     const plan = await planner.plan("Create and verify files");
 
-    expect(plan.subtasks.map((subtask) => subtask.capability)).toEqual(["files", "verify"]);
+    expect(plan.subtasks.map((subtask) => subtask.capabilities)).toEqual([["files", "shell", "browser"], ["verify", "files", "browser"]]);
   });
 
-  it("tells the planner that capability is singular and permission-scoped", async () => {
+  it("normalizes model-authored shell tool aliases to runtime tool names", async () => {
+    (mockGateway.chat as any).mockResolvedValue({
+      content: `\`\`\`json
+{"goal":"Create a deck","subtasks":[{"id":"task-1","title":"Create and run the deck generator","roles":["DocumentAgent"],"capabilities":["files","shell"],"dependsOn":[],"riskLevel":"low","successCriteria":"deck.pptx exists","routingReason":"presentation artifact work","model":"google/gemini-2.5-flash"}],"executionContract":{"contextPolicy":{"maxInputTokens":4000,"maxDependencyChars":1000,"maxHistoryTurns":2,"maxFileExcerptLines":80,"includeFullSkillDocs":false,"allowOnDemandReads":true,"allowedTools":["read_file","write_file","shell_exec"]},"requiredArtifacts":["deck.pptx"],"targetWorkspace":"task working directory","expectedNextActions":["execute the generator"],"dependencyGraph":[{"subtaskId":"task-1","dependsOn":[]}],"preflight":{"runOncePerAssignment":true,"targetPaths":[]},"completionSignals":["deck exists"],"noProgress":{"correctionAfter":1,"stopAfter":2},"actionQueue":{"useWhen":["related work"],"maxActions":4,"maxDepth":1,"stopOnError":true},"verificationSurface":"files"}}
+\`\`\``,
+    });
+
+    const plan = await planner.plan("Create a deck");
+    expect(plan.executionContract?.contextPolicy?.allowedTools).toEqual(["read_file", "write_file", "execute_command"]);
+  });
+
+  it("tells the planner to compose roles and permission-scoped capabilities", async () => {
     (mockGateway.chat as any).mockResolvedValue({ content: '```json\n{ "goal": "g", "subtasks": [] }\n```' });
 
     await planner.plan("Do a thing");
 
     const systemPrompt = (mockGateway.chat as any).mock.calls[0][0][0].content as string;
-    expect(systemPrompt).toContain("exactly one primary 'capability'");
-    expect(systemPrompt).toContain("never output a comma-separated capability list or array");
+      expect(systemPrompt).toContain("complete set of cooperating agent roles");
+      expect(systemPrompt).toContain("non-empty 'roles' and 'capabilities' arrays");
+      expect(systemPrompt).toContain("union of permission-scoped tools");
     expect(systemPrompt).toContain("Verification is a first-class part of the plan");
     expect(systemPrompt).toContain("report the unproven claim as a bug/limitation to YAAA");
     expect(systemPrompt).toContain("VerifierAgent");
@@ -239,11 +255,11 @@ describe("Planner", () => {
         subtasks: Array.from({ length: count }, (_, index) => ({
           id: `subtask-${index + 1}`,
           title: index === 0 ? "Python developer" : "Python tester",
-          capability: index === 0 ? "files" : "verify",
+          roles: [index === 0 ? "PrincipalSweAgent" : "QaTesterAgent"],
+          capabilities: [index === 0 ? "files" : "verify"],
           dependsOn: index === 0 ? [] : ["subtask-1"],
           riskLevel: "low",
           successCriteria: "Role assignment completed",
-          agentTemplate: index === 0 ? "PrincipalSweAgent" : "QaTesterAgent",
           routingReason: index === 0 ? "Implementation role selected by planner." : "Independent verification role selected by planner.",
           model: index === 0 ? "anthropic/claude-sonnet-4.5" : "anthropic/claude-haiku-4.5",
         })),
@@ -268,18 +284,18 @@ describe("Planner", () => {
 
 describe("defaultModelForSubtask", () => {
   it("routes simple file/verify work to the cheapest tier", () => {
-    expect(defaultModelForSubtask({ capability: "files", riskLevel: "low" })).toBe(MODEL_TIERS.simple);
-    expect(defaultModelForSubtask({ capability: "verify", riskLevel: "low" })).toBe(MODEL_TIERS.simple);
+    expect(defaultModelForSubtask({ roles: ["FilesAgent"], capabilities: ["files"], riskLevel: "low" })).toBe(MODEL_TIERS.simple);
+    expect(defaultModelForSubtask({ roles: ["QaTesterAgent"], capabilities: ["verify"], riskLevel: "low" })).toBe(MODEL_TIERS.simple);
   });
 
   it("routes docs/browser work to the mid tier", () => {
-    expect(defaultModelForSubtask({ capability: "docs", riskLevel: "low" })).toBe(MODEL_TIERS.medium);
-    expect(defaultModelForSubtask({ capability: "browser", riskLevel: "medium" })).toBe(MODEL_TIERS.medium);
+    expect(defaultModelForSubtask({ roles: ["DocumentAgent"], capabilities: ["docs"], riskLevel: "low" })).toBe(MODEL_TIERS.medium);
+    expect(defaultModelForSubtask({ roles: ["ResearcherAgent"], capabilities: ["browser"], riskLevel: "medium" })).toBe(MODEL_TIERS.medium);
   });
 
   it("routes engineering templates and high-risk work to the strongest tier", () => {
-    expect(defaultModelForSubtask({ capability: "files", agentTemplate: "PrincipalSweAgent" })).toBe(MODEL_TIERS.complex);
-    expect(defaultModelForSubtask({ capability: "docs", riskLevel: "high" })).toBe(MODEL_TIERS.complex);
-    expect(defaultModelForSubtask({ capability: "files", agentTemplate: "GraphicsEngineerAgent" })).toBe(MODEL_TIERS.complex);
+    expect(defaultModelForSubtask({ roles: ["PrincipalSweAgent"], capabilities: ["files"] })).toBe(MODEL_TIERS.complex);
+    expect(defaultModelForSubtask({ roles: ["DocumentAgent"], capabilities: ["docs"], riskLevel: "high" })).toBe(MODEL_TIERS.complex);
+    expect(defaultModelForSubtask({ roles: ["GraphicsEngineerAgent"], capabilities: ["files"] })).toBe(MODEL_TIERS.complex);
   });
 });

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { Capability } from "./types.js";
 
 export const ArtifactRefSchema = z.object({
   path: z.string(),
@@ -45,19 +46,18 @@ export const ConversationMessageSchema = z.object({
 export const SubtaskSchema = z.object({
   id: z.string(),
   title: z.string(),
-  capability: z.enum(["docs", "browser", "shell", "files", "integration", "verify"]),
+  summary: z.string().min(1).optional(),
+  roles: z.array(z.string().min(1)).min(1),
+  capabilities: z.array(z.nativeEnum(Capability)).min(1),
   dependsOn: z.array(z.string()),
   riskLevel: z.enum(["low", "medium", "high"]),
   successCriteria: z.string(),
-  agentTemplate: z.enum([
-    "FilesAgent", "VerifierAgent", "PrincipalSweAgent", "UiArchitectAgent",
-    "GraphicsEngineerAgent", "ResearcherAgent", "AdStrategistAgent",
-    "DesignerAgent", "DocumentAgent", "DevOpsAgent", "QaTesterAgent", "CvTesterAgent",
-  ]).optional(),
   routingReason: z.string().min(1).optional(),
   model: z.string().optional(),
   modelReason: z.string().min(1).optional(),
+  skills: z.array(z.string().min(1)).default([]),
   artifacts: z.array(ArtifactRefSchema).optional(),
+  relevantArtifactPaths: z.array(z.string()).optional(),
   state: z.enum(["pending", "running", "completed", "failed"]).default("pending"),
   assignedTo: z.string().optional(),
   result: z.string().optional(),
@@ -66,9 +66,43 @@ export const SubtaskSchema = z.object({
 export const TaskPlanSchema = z.object({
   goal: z.string(),
   subtasks: z.array(SubtaskSchema),
+  executionContract: z.object({
+    contextPolicy: z.object({
+      maxInputTokens: z.number().int().positive(),
+      maxDependencyChars: z.number().int().positive(),
+      maxHistoryTurns: z.number().int().positive(),
+      maxFileExcerptLines: z.number().int().positive(),
+      includeFullSkillDocs: z.boolean(),
+      allowOnDemandReads: z.boolean(),
+      allowedTools: z.array(z.string()).default([]),
+    }).optional(),
+    requiredArtifacts: z.array(z.string()).default([]),
+    targetWorkspace: z.string().default(""),
+    expectedNextActions: z.array(z.string()).default([]),
+    dependencyGraph: z.array(z.object({
+      subtaskId: z.string(),
+      dependsOn: z.array(z.string()).default([]),
+    })).default([]),
+    preflight: z.object({
+      runOncePerAssignment: z.boolean(),
+      targetPaths: z.array(z.string()).default([]),
+    }),
+    completionSignals: z.array(z.string()).min(1),
+    noProgress: z.object({
+      correctionAfter: z.number().int().positive(),
+      stopAfter: z.number().int().positive(),
+    }),
+    actionQueue: z.object({
+      useWhen: z.array(z.string()).default([]),
+      maxActions: z.number().int().positive(),
+      maxDepth: z.number().int().nonnegative(),
+      stopOnError: z.boolean(),
+    }),
+    verificationSurface: z.enum(["files", "electron", "browser", "shell", "none"]),
+  }).optional(),
   planningEstimate: z.object({
     message: z.string().min(1),
-    considerations: z.array(z.string()),
+    considerations: z.array(z.string()).optional().default([]),
     expectedDurationMs: z.number().int().positive(),
   }).optional(),
   planningAnalysis: z.object({
@@ -79,11 +113,6 @@ export const TaskPlanSchema = z.object({
       subtaskId: z.string(),
       independentExecution: z.boolean(),
       dependencyReason: z.string(),
-      consideredRoles: z.array(z.object({
-        agentTemplate: z.string(),
-        relevant: z.boolean(),
-        rationale: z.string(),
-      })),
       selectedRole: z.string(),
       roleExpectation: z.string(),
       selectedModel: z.string(),
@@ -112,9 +141,28 @@ export const TaskPlanSchema = z.object({
     strategy: z.string(),
     stages: z.array(z.object({
       id: z.string(),
-      kind: z.enum(["artifact", "automated", "visual", "research"]),
+      kind: z.preprocess((val) => {
+        if (typeof val === "string") {
+          const lower = val.toLowerCase().trim();
+          if (lower === "browser" || lower === "visual" || lower === "gui" || lower === "ui") return "visual";
+          if (lower === "files" || lower === "file" || lower === "code" || lower === "artifact") return "artifact";
+          if (lower === "test" || lower === "shell" || lower === "automated" || lower === "cmd") return "automated";
+          if (lower === "docs" || lower === "research" || lower === "doc") return "research";
+          return lower;
+        }
+        return val;
+      }, z.enum(["artifact", "automated", "visual", "research"])),
       targetSubtaskIds: z.array(z.string()),
-      capability: z.enum(["files", "shell", "browser", "verify", "docs"]),
+      capability: z.preprocess((val) => {
+        if (typeof val === "string") {
+          const lower = val.toLowerCase().trim();
+          if (lower === "file") return "files";
+          if (lower === "web") return "browser";
+          if (lower === "terminal" || lower === "bash" || lower === "cmd") return "shell";
+          return lower;
+        }
+        return val;
+      }, z.nativeEnum(Capability)),
       method: z.string(),
       available: z.boolean(),
       limitation: z.string().optional(),

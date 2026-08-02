@@ -1,0 +1,1 @@
+.v2-right-pane{display:flex;width:min(100%,350px);height:100%;min-width:0;min-height:0;box-sizing:border-box;flex-direction:column;gap:12px;overflow:auto;border-left:1px solid var(--border-color,#303541);padding:12px 0 12px 12px}.v2-right-pane>*{flex:0 0 auto}

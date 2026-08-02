@@ -1,0 +1,14 @@
+import React, { forwardRef, useImperativeHandle } from "react";
+import { useSidePanelViewModel } from "./viewmodels/useSidePanelViewModel";
+import type { SidePanelEvent, SidePanelHandle, SidePanelProps, SidePanelTab } from "./interfaces/side-panel.interfaces";
+import "./side-panel.css";
+
+export const SidePanel = forwardRef<SidePanelHandle, SidePanelProps>(function SidePanel({ initialTabs = [], initialActiveTabId, className = "", onEvent }, ref) {
+  const model = useSidePanelViewModel(initialTabs, initialActiveTabId);
+  const event = (next: SidePanelEvent) => onEvent?.(next);
+  const closeTab = (id: string) => { const tab = model.tabs.find((item) => item.id === id); if (tab?.closable !== false) { model.deleteTab(id); event({ kind: "tab-close", tabId: id, tab }); } };
+  useImperativeHandle(ref, () => ({ initTabs: model.initTabs, addTab: (tab, activate = true) => { model.addTab(tab, activate); event({ kind: "tab-add", tabId: tab.id, tab }); }, updateTab: (id, patch) => { model.updateTab(id, patch); event({ kind: "tab-update", tabId: id }); }, deleteTab: (id) => { model.deleteTab(id); event({ kind: "tab-delete", tabId: id }); }, closeTab, activateTab: (id) => { model.activateTab(id); event({ kind: "tab-change", tabId: id }); }, addContent: (tabId, content) => { model.addContent(tabId, content); event({ kind: "content-add", tabId, contentId: content.id, content }); }, updateContent: (tabId, contentId, patch) => { model.updateContent(tabId, contentId, patch); event({ kind: "content-update", tabId, contentId }); }, editContent: (tabId, contentId, patch) => { model.updateContent(tabId, contentId, patch); event({ kind: "content-update", tabId, contentId }); }, deleteContent: (tabId, contentId) => { model.deleteContent(tabId, contentId); event({ kind: "content-delete", tabId, contentId }); } }), [model, onEvent]);
+  const activeTab = model.tabs.find((tab) => tab.id === model.activeTabId);
+  return <aside className={`v2-side-panel ${className}`} aria-label="Side panel"><div className="v2-side-panel-tabs" role="tablist" aria-label="Side panel tabs">{model.tabs.map((tab) => <div className="v2-side-panel-tab" role="tab" aria-selected={tab.id === model.activeTabId} key={tab.id}><button type="button" className="v2-side-panel-tab-select" onClick={() => { model.activateTab(tab.id); event({ kind: "tab-change", tabId: tab.id, tab }); }}>{tab.title}</button>{tab.closable !== false && <button type="button" className="v2-side-panel-tab-close" aria-label={`Close ${tab.title}`} onClick={() => closeTab(tab.id)}>×</button>}</div>)}</div><div className="v2-side-panel-content" role="tabpanel">{activeTab ? (activeTab.content ?? []).map((item) => <article className="v2-side-panel-content-item" key={item.id}>{item.title && <h3>{item.title}</h3>}<div>{item.content}</div></article>) : <div className="v2-side-panel-empty">Select a tab to view details.</div>}</div></aside>;
+});
+

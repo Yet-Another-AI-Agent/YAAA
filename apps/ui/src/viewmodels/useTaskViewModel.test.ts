@@ -349,6 +349,120 @@ describe("useTaskViewModel — mission continuity", () => {
     );
   });
 
+  it("bubbles a sub-subtask completion into the visible parent task state", async () => {
+    let onEvent: ((event: any) => void) | undefined;
+    vi.mocked(TaskModel.subscribeEvents).mockImplementation((eventHandler) => {
+      onEvent = eventHandler;
+      return () => {};
+    });
+    const { result } = renderHook(() => useTaskViewModel());
+
+    act(() => result.current.setGoal("Build a thing"));
+    await act(async () => { await result.current.startTask(); });
+    await act(async () => {
+      onEvent?.({
+        topic: "task.task-123.plan_updated",
+        data: {
+          goal: "Build a thing",
+          subtasks: [{
+            id: "task-1",
+            title: "Implement it",
+            state: "running",
+            subSubtasks: [
+              { id: "task-1.1", title: "Create the artifact", state: "running" },
+            ],
+          }],
+        },
+      });
+      onEvent?.({
+        topic: "task.task-123.sub_subtask_completed",
+        data: {
+          taskId: "task-123",
+          agentId: "pikachu-1",
+          subtaskId: "task-1",
+          subSubtask: { id: "task-1.1", title: "Create the artifact", state: "completed" },
+          allSubSubtasks: [{ id: "task-1.1", title: "Create the artifact", state: "completed" }],
+        },
+      });
+    });
+
+    expect(result.current.subtasks[0].subSubtasks).toEqual([
+      expect.objectContaining({ id: "task-1.1", state: "completed" }),
+    ]);
+  });
+
+  it("renders the sub-agent question and the addressed YAAA answer", async () => {
+    let onEvent: ((event: any) => void) | undefined;
+    vi.mocked(TaskModel.subscribeEvents).mockImplementation((eventHandler) => {
+      onEvent = eventHandler;
+      return () => {};
+    });
+    const { result } = renderHook(() => useTaskViewModel());
+
+    act(() => result.current.setGoal("Build a thing"));
+    await act(async () => { await result.current.startTask(); });
+    await act(async () => {
+      onEvent?.({
+        topic: "task.task-123.agent_status",
+        data: { id: "pikachu-1", handle: "@pikachu-1", status: "working" },
+      });
+      onEvent?.({
+        topic: "task.task-123.chat-message",
+        data: {
+          type: "chat-message",
+          message: {
+            kind: "help_request",
+            from: "pikachu-1",
+            to: "orchestrator",
+            problem: "Should I preserve the existing API?",
+          },
+        },
+      });
+      onEvent?.({
+        topic: "task.task-123.chat-message",
+        data: {
+          type: "chat-message",
+          message: {
+            kind: "info_reply",
+            from: "orchestrator",
+            to: "pikachu-1",
+            answer: "@pikachu-1 Preserve the existing API and verify compatibility first.",
+          },
+        },
+      });
+    });
+
+    expect(result.current.logs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ content: expect.stringContaining("@pikachu-1 @yaaa Should I preserve the existing API?") }),
+      expect.objectContaining({ content: expect.stringContaining("@pikachu-1 Preserve the existing API") }),
+    ]));
+  });
+
+  it("does not render a live event twice when replay overlaps subscription", async () => {
+    const initialStatus = {
+      eventId: "task-123:1",
+      topic: "task.task-123.started",
+      data: { note: "Request received. Checking whether clarification is needed." },
+    };
+    let onEvent: ((event: any) => void) | undefined;
+    vi.mocked(TaskModel.subscribeEvents).mockImplementation((eventHandler) => {
+      onEvent = eventHandler;
+      // Simulate the event arriving live before the replay query resolves.
+      onEvent(initialStatus);
+      return () => {};
+    });
+    vi.mocked(TaskModel.getRecentTaskEvents).mockResolvedValueOnce([initialStatus]);
+
+    const { result } = renderHook(() => useTaskViewModel());
+    act(() => result.current.setGoal("Build a thing"));
+    await act(async () => { await result.current.startTask(); });
+    await act(async () => {});
+
+    expect(result.current.logs.filter(
+      (log) => log.content === initialStatus.data.note,
+    )).toHaveLength(0);
+  });
+
   it("keeps an awaiting implementation plan visible during an informational follow-up", async () => {
     vi.mocked(TaskModel.classifyPlanReviewIntent).mockResolvedValue("feedback");
     let onEvent: ((event: any) => void) | undefined;
