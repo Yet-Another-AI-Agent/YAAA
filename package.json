@@ -13,14 +13,27 @@
     "test": "vitest run --coverage",
     "dev:ui": "npm run dev:electron --workspace=apps/ui",
     "rebuild:electron": "electron-rebuild -f -w better-sqlite3 --module-dir apps/ui",
-    "e2e": "playwright test"
+    "e2e": "playwright test",
+    "storybook:v2": "storybook dev -c v2/.storybook -p 6006",
+    "storybook:build:v2": "storybook build -c v2/.storybook -o v2/storybook-static",
+    "storybook:test:v2": "start-server-and-test storybook:v2 6006 \"test-storybook --config-dir v2/.storybook --url http://127.0.0.1:6006 --ci\""
   },
   "devDependencies": {
     "@biomejs/biome": "^1.8.3",
     "@playwright/test": "^1.61.1",
+    "@storybook/addon-essentials": "^8.6.14",
+    "@storybook/addon-interactions": "^8.6.14",
+    "@storybook/react-vite": "^8.6.14",
+    "@storybook/test": "^8.6.14",
+    "@storybook/test-runner": "^0.22.1",
     "@vitest/coverage-v8": "^1.6.0",
     "jsdom": "^26.1.0",
+    "start-server-and-test": "^2.1.5",
+    "storybook": "^8.6.14",
     "typescript": "^5.5.4",
     "vitest": "^1.6.0"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1"
   }
 }

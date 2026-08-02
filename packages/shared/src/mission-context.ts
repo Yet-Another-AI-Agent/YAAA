@@ -11,6 +11,9 @@
  * unit-tested in isolation and reused by any layer (orchestrator, agents).
  */
 
+import type { Skill } from "./skills/skill-registry.js";
+import type { ContextPolicy, ExecutionContract } from "./types.js";
+
 /** A condensed result handed forward from a completed subtask to its dependents. */
 export interface DependencyOutput {
   /** Subtask id, e.g. "subtask-1". */
@@ -24,12 +27,18 @@ export interface DependencyOutput {
 }
 
 export interface AgentBriefInput {
+  /** Context selector role; controls which durable facts are promoted. */
+  role?: "planner" | "orchestrator" | "worker" | "verifier";
   /** The user's overall mission goal (plan.goal). */
   missionGoal: string;
   /** The specific subtask this agent must complete. */
   subtaskTitle: string;
   /** The subtask's success criteria. */
   successCriteria: string;
+  /** Composite specialist roles assigned to this one worker. */
+  roles?: string[];
+  /** Union of permission-scoped capabilities available to this worker. */
+  capabilities?: string[];
   /** Results from subtasks this one depends on, in completion order. */
   dependencyOutputs?: DependencyOutput[];
   /**
@@ -42,12 +51,72 @@ export interface AgentBriefInput {
   maxDependencyChars?: number;
   /** Orchestrator-authored assignment document path for this agent. */
   handsOnPath?: string;
-  /** Agent-authored proof-of-work path expected at completion. */
-  proofOfWorkPath?: string;
   /** Agent-authored handoff path expected at completion. */
   handOffPath?: string;
   /** Live files found in the task workspace immediately before this brief. */
   workspaceArtifactPaths?: string[];
+  /** Sub-subtasks breakdown (micro-steps) managed by the sub-agent. */
+  subSubtasks?: Array<{ id: string; title: string; state: string; result?: string }>;
+  /** Special technical skills and library documentation provided to the agent. */
+  skills?: Skill[];
+  /** LLM-generated execution policy for this assignment. */
+  executionContract?: ExecutionContract;
+  /** Per-assignment context limits selected by the planner. */
+  contextPolicy?: ContextPolicy;
+  /** Optional hard character ceiling for this prompt packet. */
+  maxContextChars?: number;
+}
+
+/**
+ * The bounded, role-specific view sent to a model. Durable mission state is
+ * intentionally not represented here; it remains in the plan store, event
+ * log, workspace files, and handoff documents.
+ */
+export interface ContextPacket {
+  role: "planner" | "orchestrator" | "worker" | "verifier";
+  missionGoal: string;
+  assignment: string;
+  successCriteria: string;
+  activeStep?: string;
+  requiredFiles: string[];
+  relevantEvidence: string[];
+  dependencySummary: string[];
+  selectedSkillIds: string[];
+  constraints: string[];
+  omittedSections: string[];
+}
+
+/** Select durable facts for one model boundary without reading or copying the full transcript. */
+export function assembleContextPacket(input: AgentBriefInput): ContextPacket {
+  const subSubtasks = input.subSubtasks ?? [];
+  const activeStep = subSubtasks.find((step) => step.state === "running");
+  const rawDependencySummary = (input.dependencyOutputs ?? []).map((dependency) =>
+    `[${dependency.id}] ${dependency.title}: ${dependency.summary}`,
+  );
+  const dependencySummary = budgetLines(
+    rawDependencySummary,
+    input.contextPolicy?.maxDependencyChars ?? DEFAULT_MAX_DEPENDENCY_CHARS,
+  ).split("\n").filter(Boolean);
+  const requiredFiles = input.executionContract?.requiredArtifacts ?? [];
+  const selectedSkillIds = (input.skills ?? []).map((skill) => skill.id);
+  const omittedSections = ["full-transcript", "unrelated-sibling-results"];
+  if (input.contextPolicy?.includeFullSkillDocs === false) omittedSections.push("full-skill-documents");
+  return {
+    role: input.role ?? "worker",
+    missionGoal: input.missionGoal?.trim() || "(not specified)",
+    assignment: input.subtaskTitle?.trim() || "(not specified)",
+    successCriteria: input.successCriteria?.trim() || "(not specified)",
+    activeStep: activeStep ? `${activeStep.id}: ${activeStep.title}` : undefined,
+    requiredFiles,
+    relevantEvidence: dependencySummary.slice(-4),
+    dependencySummary,
+    selectedSkillIds,
+    constraints: [
+      ...(input.executionContract?.expectedNextActions ?? []),
+      ...(input.retryDirective?.trim() ? [input.retryDirective.trim()] : []),
+    ],
+    omittedSections,
+  };
 }
 
 /** ~1.5k tokens of dependency context by default. */
@@ -92,6 +161,7 @@ export function budgetLines(lines: string[], maxChars: number): string {
  * budgeted dependency results follow.
  */
 export function buildAgentBrief(input: AgentBriefInput): string {
+  const packet = assembleContextPacket(input);
   const {
     missionGoal,
     subtaskTitle,
@@ -100,41 +170,82 @@ export function buildAgentBrief(input: AgentBriefInput): string {
     retryDirective,
     maxDependencyChars = DEFAULT_MAX_DEPENDENCY_CHARS,
     handsOnPath,
-    proofOfWorkPath,
     handOffPath,
     workspaceArtifactPaths = [],
+    subSubtasks = [],
+    skills = [],
+    executionContract,
+    contextPolicy,
+    maxContextChars = contextPolicy ? contextPolicy.maxInputTokens * 4 : undefined,
   } = input;
 
   const sections: string[] = [];
+
+  // Keep one compact, self-contained assignment summary at the very front of
+  // every worker packet. Some providers over-weight the current micro-step
+  // and may otherwise treat a terse derived label such as "Draft content" as
+  // the entire assignment. This summary is deliberately duplicated from the
+  // structured sections below so it survives any later evidence trimming.
+  sections.push(
+    `## Assignment at a glance\nMission: ${packet.missionGoal}\nDeliverable/task: ${packet.assignment}\nAcceptance criteria: ${packet.successCriteria}${packet.activeStep ? `\nCurrent micro-step: ${packet.activeStep}` : ""}${input.roles?.length ? `\nAssigned roles: ${input.roles.join(" + ")}` : ""}${input.capabilities?.length ? `\nAvailable capabilities: ${input.capabilities.join(", ")}` : ""}\n\nThis is the complete assignment context. Start work immediately using the supplied details. Do not ask for the mission, deliverable, acceptance criteria, or current step again. Do not claim that context is missing unless these fields are explicitly marked as not specified.`,
+  );
 
   if (retryDirective && retryDirective.trim()) {
     sections.push(`## Important\n${retryDirective.trim()}`);
   }
 
-  sections.push(`## Mission goal\n${missionGoal?.trim() || "(not specified)"}`);
-  sections.push(`## Your subtask\n${subtaskTitle?.trim() || "(not specified)"}`);
+  sections.push(`## Mission goal\n${packet.missionGoal}`);
+  sections.push(`## Your subtask\n${packet.assignment}`);
   sections.push(
-    `## Success criteria\n${successCriteria?.trim() || "(not specified)"}`,
+    `## Success criteria\n${packet.successCriteria}`,
   );
 
-  if (handsOnPath || proofOfWorkPath || handOffPath) {
+  if (packet.activeStep) sections.push(`## Active sub-step\n${packet.activeStep}`);
+
+  if (packet.role === "verifier") {
+    sections.push(`## Verification target\nRead-only verification assignment. Verify only the declared artifacts and acceptance criteria; do not recreate the producer's work.\n- Required artifacts: ${packet.requiredFiles.join(", ") || "use the canonical workspace inventory"}\n- Producer evidence: ${packet.relevantEvidence.join(" | ") || "none supplied; inspect the canonical artifacts"}`);
+  }
+
+  if (skills.length > 0) {
+    const skillDocs = skills.map(
+      (s) => contextPolicy?.includeFullSkillDocs === false
+        ? `### ${s.name} (${s.category})\n${s.description}\n\nSkill documentation is available through the assignment preflight reader. Read only this selected skill before using tools.`
+        : `### ${s.name} (${s.category})\n${s.description}\n\n${s.content}`
+    );
+    sections.push(`## Required Skill Preflight\nBefore using any tool, identify the relevant provided skill(s) below, read the applicable instructions, and follow them. Do not start tool work until this preflight is complete.\n\n## Provided Skills & Technical Documentation\n${skillDocs.join("\n\n---\n\n")}`);
+  }
+
+  if (subSubtasks.length > 0) {
+    const subLines = subSubtasks.map(
+      (st: { id: string; title: string; state: string; result?: string }) =>
+        `- [${st.state === "completed" ? "x" : " "}] ${st.id}: ${st.title}${st.result ? ` (${st.result})` : ""}`
+    );
+    sections.push(`## Sub-subtasks breakdown\n${subLines.join("\n")}`);
+  }
+
+  if (handsOnPath || handOffPath) {
     const lines = [
       handsOnPath
-        ? `- Read the orchestrator-authored hands-on brief at \`${handsOnPath}\` before acting.`
-        : "",
-      proofOfWorkPath
-        ? `- Create proof of work at \`${proofOfWorkPath}\` with text evidence, test output, screenshots/images, or artifact references.`
+        ? `- Read the orchestrator-authored hands-on brief at \`${handsOnPath}\` for full task details and micro-steps breakdown before acting.`
         : "",
       handOffPath
-        ? `- Create the final handoff at \`${handOffPath}\` with work done, observations, suggestions, asset metadata, residual risks, and continuation instructions for the orchestrator or another agent. If anything was not completed, explicitly state what was blocked, why it was blocked, what was attempted, what evidence proves the blocker, and what the next agent should not repeat.`
+        ? `- Create the final consolidated handoff at \`${handOffPath}\` with work done, proof of work, tool evidence, produced artifacts, residual risks, and continuation instructions. (Transient \`checkpoint.md\` is automatically cleaned up upon completion).`
         : "",
     ].filter(Boolean);
     sections.push(`## Handoff contract\n${lines.join("\n")}`);
   }
 
   sections.push(
-    `## Exit checklist\nBefore you stop, verify every item below:\n- The requested deliverable exists as a concrete file/artifact, not only as search results, notes in chat, or a tool observation.\n- The deliverable satisfies the success criteria above; if it does not, keep working or write a clear blocker handoff.\n- You used available tools to check the deliverable exists and, when possible, reopened/read/rendered/tested it.\n${proofOfWorkPath ? `- You wrote proof of work to \`${proofOfWorkPath}\` with the evidence from that check.` : "- You recorded proof of work with concrete evidence from that check."}\n${handOffPath ? `- You wrote the final handoff to \`${handOffPath}\` with work done, observations, suggestions, asset metadata, residual risks, and continuation instructions.` : "- You wrote a final handoff with work done, observations, suggestions, asset metadata, residual risks, and continuation instructions."}\n- Do not exit immediately after web.search, list_files, read_file, or browser inspection unless you have also created/found the deliverable artifact and completed the proof/handoff.`,
+    `## Exit checklist\nBefore you stop, verify every item below:\n- The requested deliverable exists as a concrete file/artifact, not only as search results, notes in chat, or a tool observation.\n- The deliverable satisfies the success criteria above; if it does not, keep working or write a clear blocker handoff.\n- You used available tools to check the deliverable exists and, when possible, reopened/read/rendered/tested it.\n${handOffPath ? `- You wrote the consolidated handoff and proof of work to \`${handOffPath}\`.` : "- You recorded a final handoff with work done, proof of work, tool evidence, residual risks, and continuation instructions."}\n- Do not exit immediately after web.search, list_files, read_file, or browser inspection unless you have also created/found the deliverable artifact and completed the proof/handoff.`,
   );
+
+  if (executionContract) {
+    sections.push(`## Execution contract\nThis is the task-specific policy generated during planning. Follow it as the source of truth; do not invent extra steps or repeatedly redo completed work.\n- Required artifacts: ${executionContract.requiredArtifacts.join(", ") || "none declared"}\n- Target workspace: ${executionContract.targetWorkspace || "the canonical task workspace"}\n- Expected next actions: ${executionContract.expectedNextActions.join("; ") || "choose the next evidence-backed action"}\n- Preflight once per assignment: ${executionContract.preflight.runOncePerAssignment ? "yes" : "no"}${executionContract.preflight.targetPaths.length ? `; target paths: ${executionContract.preflight.targetPaths.join(", ")}` : ""}\n- Completion signals: ${executionContract.completionSignals.join("; ")}\n- No-progress policy: correct after ${executionContract.noProgress.correctionAfter} equivalent results; stop after ${executionContract.noProgress.stopAfter}.\n- Sequential action queues: use for ${executionContract.actionQueue.useWhen.join(", ") || "related dependent actions"}; max ${executionContract.actionQueue.maxActions} actions, depth ${executionContract.actionQueue.maxDepth}, stop on error: ${executionContract.actionQueue.stopOnError ? "yes" : "no"}.\n- Verification surface: ${executionContract.verificationSurface}.`);
+  }
+
+  if (contextPolicy) {
+    sections.push(`## Context policy\nThe complete mission history remains durable outside this prompt. Use only the relevant assignment context here. Read additional files or selected skill documentation on demand when needed.\n- Context budget: approximately ${contextPolicy.maxInputTokens} input tokens\n- Dependency evidence: up to ${contextPolicy.maxDependencyChars} characters\n- History: up to ${contextPolicy.maxHistoryTurns} recent turns\n- File excerpts: up to ${contextPolicy.maxFileExcerptLines} lines\n- Full skill documents initially: ${contextPolicy.includeFullSkillDocs ? "yes" : "no"}\n- On-demand reads: ${contextPolicy.allowOnDemandReads ? "allowed" : "not allowed"}.`);
+  }
 
   if (dependencyOutputs.length > 0) {
     const lines = dependencyOutputs.map(
@@ -164,7 +275,29 @@ export function buildAgentBrief(input: AgentBriefInput): string {
     `Work toward the mission goal above. Use tools as needed. Only emit your final result after the exit checklist is satisfied, or after you have written a blocker handoff explaining exactly why it cannot be satisfied.`,
   );
 
-  return sections.join("\n\n");
+  let rendered = sections.join("\n\n");
+  if (maxContextChars && rendered.length > maxContextChars) {
+    // Preserve the assignment contract and completion instructions. Trim
+    // evidence-heavy sections first; the agent can retrieve omitted details
+    // through the bounded read tools when the policy permits it.
+    const removableHeadings = [
+      "## Live workspace artifact inventory",
+      "## Results from completed dependencies",
+      "## Sub-subtasks breakdown",
+      "## Provided Skills & Technical Documentation",
+    ];
+    for (const heading of removableHeadings) {
+      if (rendered.length <= maxContextChars) break;
+      const index = sections.findIndex((section) => section.includes(heading));
+      if (index < 0) continue;
+      sections[index] = `${heading}\n[Omitted from this turn to fit the context budget. Use the assignment's bounded read tools if this evidence is required.]`;
+      rendered = sections.join("\n\n");
+    }
+    if (rendered.length > maxContextChars) {
+      rendered = `${rendered.slice(0, Math.max(0, maxContextChars - 180))}\n\n[Context packet truncated at the planner-selected budget; durable mission state remains persisted outside this prompt.]`;
+    }
+  }
+  return rendered;
 }
 
 export interface MissionSummaryInput {

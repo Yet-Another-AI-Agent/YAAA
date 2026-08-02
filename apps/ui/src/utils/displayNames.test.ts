@@ -58,10 +58,14 @@ describe("displaySender", () => {
     expect(displaySender("Supervisor")).toBe(ORCHESTRATOR_DISPLAY);
   });
 
-  it("passes User, System, and generic Agent through unchanged", () => {
+  it("normalizes legacy generic Agent labels to YAAA in the dashboard", () => {
+    expect(displaySender("Agent (Agent)")).toBe(ORCHESTRATOR_DISPLAY);
+  });
+
+  it("passes User and System through unchanged", () => {
     expect(displaySender("User")).toBe("User");
     expect(displaySender("System")).toBe("System");
-    expect(displaySender("Agent")).toBe("Agent");
+    expect(displaySender("Agent")).toBe(ORCHESTRATOR_DISPLAY);
   });
 
   it("maps an agent id to a human name and role", () => {

@@ -248,7 +248,8 @@ describe("SqliteStore", () => {
         {
           id: "1",
           title: "subtask 1",
-          capability: "files",
+      roles: ["FilesAgent"],
+      capabilities: ["files"],
           dependsOn: [],
           riskLevel: "low",
           successCriteria: "criteria",

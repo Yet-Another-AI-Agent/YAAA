@@ -59,7 +59,7 @@ const MODEL_FALLBACKS: Record<string, string[]> = {
 
 function isModelUnavailable(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
-  return /\b404\b|model_not_found|not supported|invalid model/i.test(message);
+  return /\b404\b|model_not_found|not supported|invalid model|(?:model|provider|service).*(?:unavailable|not found)|(?:temporarily|currently) unavailable/i.test(message);
 }
 
 function retryDelay(attempt: number): number {

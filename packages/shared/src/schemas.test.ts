@@ -22,7 +22,8 @@ describe("Shared schemas validation", () => {
     const valid = {
       id: "st-1",
       title: "Write facts",
-      capability: "files",
+      roles: ["FilesAgent"],
+      capabilities: ["files"],
       dependsOn: [],
       riskLevel: "low",
       successCriteria: "done",
@@ -43,7 +44,8 @@ describe("Shared schemas validation", () => {
         {
           id: "st-1",
           title: "Write facts",
-          capability: "files",
+          roles: ["FilesAgent"],
+          capabilities: ["files"],
           dependsOn: [],
           riskLevel: "low",
           successCriteria: "done",
@@ -109,5 +111,56 @@ describe("Shared schemas validation", () => {
       mentions: [{ handle: "@sage-1", recipientId: "agent-1", recipientKind: "agent" }],
       createdAt: "2026-01-01T00:00:01.000Z",
     }).success).toBe(true);
+  });
+
+  it("requires composite roles and capabilities in planner output", () => {
+    const planWithModelLingo = {
+      goal: "Test plan with LLM verification stage kind variance",
+      subtasks: [
+        {
+          id: "st-1",
+          title: "Write deliverable",
+          roles: ["FilesAgent"],
+          capabilities: ["files"],
+          dependsOn: [],
+          riskLevel: "low",
+          successCriteria: "file created",
+        },
+      ],
+      verification: {
+        required: true,
+        strategy: "Independent verification",
+        stages: [
+          {
+            id: "stage-1",
+            kind: "browser", // normalized to "visual"
+            targetSubtaskIds: ["st-1"],
+            capability: "web", // normalized to "browser"
+            method: "Inspect web layout",
+            available: true,
+          },
+          {
+            id: "stage-2",
+            kind: "files", // normalized to "artifact"
+            targetSubtaskIds: ["st-1"],
+            capability: "file", // normalized to "files"
+            method: "Inspect file contents",
+            available: true,
+          },
+        ],
+        toolLimitations: [],
+        decisionPolicy: "Must pass",
+      },
+    };
+
+    const parsed = TaskPlanSchema.safeParse(planWithModelLingo);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.subtasks[0].capabilities).toEqual(["files"]);
+      expect(parsed.data.verification?.stages[0].kind).toBe("visual");
+      expect(parsed.data.verification?.stages[0].capability).toBe("browser");
+      expect(parsed.data.verification?.stages[1].kind).toBe("artifact");
+      expect(parsed.data.verification?.stages[1].capability).toBe("files");
+    }
   });
 });

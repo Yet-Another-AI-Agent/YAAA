@@ -1,9 +1,9 @@
 import type { IBus, IStore, ModelResolution, ModelResolver } from "@yaaa/interfaces";
-import { agentControl, container, orchestratorMailbox, type Container, type IEventQueue } from "@yaaa/platform";
-import { type AgentRun, type Subtask, type TaskPlan, type LedgerEntry, type DependencyOutput, type VerificationFinding, buildAgentBrief, getErrorFingerprint, isInsufficientFundsError } from "@yaaa/shared";
+import { agentControl, container, pauseController, orchestratorMailbox, type Container, type IEventQueue } from "@yaaa/platform";
+import { type AgentRun, type Subtask, type TaskPlan, type LedgerEntry, type DependencyOutput, type VerificationFinding, buildAgentBrief, buildMissionSummary, deriveSubSubtasksFromSubtask, getErrorFingerprint, getMatchingSkills, getSkill, isInsufficientFundsError, validateSubSubtaskTitle } from "@yaaa/shared";
 import { AGENT_REGISTRY, selectAgentTemplate } from "../registry.js";
 import { InnerLoop } from "./inner-loop.js";
-import { SupervisorAssessor } from "./supervisor-assessor.js";
+import { SupervisorAssessor, type SupervisorDecision } from "./supervisor-assessor.js";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -16,6 +16,46 @@ const __dirname = path.dirname(__filename);
 // attempt count: when the same error fingerprint recurs this many times the
 // agent is demonstrably stuck, so we stop and escalate to a different approach.
 const MAX_IDENTICAL_ERRORS = 3;
+
+// These are only emergency candidates for a model that was present in the
+// planner catalog but rejected at execution time. The live resolver still
+// validates each candidate before it is used.
+const MODEL_UNAVAILABLE_FALLBACKS: Record<string, string[]> = {
+  "anthropic/claude-sonnet-4.6": ["anthropic/claude-sonnet-4.5", "anthropic/claude-haiku-4.5"],
+  "anthropic/claude-opus-4.8": ["anthropic/claude-opus-4.7", "anthropic/claude-sonnet-4.6"],
+  "anthropic/claude-opus-4.7": ["anthropic/claude-sonnet-4.6", "anthropic/claude-haiku-4.5"],
+};
+
+function isUnavailableModelError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /(?:model|provider|service).*(?:unavailable|not found|not supported)|(?:temporarily|currently) unavailable|\b(?:400|404|503)\b.*(?:model|unavailable|provider|service)/i.test(message);
+}
+
+/**
+ * A provider rejected the request itself (bad transcript, invalid tool schema,
+ * unsupported parameter, etc.). This is not an agent reasoning failure: a new
+ * worker with the same workspace would repeat the same request and may rerun
+ * the producer script. Diagnose and stop instead of blindly spawning a clone.
+ */
+function isDeterministicProviderRequestError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /\b400\b|bad request|validationexception|text content block|tool.?call.*(?:mismatch|invalid|missing)|function.?response|invalid request|unsupported parameter/i.test(message)
+    && !isUnavailableModelError(error);
+}
+
+function isEmptyArtifactError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /^EMPTY_ARTIFACT:/i.test(message);
+}
+
+/**
+ * A worker that asks for the assignment already present in its first brief has
+ * not made recoverable progress. Treat this as a terminal context failure so
+ * artifact gating cannot turn it into an endless replacement-agent loop.
+ */
+function isAssignmentContextRefusal(summary: string): boolean {
+  return /(?:don't|do not|cannot|can not|unable to)\s+(?:see|find|complete|proceed|assist)[^.!?]{0,180}(?:assignment|task|context|details)|please provide (?:the )?(?:full|complete) (?:task|assignment|mission) details|without (?:any )?(?:context|details) (?:about|for) the (?:specific )?task/i.test(summary);
+}
 
 // Provider rate limits are shared by all workers in a mission. Keep this hard
 // capped at two even if an old plan asks for more agents; callers may lower it
@@ -229,6 +269,40 @@ export class OuterLoop {
     }
   }
 
+  private disabledModelsByTask = new Map<string, Set<string>>();
+
+  private addDisabledModel(taskId: string, modelSubstring: string): void {
+    if (!this.disabledModelsByTask.has(taskId)) {
+      this.disabledModelsByTask.set(taskId, new Set());
+    }
+    this.disabledModelsByTask.get(taskId)!.add(modelSubstring.toLowerCase());
+  }
+
+  private isModelDisabled(taskId: string, modelName?: string): boolean {
+    if (!modelName) return false;
+    const disabled = this.disabledModelsByTask.get(taskId);
+    if (!disabled) return false;
+    const lower = modelName.toLowerCase();
+    for (const d of disabled) {
+      if (lower.includes(d)) return true;
+    }
+    return false;
+  }
+
+  private async chooseUnavailableModelFallback(taskId: string, failedModel: string, preferred?: string): Promise<string | undefined> {
+    const candidates = [
+      preferred,
+      ...(MODEL_UNAVAILABLE_FALLBACKS[failedModel.toLowerCase()] ?? []),
+      "google/gemini-2.5-pro-preview",
+      "google/gemini-2.5-flash",
+    ].filter((model, index, list): model is string => Boolean(model) && model !== failedModel && list.indexOf(model) === index);
+    for (const candidate of candidates) {
+      const resolution = await this.resolveModel(taskId, candidate);
+      if (resolution.model && resolution.model.toLowerCase() !== failedModel.toLowerCase()) return resolution.model;
+    }
+    return undefined;
+  }
+
   /**
    * Ask the runtime which model this agent should actually run on. The catalog
    * behind the resolver is fetched once and cached, so this is a cheap call per
@@ -236,6 +310,12 @@ export class OuterLoop {
    * which keeps keyless/test runtimes working.
    */
   private async resolveModel(taskId: string, requested?: string): Promise<ModelResolution> {
+    if (requested && this.isModelDisabled(taskId, requested)) {
+      return {
+        model: undefined,
+        reason: `Model ${requested} was disabled per user control command. Falling back to default model.`,
+      };
+    }
     if (!this.modelResolver) {
       return {
         model: requested,
@@ -250,6 +330,12 @@ export class OuterLoop {
         requestedModel: requested ?? null,
         selectedModel: resolution.model ?? null,
       });
+      if (resolution.model && this.isModelDisabled(taskId, resolution.model)) {
+        return {
+          model: undefined,
+          reason: `Catalog resolved ${resolution.model}, but it was flagged as unavailable by user command.`,
+        };
+      }
       return resolution;
     } catch (error) {
       warnOuter(taskId, "model catalog lookup failed; preserving requested model", {
@@ -375,14 +461,29 @@ export class OuterLoop {
   }
 
   private requiredArtifactGaps(subtask: Subtask, artifacts: Array<{ path: string }>, missionGoal = ""): string[] {
-    const contract = `${missionGoal}\n${subtask.title}\n${subtask.successCriteria}`.toLowerCase();
+    // Evaluate only this subtask's declared output. Looking at the overall
+    // mission here makes an upstream research/content step appear responsible
+    // for the final binary deliverable, which causes redirects such as
+    // "outline.md is missing a PPTX" and repeatedly respawns the same agent.
+    // The mission remains available in the worker brief; artifact ownership is
+    // determined by the subtask title and success criteria.
+    void missionGoal;
+    const contract = `${subtask.title}\n${subtask.successCriteria}`.toLowerCase();
     const paths = artifacts.map((artifact) => String(artifact.path || "").toLowerCase());
     const gaps: string[] = [];
-    if (/powerpoint|pptx|slide deck|presentation|slides?/.test(contract) && !paths.some((p) => p.endsWith(".pptx"))) {
+    const declaredPaths = Array.from(contract.matchAll(/["'`]([^"'`]+\.[a-z0-9]{1,12})["'`]|\b([\w./-]+\.(?:pptx?|docx?|xlsx?|pdf|html?|css|js|ts|md|png|jpe?g|svg))\b/gi))
+      .map((match) => (match[1] || match[2] || "").toLowerCase())
+      .filter((value) => value.length > 0);
+    for (const declaredPath of declaredPaths) {
+      if (!paths.some((pathValue) => pathValue === declaredPath || pathValue.endsWith(`/${declaredPath}`))) {
+        gaps.push(`Required subtask artifact is missing: ${declaredPath}.`);
+      }
+    }
+    if (/powerpoint|\.pptx\b|pptxgenjs/.test(contract) && !paths.some((p) => p.endsWith(".pptx"))) {
       gaps.push("Create and verify a real .pptx presentation file; a Markdown outline is not an acceptable substitute.");
     }
-    if (/generated image|actual image|illustration|visual(?:ly)?(?: appealing| asset| deck)?|embed(?:ded|s)? image|png|jpg|jpeg/.test(contract) && !paths.some((p) => /\.(png|jpe?g|webp|gif)$/.test(p))) {
-      gaps.push("Create the required image assets as real PNG/JPG/WebP files and reference/embed them in the deliverable.");
+    if (/generated image|actual image|illustration|visual(?:ly)?(?: appealing| asset| deck)?|embed(?:ded|s)? image|png|jpg|jpeg|svg/.test(contract) && !paths.some((p) => /\.(png|jpe?g|webp|gif|svg)$/i.test(p))) {
+      gaps.push("Create the required image assets as real PNG/JPG/WebP/SVG files and reference/embed them in the deliverable.");
     }
     return gaps;
   }
@@ -417,9 +518,22 @@ export class OuterLoop {
           // A missing or binary artifact remains available by path in the brief.
         }
       }
-      if (evidence.length === 0) return output;
+      if (evidence.length === 0) return {
+        ...output,
+        // A worker can legitimately produce many files. Pass only a bounded
+        // representative set to the next worker; the filesystem remains the
+        // source of truth and the verifier can inspect paths on demand.
+        artifacts: [
+          ...(output.artifacts ?? []).slice(0, 3),
+          ...(output.artifacts ?? []).slice(-20),
+        ].filter((artifact, index, list) => list.findIndex((item) => item.path === artifact.path) === index),
+      };
       return {
         ...output,
+        artifacts: [
+          ...(output.artifacts ?? []).slice(0, 3),
+          ...(output.artifacts ?? []).slice(-20),
+        ].filter((artifact, index, list) => list.findIndex((item) => item.path === artifact.path) === index),
         summary: `${output.summary}\n\nYAAA inspected these dependency files before starting you:\n\n${evidence.join("\n\n")}`,
       };
     });
@@ -440,7 +554,7 @@ export class OuterLoop {
     const root = path.resolve(workingDir);
     const found: string[] = [];
     const visit = (directory: string): void => {
-      if (found.length >= 300) return;
+      if (found.length >= 80) return;
       let entries: fs.Dirent[];
       try {
         entries = fs.readdirSync(directory, { withFileTypes: true });
@@ -448,8 +562,8 @@ export class OuterLoop {
         return;
       }
       for (const entry of entries) {
-        if (found.length >= 300) return;
-        if (entry.name === ".git" || entry.name === "node_modules") continue;
+        if (found.length >= 80) return;
+        if (entry.name === ".git" || entry.name === "node_modules" || entry.name === "dist" || entry.name === "build") continue;
         const absolute = path.join(directory, entry.name);
         if (entry.isDirectory()) visit(absolute);
         else if (entry.isFile()) found.push(path.relative(root, absolute).split(path.sep).join("/"));
@@ -457,6 +571,66 @@ export class OuterLoop {
     };
     visit(root);
     return found.sort();
+  }
+
+  /**
+   * Build a bounded path-only inventory for a replacement agent. A failed
+   * worker's handoff is persisted even when runInnerLoop throws, but the old
+   * retry path only forwarded artifacts returned by an incomplete checkpoint.
+   * That left normal failure retries unaware of scripts/assets already created
+   * in the shared task workspace.
+   */
+  private listRetryArtifactInventory(agentId: string, createdAfterMs = 0): Array<{ path: string; mimeType: string; description: string }> {
+    const paths = this.listWorkspaceArtifactPaths()
+      .filter((artifactPath) => {
+        if (!createdAfterMs) return true;
+        try {
+          const workingDir = this.scope.resolve<string>("workingDir");
+          return fs.statSync(path.resolve(workingDir, artifactPath)).mtimeMs >= createdAfterMs;
+        } catch {
+          return false;
+        }
+      })
+      .sort((a, b) => {
+        const priority = (value: string): number => {
+          if (/\/handOff\.md$/i.test(value)) return 0;
+          if (/\/incompleteWork\.md$/i.test(value)) return 1;
+          if (/\.(?:png|jpe?g|webp|gif|svg|pptx?|docx?|xlsx?|pdf)$/i.test(value)) return 2;
+          return 3;
+        };
+        return priority(a) - priority(b) || a.localeCompare(b);
+      })
+      .slice(0, 80);
+    return paths.map((artifactPath) => ({
+      path: artifactPath,
+      mimeType: "application/octet-stream",
+      description: "Existing task-workspace artifact available for inspection; do not regenerate without evidence.",
+    }));
+  }
+
+  private readRetryHandoffEvidence(inventory: Array<{ path: string }>): string | undefined {
+    let workingDir: string;
+    try {
+      workingDir = this.scope.resolve<string>("workingDir");
+    } catch {
+      return undefined;
+    }
+    const sections: string[] = [];
+    let remaining = 12_000;
+    for (const artifact of inventory) {
+      if (remaining <= 0 || !/(?:\/|^)(?:handOff|incompleteWork|checkpoint)\.md$/i.test(artifact.path)) continue;
+      const absolute = path.resolve(workingDir, artifact.path);
+      try {
+        const contents = fs.readFileSync(absolute, "utf8").trim();
+        if (!contents) continue;
+        const excerpt = contents.slice(0, remaining);
+        sections.push(`### ${artifact.path}\n${excerpt}`);
+        remaining -= excerpt.length;
+      } catch {
+        // The path remains in the bounded inventory even when it is unreadable.
+      }
+    }
+    return sections.length > 0 ? sections.join("\n\n") : undefined;
   }
 
   private writeHandsOnBrief(agent: AgentRun, brief: string): void {
@@ -485,6 +659,9 @@ export class OuterLoop {
       subtaskId: snapshot.subtaskId,
       modelRole: snapshot.modelRole,
     });
+    if (snapshot.status === "exited" || snapshot.status === "completed" || snapshot.status === "failed") {
+      agentControl.post(snapshot.id, { type: "stop", reason: `Agent reached terminal status '${snapshot.status}'` });
+    }
     await this.store.saveAgent(snapshot.taskId, snapshot);
     await this.bus.publish(`task.${snapshot.taskId}.agent.${snapshot.id}.lifecycle`, snapshot);
   }
@@ -553,49 +730,151 @@ export class OuterLoop {
         // in the screenshot (YAAA appeared to speak for the sub-agent).
         const targetAgent = agents.find((agent) => agent.id === message.agentId);
         const targetHandle = targetAgent?.handle ?? message.agentId ?? "agent";
-        await this.bus.publish(`task.${taskId}.agent_message`, {
-          kind: "info_reply",
-          from: "orchestrator",
-          to: targetAgent?.id ?? message.agentId ?? "agent",
-          answer: `@${targetHandle.replace(/^@/, "")} I received your question: ${message.content}. Continue with the safest evidence-based path while I review it and keep your current work moving.`,
+        const plan = await this.store.getPlan(taskId);
+        const routing = await this.supervisor.routeMessage(taskId, {
+          missionGoal: plan?.goal ?? "Current mission",
+          userMessage: `Direct question from sub-agent @${targetHandle.replace(/^@/, "")}: ${message.content}\nAnswer the sub-agent's question directly and concisely. Do not return a generic acknowledgement or tell it to follow a default path. You cannot change the live execution contract in this response; never claim that permissions or tools were added. If the required tool is missing, say so plainly so YAAA can reassign the work with a corrected contract.`,
+          activeAgents: agents
+            .filter((agent) => agent.status === "working" || agent.status === "blocked")
+            .map((agent) => ({
+              id: agent.id,
+              handle: agent.handle,
+              role: agent.role,
+              assignment: agent.activeAssignment || agent.initialGoal,
+            })),
         });
+        const answer = routing.reply || routing.instruction;
+        // Never invent an answer or emit a hardcoded acknowledgement. The
+        // worker receives a response only when the routing LLM produced one.
+        if (answer) {
+          await this.bus.publish(`task.${taskId}.agent_message`, {
+            kind: "info_reply",
+            from: "orchestrator",
+            to: targetAgent?.id ?? message.agentId ?? "agent",
+            answer: `@${targetHandle.replace(/^@/, "")} ${answer}`,
+          });
+        }
         await orchestratorMailbox.acknowledge(message.id);
         continue;
       }
 
-      await this.bus.publish(`task.${taskId}.started`, {
-        kind: "status",
-        from: "orchestrator",
-        taskId,
-        state: "working",
-        note: `📬 Processing queued ${message.from} message: ${message.content}`,
-      });
+      // Intercept Control Actions (e.g. kill, force kill, pause, resume, model unavailability)
+      const controlAction = this.parseUserControlAction(message.content, workingAgents, agents);
+      if (controlAction.isControlAction) {
+        if (controlAction.actionType === "kill") {
+          const targets = controlAction.targetAgents && controlAction.targetAgents.length > 0
+            ? controlAction.targetAgents
+            : workingAgents;
 
-      // A pickup event alone is not an answer: the UI uses it to move the
-      // optimistic user turn out of the queue, but the user still needs a
-      // visible orchestrator response. Keep this acknowledgement on the
-      // event-loop path so every queued user message is answered even while
-      // the workers continue their current subtasks.
-      await this.bus.publish(`task.${taskId}.started`, {
-        kind: "status",
-        from: "orchestrator",
-        taskId,
-        state: "working",
-        note: workingAgents.length > 0
-          ? `✅ I’m here — I received your message and routed it to the active agents. I’ll keep the existing work moving and report back with the next result.`
-          : `✅ I’m here — I received your message. There are no active workers at this instant, so I’ll incorporate it at the next mission checkpoint and report back with the next result.`,
+          for (const target of targets) {
+            agentControl.post(target.id, {
+              type: "stop",
+              reason: `User control command: ${message.content}`,
+            });
+            target.status = "exited";
+            await this.store.saveAgent(taskId, target);
+            await this.bus.publish(`task.${taskId}.started`, {
+              kind: "status",
+              from: "orchestrator",
+              taskId,
+              state: "working",
+              note: `🛑 Control Action: Force killed @${target.handle.replace(/^@/, "")} per user command.`,
+            });
+          }
+
+          if (controlAction.modelUnavailableContext) {
+            this.addDisabledModel(taskId, controlAction.modelUnavailableContext);
+            await this.bus.publish(`task.${taskId}.started`, {
+              kind: "status",
+              from: "orchestrator",
+              taskId,
+              state: "working",
+              note: `⚙️ Model update: Noted model '${controlAction.modelUnavailableContext}' is unavailable. Re-assigning subtask with backup model.`,
+            });
+          }
+        } else if (controlAction.actionType === "switch_model" && controlAction.targetModel) {
+          const targets = controlAction.targetAgents && controlAction.targetAgents.length > 0
+            ? controlAction.targetAgents
+            : workingAgents;
+
+          for (const target of targets) {
+            agentControl.post(target.id, {
+              type: "switch_model",
+              newModel: controlAction.targetModel,
+              reason: `User on-the-fly model change: ${message.content}`,
+            });
+            target.model = controlAction.targetModel;
+            target.modelRole = controlAction.targetModel;
+            await this.store.saveAgent(taskId, target);
+            await this.bus.publish(`task.${taskId}.started`, {
+              kind: "status",
+              from: "orchestrator",
+              taskId,
+              state: "working",
+              note: `⚡ Control Action: Dynamically switched model for @${target.handle.replace(/^@/, "")} to '${controlAction.targetModel}' on-the-fly!`,
+            });
+          }
+        } else if (controlAction.actionType === "pause") {
+          pauseController.pause(taskId);
+          await this.bus.publish(`task.${taskId}.started`, {
+            kind: "status",
+            from: "orchestrator",
+            taskId,
+            state: "working",
+            note: `⏸️ Control Action: Task execution paused per user command.`,
+          });
+        } else if (controlAction.actionType === "resume") {
+          pauseController.resume(taskId);
+          await this.bus.publish(`task.${taskId}.started`, {
+            kind: "status",
+            from: "orchestrator",
+            taskId,
+            state: "working",
+            note: `▶️ Control Action: Task execution resumed per user command.`,
+          });
+        }
+
+        await orchestratorMailbox.acknowledge(message.id);
+        continue;
+      }
+
+      // Let the supervisor decide whether this changes any active assignment.
+      // Do not emit a generic acknowledgement or blindly broadcast the message.
+      const plan = await this.store.getPlan(taskId);
+      const routing = await this.supervisor.routeMessage(taskId, {
+        missionGoal: plan?.goal ?? "Current mission",
+        userMessage: message.content,
+        activeAgents: workingAgents.map((agent) => ({
+          id: agent.id,
+          handle: agent.handle,
+          role: agent.role,
+          assignment: agent.activeAssignment || agent.initialGoal,
+        })),
       });
-      for (const agent of workingAgents) {
+      const selectedAgents = workingAgents.filter((agent) => routing.recipientIds.includes(agent.id));
+      if (routing.reply) {
+        // This is a real answer, not a pickup acknowledgement. Keep it on the
+        // public orchestrator channel rather than pretending it is an agent
+        // reply addressed to a synthetic "user" agent.
+        await this.bus.publish(`task.${taskId}.started`, {
+          kind: "status",
+          from: "orchestrator",
+          taskId,
+          state: "working",
+          note: routing.reply,
+        });
+      }
+      for (const agent of selectedAgents) {
         await this.bus.publish(`task.${taskId}.agent_message`, {
           kind: "info_reply",
           from: "orchestrator",
           to: agent.id,
-          answer: `@${agent.handle.replace(/^@/, "")} ${message.content}`,
+          answer: `@${agent.handle.replace(/^@/, "")} ${routing.instruction || message.content}`,
         });
         const redirect = {
           type: "redirect",
-          handsOn: `${message.from === "user" ? "User" : "Orchestrator"} message received while you were working:\n\n${message.content}\n\nIncorporate it at the next safe turn. Continue from existing artifacts; do not restart unless the evidence requires it.`,
-          reason: "Queued message delivered by the orchestrator event loop.",
+          handsOn: `${message.from === "user" ? "User" : "Orchestrator"} update selected for your assignment:\n\n${routing.instruction || message.content}\n\nIncorporate it at the next safe turn. Continue from existing artifacts; do not restart unless the evidence requires it.`,
+          reason: routing.reason,
         } as const;
         // The durable queue is the source of truth for each worker lane. The
         // in-process mailbox remains as a low-latency compatibility path for
@@ -619,13 +898,257 @@ export class OuterLoop {
         } else {
           agentControl.post(agent.id, redirect);
         }
-        agentControl.post(agent.id, {
-          type: "extend",
-          additionalMs: 120_000,
-          reason: "Time granted to process queued orchestration input.",
-        });
       }
       await orchestratorMailbox.acknowledge(message.id);
+    }
+  }
+
+  private parseUserControlAction(
+    content: string,
+    workingAgents: AgentRun[],
+    allAgents: AgentRun[],
+  ): {
+    isControlAction: boolean;
+    actionType?: "kill" | "pause" | "resume" | "switch_model";
+    targetAgents?: AgentRun[];
+    targetModel?: string;
+    modelUnavailableContext?: string;
+    description?: string;
+  } {
+    const text = content.trim();
+
+    // 1. Check for Kill / Force Kill / Terminate / Stop patterns
+    const killPattern = /\b(?:force\s+)?(?:kill|stop|terminate|halt)\b/i;
+    if (killPattern.test(text)) {
+      const targets: AgentRun[] = [];
+      for (const agent of allAgents) {
+        const handleClean = agent.handle.replace(/^@/, "").toLowerCase();
+        const baseName = handleClean.split("-")[0];
+        const agentId = agent.id.toLowerCase();
+        if (
+          text.toLowerCase().includes(handleClean) ||
+          text.toLowerCase().includes(baseName) ||
+          text.toLowerCase().includes(agentId)
+        ) {
+          targets.push(agent);
+        }
+      }
+
+      const finalTargets = targets.length > 0 ? targets : workingAgents;
+      const modelMatch = text.match(/([a-zA-Z0-9._-]+)\s+is\s+unavailable/i) || text.match(/unavailable\s+model\s+([a-zA-Z0-9._-]+)/i);
+      const modelUnavailableContext = modelMatch ? modelMatch[1] : undefined;
+
+      return {
+        isControlAction: true,
+        actionType: "kill",
+        targetAgents: finalTargets,
+        modelUnavailableContext,
+        description: `Force kill request for ${finalTargets.map((a) => a.handle).join(", ") || "active agents"}`.trim(),
+      };
+    }
+
+    // 2. Check for Model Upgrade / Switch / Downscale patterns (e.g. "use smaller model", "switch jigglypuff to haiku")
+    const modelPatterns = [
+      /\b(?:upgrade|switch|change|downgrade|set|use)\s+(?:the\s+)?(?:model\s+)?(?:of\s+)?(?:@?([a-zA-Z0-9_-]+)\s+)?to\s+([a-zA-Z0-9./_-]+)/i,
+      /\b(?:use|switch\s+to|change\s+to)\s+(?:a\s+)?(smaller|small|low|lower|cheap|cheapest|fast|faster|light|lite|large|pro|high|haiku|flash|mini|sonnet|opus|gpt-4o-mini|claude-[a-zA-Z0-9._-]+)\s+(?:model\b)?(?:\s+(?:for|on)\s+@?([a-zA-Z0-9_-]+))?/i,
+      /\b(?:use|set|kept\s+it\s+at)\s+(?:a\s+)?(smaller|small|low|lower|cheap|fast|haiku|flash|mini|sonnet|pro)\b/i,
+    ];
+
+    let targetHandleOrId: string | undefined;
+    let rawModel: string | undefined;
+
+    for (const pattern of modelPatterns) {
+      const m = text.match(pattern);
+      if (m) {
+        if (pattern === modelPatterns[0]) {
+          targetHandleOrId = m[1];
+          rawModel = m[2];
+        } else if (pattern === modelPatterns[1]) {
+          rawModel = m[1];
+          targetHandleOrId = m[2];
+        } else {
+          rawModel = m[1];
+        }
+        break;
+      }
+    }
+
+    if (rawModel) {
+      const cleanModel = rawModel.trim().toLowerCase();
+      const normalizedModel = /^(low|small|smaller|cheap|cheapest|fast|faster|light|lite|haiku|flash|mini)$/i.test(cleanModel)
+        ? "utility"
+        : /^(high|large|larger|pro|sonnet|opus|heavy|strong)$/i.test(cleanModel)
+          ? "planner"
+          : rawModel;
+
+      const targets: AgentRun[] = [];
+      if (targetHandleOrId) {
+        for (const agent of allAgents) {
+          const handleClean = agent.handle.replace(/^@/, "").toLowerCase();
+          const baseName = handleClean.split("-")[0];
+          const agentId = agent.id.toLowerCase();
+          if (
+            targetHandleOrId.toLowerCase() === handleClean ||
+            targetHandleOrId.toLowerCase() === baseName ||
+            targetHandleOrId.toLowerCase() === agentId
+          ) {
+            targets.push(agent);
+          }
+        }
+      }
+      const finalTargets = targets.length > 0 ? targets : workingAgents;
+
+      return {
+        isControlAction: true,
+        actionType: "switch_model",
+        targetAgents: finalTargets,
+        targetModel: normalizedModel,
+        description: `Switch model for ${finalTargets.map((a) => a.handle).join(", ") || "active agents"} to ${normalizedModel}`.trim(),
+      };
+    }
+
+    // 3. Check for Pause / Sleep
+    const pausePattern = /^(?:pause|sleep|hold\s+execution)\b/i;
+    if (pausePattern.test(text)) {
+      return {
+        isControlAction: true,
+        actionType: "pause",
+        description: "Pause task execution request",
+      };
+    }
+
+    // 4. Check for Resume / Unpause
+    const resumePattern = /^(?:resume|unpause|continue\s+execution)\b/i;
+    if (resumePattern.test(text)) {
+      return {
+        isControlAction: true,
+        actionType: "resume",
+        description: "Resume task execution request",
+      };
+    }
+
+    return { isControlAction: false };
+  }
+
+  /**
+   * Evaluates a periodic sub-agent checkpoint document in real-time.
+   * Intimates the Outer Loop supervisor LLM to decide course correction ("redirect"),
+   * early acceptance ("accept"), or continuing execution ("continue").
+   */
+  public async handlePeriodicCheckpoint(
+    taskId: string,
+    event: { agentId: string; turn: number; checkpointPath: string; summary: string; continuations?: number },
+    plan: TaskPlan,
+  ): Promise<void> {
+    const agents = await this.store.getAgents(taskId);
+    const agent = agents.find((a) => a.id === event.agentId);
+    if (!agent || ["completed", "failed", "exited"].includes(agent.status)) return;
+
+    const subtask = plan.subtasks.find((s) => s.id === agent.subtaskId);
+    if (!subtask) return;
+
+    logOuter(taskId, "evaluating periodic subagent checkpoint", {
+      agentId: event.agentId,
+      turn: event.turn,
+      checkpointPath: event.checkpointPath,
+    });
+
+    const criteriaStr = Array.isArray(subtask.successCriteria)
+      ? subtask.successCriteria.join("; ")
+      : String(subtask.successCriteria ?? "");
+
+    const decision = await this.supervisor.assess(taskId, {
+      missionGoal: plan.goal,
+      subtaskTitle: subtask.title,
+      successCriteria: criteriaStr,
+      checkpointSummary: event.summary,
+      artifacts: [{ path: event.checkpointPath, description: `Turn ${event.turn} periodic checkpoint` }],
+      continuations: event.continuations ?? 0,
+      maxContinuations: 3,
+    });
+
+    if (this.applySupervisorPlanChanges(plan, subtask, decision)) {
+      await this.store.savePlan(taskId, plan);
+      await this.bus.publish(`task.${taskId}.plan_updated`, plan);
+    }
+
+    if (decision.action === "redirect" && decision.handsOn) {
+      logOuter(taskId, "supervisor course correction issued for subagent checkpoint", {
+        agentId: event.agentId,
+        reason: decision.reason,
+      });
+      agentControl.post(event.agentId, {
+        type: "redirect",
+        handsOn: decision.handsOn,
+        reason: `Periodic checkpoint turn ${event.turn} course correction: ${decision.reason}`,
+      });
+      await this.bus.publish(`task.${taskId}.started`, {
+        kind: "status",
+        from: "orchestrator",
+        taskId,
+        state: "working",
+        note: `🧭 Supervisor reviewed turn ${event.turn} checkpoint for @${agent.handle.replace(/^@/, "")} → Course correcting: ${decision.reason}`,
+      });
+    } else if (decision.action === "accept") {
+      logOuter(taskId, "supervisor accepted checkpoint early", { agentId: event.agentId });
+      agentControl.post(event.agentId, {
+        type: "stop",
+        reason: `Supervisor accepted deliverables at turn ${event.turn} checkpoint.`,
+      });
+    } else {
+      await this.bus.publish(`task.${taskId}.agent.${event.agentId}.thought`, {
+        kind: "thought",
+        from: event.agentId,
+        content: `👔 Supervisor reviewed turn ${event.turn} checkpoint → on track, continuing execution. Rationale: ${decision.reason}`,
+      });
+    }
+  }
+
+  /** Apply supervisor-discovered work to the live plan, including micro-steps. */
+  private applySupervisorPlanChanges(plan: TaskPlan, currentSubtask: Subtask, decision: SupervisorDecision): boolean {
+    let changed = false;
+    for (const newSt of decision.newSubtasks ?? []) {
+      if (plan.subtasks.some((existing) => existing.id === newSt.id)) continue;
+      const formatted: Subtask = {
+        id: newSt.id,
+        title: newSt.title,
+        roles: newSt.roles?.length ? newSt.roles : ["FilesAgent"],
+        capabilities: newSt.capabilities?.length ? newSt.capabilities as Subtask["capabilities"] : ["files"],
+        dependsOn: newSt.dependsOn?.length ? newSt.dependsOn : [currentSubtask.id],
+        riskLevel: (newSt.riskLevel || "medium") as Subtask["riskLevel"],
+        successCriteria: newSt.successCriteria || "Complete the follow-up deliverable",
+        state: "pending",
+        // Do not materialize micro-steps for work that has not started. The
+        // future worker owns its breakdown and may discover a better sequence.
+        subSubtasks: undefined,
+      };
+      plan.subtasks.push(formatted);
+      changed = true;
+    }
+    for (const newStep of decision.newSubSubtasks ?? []) {
+      const parentId = newStep.parentSubtaskId || currentSubtask.id;
+      const parent = plan.subtasks.find((subtask) => subtask.id === parentId);
+      if (!parent) continue;
+      parent.subSubtasks ??= [];
+      const id = newStep.id || `${parent.id}.${parent.subSubtasks.length + 1}`;
+      if (parent.subSubtasks.some((step) => step.id === id || step.title === newStep.title)) continue;
+      parent.subSubtasks.push({ id, title: newStep.title, state: "pending", result: newStep.result });
+      changed = true;
+    }
+    return changed;
+  }
+
+  /** Keep the child checklist consistent with a terminal parent decision. */
+  private reconcileSubSubtasks(subtask: Subtask, state: "completed" | "failed", summary: string): void {
+    for (const step of subtask.subSubtasks ?? []) {
+      if (step.state === "completed" || step.state === "failed") continue;
+      step.state = state;
+      step.completedAt = new Date().toISOString();
+      if (!step.result) {
+        step.result = state === "completed"
+          ? `Completed as part of the accepted subtask. ${summary.slice(0, 240)}`
+          : `Not completed because the parent subtask failed. ${summary.slice(0, 240)}`;
+      }
     }
   }
 
@@ -674,8 +1197,8 @@ export class OuterLoop {
         dependencyOutputs: producerOutputs,
         retryDirective: `An independent verifier FAILED the current deliverable. Fix it in place so it satisfies the success criteria — do NOT start over.\n\nVerifier findings:\n${findings}\n\nEvidence:\n${evidence}`,
         handsOnPath: `${fixWorkspace}/handsOn.md`,
-        proofOfWorkPath: `${fixWorkspace}/proofOfWork.md`,
         handOffPath: `${fixWorkspace}/handOff.md`,
+        executionContract: plan.executionContract,
       });
       try {
         const fixResult = await this.runInnerLoop({ agentId: fixAgent.id, taskId, templateName: producerTemplate, instruction: fixBrief, model: producer?.model });
@@ -700,8 +1223,8 @@ export class OuterLoop {
         dependencyOutputs: producerOutputs,
         retryDirective: `Re-verify the deliverable after fix round ${round}. A previous verification failed with:\n${findings}\nConfirm whether those issues are now resolved.`,
         handsOnPath: `${verifyWorkspace}/handsOn.md`,
-        proofOfWorkPath: `${verifyWorkspace}/proofOfWork.md`,
         handOffPath: `${verifyWorkspace}/handOff.md`,
+        executionContract: plan.executionContract,
       });
       try {
         const reVerify: any = await this.runInnerLoop({ agentId: reVerifyAgent.id, taskId, templateName: verifyTemplate, instruction: verifyBrief, model: verifySubtask.model });
@@ -734,13 +1257,30 @@ export class OuterLoop {
     logOuter(taskId, "subtask starting", {
       subtaskId: subtask.id,
       title: subtask.title,
-      capability: subtask.capability,
-      agentTemplate: subtask.agentTemplate,
+      roles: subtask.roles,
+      capabilities: subtask.capabilities,
       plannedModel: subtask.model,
       dependsOn: subtask.dependsOn,
     });
     subtaskStates[subtask.id] = "running";
     subtask.state = "running";
+    const subtaskRunStartedAtMs = Date.now();
+    const hasLegacyVagueStep = subtask.subSubtasks?.some((step) => !validateSubSubtaskTitle(step.title).valid) ?? false;
+    if (!subtask.subSubtasks || subtask.subSubtasks.length === 0 || hasLegacyVagueStep) {
+      const previousSteps = new Map((subtask.subSubtasks ?? []).map((step) => [step.id, step]));
+      subtask.subSubtasks = deriveSubSubtasksFromSubtask(subtask);
+      // Keep durable completion evidence when upgrading a plan created by the
+      // old procedural step generator.
+      subtask.subSubtasks.forEach((step) => {
+        const previous = previousSteps.get(step.id);
+        if (previous?.state === "completed") {
+          step.state = "completed";
+          step.result = previous.result;
+        }
+      });
+    } else if (subtask.subSubtasks.length > 0 && subtask.subSubtasks.every((sst) => sst.state === "pending")) {
+      subtask.subSubtasks[0].state = "running";
+    }
     await this.store.savePlan(taskId, plan);
     await this.bus.publish(`task.${taskId}.plan_updated`, plan);
 
@@ -820,6 +1360,13 @@ export class OuterLoop {
             : requestedModel ? "backup" : "template-default-retry";
       const resolution = await this.resolveModel(taskId, requestedModel);
       const selectedModel = resolution.model;
+      await this.bus.publish(`task.${taskId}.started`, {
+        kind: "status",
+        from: "orchestrator",
+        taskId,
+        state: "working",
+        note: `🧩 Assigning ${templateName} to ${subtask.id}${selectedModel ? ` on ${selectedModel}` : " using the configured worker model"}.`,
+      });
       const agent = await this.createAgentRun(taskId, subtask, currentStep, templateName);
       if (selectedModel) {
         agent.modelRole = selectedModel;
@@ -863,28 +1410,60 @@ export class OuterLoop {
       const retryDirective = supervisorRedirect
         ? `Supervisor course-correction from the team lead who reviewed the previous checkpoint:\n${supervisorRedirect}\n\nContinue from the existing artifacts; do not restart from scratch.\n\nCheckpoint artifacts:\n${lastIncompleteArtifacts.map((artifact) => `- ${artifact.path}: ${artifact.description}`).join("\n") || "- None recorded."}`
         : differentApproachAttempted
-        ? `Previous agents failed ${identicalErrors} consecutive times with: "${lastErrorMessage}". Attempt a COMPLETELY DIFFERENT approach — do not repeat the failed strategy.`
+        ? `Previous agents failed ${identicalErrors} consecutive times with: "${lastErrorMessage}". Attempt a COMPLETELY DIFFERENT approach — do not repeat the failed strategy. First inspect the existing workspace and handoff artifacts; do not recreate scripts or overwrite a valid deliverable unless evidence requires it.`
         : lastIncompleteSummary
-          ? `Previous agent reached its timebox and produced an incomplete handoff instead of a final deliverable. Continue from the listed artifacts; do not restart unless the evidence is insufficient.\n\nCheckpoint summary:\n${lastIncompleteSummary}\n\nCheckpoint artifacts:\n${lastIncompleteArtifacts.map((artifact) => `- ${artifact.path}: ${artifact.description}`).join("\n") || "- None recorded."}`
+          ? `Previous agent reached its timebox and produced an incomplete handoff instead of a final deliverable. Continue from the listed artifacts; do not restart unless the evidence is insufficient. Do not recreate scripts or overwrite valid files before inspecting them.\n\nCheckpoint summary:\n${lastIncompleteSummary}\n\nCheckpoint artifacts:\n${lastIncompleteArtifacts.map((artifact) => `- ${artifact.path}: ${artifact.description}`).join("\n") || "- None recorded."}`
           : attempts > 1 && lastErrorMessage
-            ? `A previous attempt to execute this subtask failed with the following error: "${lastErrorMessage}". Please check the existing files in the workspace and correct any mistakes to resolve this issue.`
+            ? `A previous attempt to execute this subtask failed with the following error: "${lastErrorMessage}". First inspect the existing files, scripts, handoff, and failure evidence. Correct in place where possible; do not blindly recreate the producer script or regenerate an existing deliverable.\n\nKnown workspace artifacts:\n${lastIncompleteArtifacts.map((artifact) => `- ${artifact.path}`).join("\n") || "- Inventory unavailable; list the workspace before acting."}`
             : ctx.resumeDirective
               ? ctx.resumeDirective
         : undefined;
 
       const preparedDependencyOutputs = this.readDependencyEvidence(dependencyOutputs);
+      // Skills are opt-in and bounded. Never attach the whole skill catalog or
+      // unbounded reference markdown to every worker prompt.
+      const inferredSkills = getMatchingSkills(`${subtask.title} ${subtask.successCriteria}`);
+      const plannedSkills = (subtask.skills ?? [])
+        .map((skillId) => getSkill(skillId))
+        .filter((skill): skill is NonNullable<typeof skill> => Boolean(skill));
+      const relevantPlannedSkills = inferredSkills.length > 0
+        ? plannedSkills.filter((skill) => inferredSkills.some((inferred) => inferred.id === skill.id))
+        : plannedSkills;
+      const contextPolicy = plan.executionContract?.contextPolicy;
+      const skills = Array.from(new Map([...relevantPlannedSkills, ...inferredSkills].map((skill) => [skill.id, skill])).values()).map((skill) => ({
+        ...skill,
+        content: contextPolicy?.includeFullSkillDocs === false ? "" : skill.content.slice(0, 6_000),
+      }));
+      await this.bus.publish(`task.${taskId}.agent.${agent.id}.thought`, {
+        kind: "thought",
+        from: agent.id,
+        content: `Skill preflight — selected: ${skills.length > 0 ? skills.map((skill) => skill.id).join(", ") : "none"}. The worker must read only these instructions before using tools.`,
+        metadata: {
+          event: "skill_preflight",
+          subtaskId: subtask.id,
+          selectedSkills: skills.map((skill) => skill.id),
+        },
+      });
       const instruction = buildAgentBrief({
+        role: ["VerifierAgent", "QaTesterAgent", "CvTesterAgent"].includes(templateName) ? "verifier" : "worker",
         missionGoal: plan.goal,
         subtaskTitle: subtask.title,
         successCriteria: subtask.successCriteria,
+        roles: subtask.roles,
+        capabilities: subtask.capabilities,
         dependencyOutputs: preparedDependencyOutputs,
+        maxDependencyChars: contextPolicy?.maxDependencyChars,
         retryDirective,
         handsOnPath: `${workspacePrefix}/handsOn.md`,
-        proofOfWorkPath: `${workspacePrefix}/proofOfWork.md`,
         handOffPath: `${workspacePrefix}/handOff.md`,
         workspaceArtifactPaths: ["VerifierAgent", "QaTesterAgent", "CvTesterAgent"].includes(templateName)
           ? this.listWorkspaceArtifactPaths()
           : undefined,
+        subSubtasks: subtask.subSubtasks,
+        skills,
+        executionContract: plan.executionContract,
+        contextPolicy,
+        maxContextChars: contextPolicy ? contextPolicy.maxInputTokens * 4 : undefined,
       });
       this.writeHandsOnBrief(agent, instruction);
       // Persist the concise live assignment on the agent card; the complete
@@ -904,14 +1483,74 @@ export class OuterLoop {
       const result = await this.runInnerLoop({
           agentId: agent.id,
           taskId,
+          subtaskId: subtask.id,
           templateName,
+          roleNames: subtask.roles,
+          capabilities: subtask.capabilities,
           instruction,
           contextArtifacts: lastIncompleteArtifacts.map((artifact) => artifact.path),
           model: selectedModel,
+          subSubtasks: subtask.subSubtasks || deriveSubSubtasksFromSubtask(subtask),
+          executionContract: plan.executionContract,
+          skillIds: skills.map((skill) => skill.id),
+          contextSections: {
+            skillChars: contextPolicy?.includeFullSkillDocs === false
+              ? 0
+              : skills.reduce((total, skill) => total + skill.description.length + skill.content.length, 0),
+            dependencyChars: preparedDependencyOutputs.reduce((total, dependency) => total + dependency.summary.length + dependency.title.length, 0),
+            fileExcerptChars: 0,
+            included: [
+              "assignment",
+              ...(skills.length > 0 ? [contextPolicy?.includeFullSkillDocs === false ? "skill-identifiers" : "skill-documents"] : []),
+              ...(preparedDependencyOutputs.length > 0 ? ["dependency-summaries"] : []),
+              "execution-contract",
+            ],
+            omitted: [
+              "older-tool-history",
+              ...(contextPolicy?.includeFullSkillDocs === false ? ["full-skill-documents"] : []),
+              "unrelated-dependencies",
+            ],
+          },
         });
 
         const summary = result.summary || JSON.stringify(result);
         const resultArtifacts = [handsOnArtifact, ...(result.artifacts ?? [])];
+        const permissionBlockReasons = Array.isArray((result as any).permissionBlockReasons)
+          ? (result as any).permissionBlockReasons.map(String)
+          : [];
+        const permissionArtifactGaps = this.requiredArtifactGaps(subtask, resultArtifacts, plan.goal);
+        // Permission/capability denials are terminal for this assignment. A
+        // replacement agent receives the same contract and cannot solve the
+        // boundary; spawning one only repeats the failure and burns tokens.
+        // If the agent nevertheless completed every required artifact, the
+        // denial was optional and normal completion remains valid.
+        if ((result as any).permissionBlocked === true
+          && (result.incomplete === true || permissionArtifactGaps.length > 0)) {
+          const reason = permissionBlockReasons.length > 0
+            ? permissionBlockReasons.join(" | ")
+            : "The assigned agent was denied a required tool or permission.";
+          const blockerSummary = `Subtask blocked: ${reason}`;
+          subtaskStates[subtask.id] = "failed";
+          subtask.state = "failed";
+          subtask.result = blockerSummary;
+          subtask.artifacts = resultArtifacts;
+          this.reconcileSubSubtasks(subtask, "failed", blockerSummary);
+          agent.status = "failed";
+          agent.finishedAt = new Date().toISOString();
+          agent.summary = blockerSummary;
+          await this.recordAgentLifecycle(agent);
+          await this.store.savePlan(taskId, plan);
+          await this.bus.publish(`task.${taskId}.plan_updated`, plan);
+          await this.bus.publish(`task.${taskId}.started`, {
+            kind: "status",
+            from: "orchestrator",
+            taskId,
+            state: "working",
+            note: `⛔ ${subtask.title} is blocked by a permission/capability denial. No replacement agent was spawned. ${reason}`,
+          });
+          facts.push(blockerSummary);
+          continue;
+        }
         if (result.incomplete) {
           subtask.result = summary;
           subtask.artifacts = resultArtifacts;
@@ -924,6 +1563,45 @@ export class OuterLoop {
           agent.finishedAt = new Date().toISOString();
           agent.summary = summary;
           await this.recordAgentLifecycle(agent);
+
+          // A deterministic no-progress stop is already a completed safety
+          // decision by the inner loop. It is not a timebox checkpoint and it
+          // must not enter the supervisor continuation path: doing so creates
+          // a fresh agent with the same contract, which repeats the same tool
+          // failure and burns model calls. Preserve the handoff as the source
+          // of truth and fail this subtask without spawning a replacement.
+          if ((result as any).stopReason === "no-progress") {
+            subtaskStates[subtask.id] = "failed";
+            subtask.state = "failed";
+            this.reconcileSubSubtasks(subtask, "failed", summary);
+            facts.push(`Subtask ${subtask.id} stopped after deterministic no-progress detection. No replacement was spawned. ${summary}`);
+            await this.store.savePlan(taskId, plan);
+            await this.bus.publish(`task.${taskId}.plan_updated`, plan);
+            logOuter(taskId, "attempt stopped after no-progress detection", {
+              subtaskId: subtask.id,
+              attempt: attempts,
+              agentId: agent.id,
+              replacementSuppressed: true,
+            });
+            continue;
+          }
+
+          if (isAssignmentContextRefusal(summary)) {
+            subtaskStates[subtask.id] = "failed";
+            subtask.state = "failed";
+            this.reconcileSubSubtasks(subtask, "failed", summary);
+            facts.push(`Subtask ${subtask.id} stopped after refusing the supplied assignment context. No replacement was spawned. ${summary}`);
+            await this.store.savePlan(taskId, plan);
+            await this.bus.publish(`task.${taskId}.plan_updated`, plan);
+            logOuter(taskId, "attempt stopped after assignment-context refusal", {
+              subtaskId: subtask.id,
+              attempt: attempts,
+              agentId: agent.id,
+              replacementSuppressed: true,
+            });
+            continue;
+          }
+
           continuations++;
           logOuter(taskId, "attempt checkpointed incomplete", {
             subtaskId: subtask.id,
@@ -968,6 +1646,9 @@ export class OuterLoop {
             subtask.state = "completed";
             subtask.result = summary;
             subtask.artifacts = resultArtifacts;
+            subtask.relevantArtifactPaths = (decision.relevantArtifactPaths ?? [])
+              .filter((artifactPath) => resultArtifacts.some((artifact) => artifact.path === artifactPath));
+            this.reconcileSubSubtasks(subtask, "completed", summary);
             facts.push(`Subtask ${subtask.id} accepted by supervisor at checkpoint. Summary: ${summary}`);
             completedOutputs.set(subtask.id, { id: subtask.id, title: subtask.title, summary, artifacts: resultArtifacts });
             await this.store.savePlan(taskId, plan);
@@ -978,6 +1659,7 @@ export class OuterLoop {
           if (decision.action === "fail" || continuations >= maxContinuations) {
             subtaskStates[subtask.id] = "failed";
             subtask.state = "failed";
+            this.reconcileSubSubtasks(subtask, "failed", summary);
             const why =
               decision.action === "fail"
                 ? `Supervisor stopped it: ${decision.reason}`
@@ -1011,7 +1693,7 @@ export class OuterLoop {
         // A verify subtask that returns a "failed" verdict is NOT a done subtask.
         // Negotiate a bounded fix→re-verify loop before accepting the outcome,
         // instead of letting the failure fall straight through to a run abort.
-        if (subtask.capability === "verify" && (result as any).status === "failed") {
+        if (subtask.capabilities.includes("verify") && (result as any).status === "failed") {
           await this.recordVerificationFindings(taskId, plan, subtask, agent, result as any);
           await this.recordPlanCorrection(taskId, plan, {
             subtaskId: subtask.id,
@@ -1028,6 +1710,7 @@ export class OuterLoop {
             subtaskStates[subtask.id] = "failed";
             subtask.state = "failed";
             subtask.result = outcome.summary || summary;
+            this.reconcileSubSubtasks(subtask, "failed", outcome.summary || summary);
             await this.store.savePlan(taskId, plan);
             await this.bus.publish(`task.${taskId}.plan_updated`, plan);
             facts.push(`Subtask ${subtask.id} failed verification after fix rounds. ${outcome.summary}`);
@@ -1038,6 +1721,7 @@ export class OuterLoop {
           subtask.state = "completed";
           subtask.result = outcome.summary || summary;
           subtask.artifacts = resultArtifacts;
+          this.reconcileSubSubtasks(subtask, "completed", outcome.summary || summary);
           await this.store.savePlan(taskId, plan);
           await this.bus.publish(`task.${taskId}.plan_updated`, plan);
           facts.push(`Subtask ${subtask.id} passed after ${resolveMaxVerificationRounds()}-round fix negotiation. Summary: ${outcome.summary || summary}`);
@@ -1048,6 +1732,39 @@ export class OuterLoop {
         }
 
         const artifactGaps = this.requiredArtifactGaps(subtask, resultArtifacts, plan.goal);
+        const declaredImplementationSteps = (subtask.subSubtasks ?? []).filter(
+          (step) => !/\b(?:verify|validate|test|confirm|render|inspect)\b/i.test(step.title),
+        );
+        const implementationEvidenceComplete = declaredImplementationSteps.length > 0
+          && declaredImplementationSteps.every((step) => step.state === "completed");
+        // A worker's queued actions can finish every implementation micro-step
+        // with concrete artifacts before its prose response arrives. In that
+        // case, do not spend another supervisor LLM turn deciding whether the
+        // already-proven implementation is complete. Verification children,
+        // when present, deliberately prevent this fast path.
+        if (artifactGaps.length === 0 && implementationEvidenceComplete && !subtask.capabilities.includes("verify")) {
+          subtaskStates[subtask.id] = "completed";
+          subtask.state = "completed";
+          subtask.result = summary;
+          subtask.artifacts = resultArtifacts;
+          this.reconcileSubSubtasks(subtask, "completed", summary);
+          await this.store.savePlan(taskId, plan);
+          await this.bus.publish(`task.${taskId}.plan_updated`, plan);
+          await this.bus.publish(`task.${taskId}.started`, {
+            kind: "status",
+            from: "orchestrator",
+            taskId,
+            state: "working",
+            note: `✅ ${subtask.id} completed from artifact and micro-step evidence; supervisor LLM not required.`,
+          });
+          facts.push(`Subtask ${subtask.id} finished from concrete artifact and implementation-step evidence. Summary: ${summary}`);
+          completedOutputs.set(subtask.id, { id: subtask.id, title: subtask.title, summary, artifacts: resultArtifacts });
+          agent.status = "completed";
+          agent.finishedAt = new Date().toISOString();
+          agent.summary = summary;
+          await this.recordAgentLifecycle(agent);
+          continue;
+        }
         const completionReview = await this.supervisor.assess(taskId, {
           missionGoal: plan.goal,
           subtaskTitle: subtask.title,
@@ -1061,15 +1778,25 @@ export class OuterLoop {
           continuations,
           maxContinuations,
         });
-        const effectiveCompletionReview = artifactGaps.length > 0 && completionReview.action !== "fail"
+        const workerRefusedAssignment = isAssignmentContextRefusal(summary);
+        const effectiveCompletionReview = workerRefusedAssignment
+          ? {
+              action: "fail" as const,
+              reason: "Worker refused the assignment context already supplied in its brief; no replacement agent will be spawned.",
+              relevantArtifactPaths: completionReview.relevantArtifactPaths,
+            }
+          : artifactGaps.length > 0 && completionReview.action !== "fail"
           ? {
               action: "redirect" as const,
               reason: `Required deliverables are missing: ${artifactGaps.join(" ")}`,
               handsOn: `${completionReview.handsOn ? `${completionReview.handsOn}\n\n` : ""}Do not stop at the Markdown outline. Produce the missing concrete deliverables now: ${artifactGaps.join(" ")} Inspect the existing files first and continue from them.`,
               nextAgentTemplate: completionReview.nextAgentTemplate,
               nextModel: completionReview.nextModel,
+              relevantArtifactPaths: completionReview.relevantArtifactPaths,
             }
           : completionReview;
+        subtask.relevantArtifactPaths = (effectiveCompletionReview.relevantArtifactPaths ?? [])
+          .filter((artifactPath) => resultArtifacts.some((artifact) => artifact.path === artifactPath));
         await this.recordPlanCorrection(taskId, plan, {
           subtaskId: subtask.id,
           agentId: agent.id,
@@ -1119,6 +1846,7 @@ export class OuterLoop {
           subtask.state = "failed";
           subtask.result = summary;
           subtask.artifacts = resultArtifacts;
+          this.reconcileSubSubtasks(subtask, "failed", summary);
           facts.push(`Subtask ${subtask.id} failed supervisor validation after agent execution. ${effectiveCompletionReview.reason}`);
           agent.status = "failed";
           agent.finishedAt = new Date().toISOString();
@@ -1133,6 +1861,20 @@ export class OuterLoop {
         subtask.state = "completed";
         subtask.result = summary;
         subtask.artifacts = resultArtifacts;
+        this.reconcileSubSubtasks(subtask, "completed", summary);
+
+        // Dynamic replanning is applied to the live plan, including newly
+        // discovered micro-steps. The execution queue below intentionally
+        // references plan.subtasks, so these tasks are picked up immediately.
+        if (this.applySupervisorPlanChanges(plan, subtask, completionReview)) {
+          for (const added of plan.subtasks) {
+            if (subtaskStates[added.id] === undefined) {
+              subtaskStates[added.id] = "pending";
+              facts.push(`Dynamic re-planning added follow-up subtask ${added.id}: ${added.title}`);
+            }
+          }
+        }
+
         await this.store.savePlan(taskId, plan);
         await this.bus.publish(`task.${taskId}.plan_updated`, plan);
         facts.push(`Subtask ${subtask.id} finished. Summary: ${summary}`);
@@ -1163,6 +1905,24 @@ export class OuterLoop {
         identicalErrors = fingerprint === lastErrorFingerprint ? identicalErrors + 1 : 1;
         lastErrorFingerprint = fingerprint;
         lastErrorMessage = err.message;
+        const retryInventory = this.listRetryArtifactInventory(
+          agent.id,
+          subtaskRunStartedAtMs,
+        );
+        if (retryInventory.length > 0) {
+          const merged = [...lastIncompleteArtifacts, ...retryInventory];
+          lastIncompleteArtifacts = merged.filter((artifact, index, list) => list.findIndex((item) => item.path === artifact.path) === index);
+          const handoffEvidence = this.readRetryHandoffEvidence(retryInventory);
+          if (handoffEvidence) {
+            lastIncompleteSummary = `Previous agent failure evidence recovered from the shared workspace:\n\n${handoffEvidence}`;
+          }
+          logOuter(taskId, "captured existing workspace inventory before retry", {
+            subtaskId: subtask.id,
+            failedAgentId: agent.id,
+            artifactCount: lastIncompleteArtifacts.length,
+            handoffEvidenceChars: handoffEvidence?.length ?? 0,
+          });
+        }
         warnOuter(taskId, "attempt failed", {
           subtaskId: subtask.id,
           attempt: attempts,
@@ -1175,7 +1935,9 @@ export class OuterLoop {
         });
 
         const loopDetected = identicalErrors >= MAX_IDENTICAL_ERRORS;
-        const terminalFailure = (loopDetected && differentApproachAttempted) || errorAttempts >= maxAttempts;
+        const deterministicProviderError = isDeterministicProviderRequestError(err);
+        const emptyArtifactError = isEmptyArtifactError(err);
+        const terminalFailure = emptyArtifactError || (loopDetected && differentApproachAttempted) || errorAttempts >= maxAttempts;
         // An attempt can fail while the subtask remains recoverable. Keep that
         // worker out of the FAILED state until YAAA has exhausted its bounded
         // correction/replacement policy.
@@ -1187,7 +1949,11 @@ export class OuterLoop {
         await this.recordAgentLifecycle(agent);
         console.error(`Subtask ${subtask.id} attempt ${attempts} failed:`, err);
 
-        const correctiveSteps = loopDetected
+        const correctiveSteps = emptyArtifactError
+          ? `Required output is empty or invalid. Stop this producer attempt and preserve the exact evidence; YAAA will not spend another model turn looping on an invalid artifact.`
+          : deterministicProviderError
+          ? `Diagnose the provider request rejection from the exact error and preserve the existing workspace. YAAA will not spawn a replacement that could repeat the same request or regenerate artifacts.`
+          : loopDetected
           ? `Stop repeating the failed approach. YAAA will replace this attempt with a different approach after reviewing the repeated error.`
           : `Inspect the existing artifacts, verify the failing tool/model transcript, and retry with the corrected assignment context.`;
         // A worker failure is a conversation with YAAA, not a silent agent
@@ -1205,14 +1971,94 @@ export class OuterLoop {
           from: "orchestrator",
           taskId,
           state: "working",
-          note: `@${agent.handle.replace(/^@/, "")} I received the failure report. Corrective steps: ${correctiveSteps}`,
+          note: `@${agent.handle.replace(/^@/, "")} I received the failure report (${deterministicProviderError ? "provider request error" : "agent execution error"}). Corrective steps: ${correctiveSteps}`,
         });
         await this.recordPlanCorrection(taskId, plan, {
           subtaskId: subtask.id,
           agentId: agent.id,
-          action: loopDetected ? "different-approach" : "retry",
-          reason: err.message,
+          action: deterministicProviderError ? "diagnose-request-error" : loopDetected ? "different-approach" : "retry",
+          reason: `${deterministicProviderError ? "Deterministic provider request rejection: " : ""}${err.message}`,
         });
+
+        if (emptyArtifactError) {
+          subtaskStates[subtask.id] = "failed";
+          subtask.state = "failed";
+          this.reconcileSubSubtasks(subtask, "failed", err.message);
+          await this.store.savePlan(taskId, plan);
+          await this.bus.publish(`task.${taskId}.plan_updated`, plan);
+          facts.push(`Subtask ${subtask.id} stopped because a required artifact was zero bytes. Error: ${err.message}`);
+          currentStep = allocateStep();
+          continue;
+        }
+
+        // A 400/request-shape failure cannot be repaired by a fresh agent. The
+        // failed handoff and exact provider error remain the source of truth;
+        // stop this subtask before the retry/kill-switch path can create a
+        // replacement that starts over in the same workspace.
+        if (deterministicProviderError) {
+          const existingArtifactGaps = this.requiredArtifactGaps(subtask, lastIncompleteArtifacts, plan.goal);
+          const concreteExistingArtifacts = lastIncompleteArtifacts.filter((artifact) =>
+            !/(?:^|\/)agent-workspaces\//i.test(artifact.path)
+            && !/\.(?:md|markdown|txt)$/i.test(artifact.path)
+            && !/\/\.(?:yaaa|git)\//i.test(artifact.path),
+          );
+          if (existingArtifactGaps.length === 0 && concreteExistingArtifacts.length > 0) {
+            subtaskStates[subtask.id] = "completed";
+            subtask.state = "completed";
+            subtask.result = `The provider rejected the final tool transcript, but all required artifacts were already present. ${err.message}`;
+            subtask.artifacts = lastIncompleteArtifacts;
+            this.reconcileSubSubtasks(subtask, "completed", subtask.result);
+            await this.store.savePlan(taskId, plan);
+            await this.bus.publish(`task.${taskId}.plan_updated`, plan);
+            facts.push(`Subtask ${subtask.id} accepted from existing artifacts after a deterministic provider error; downstream verification may continue.`);
+            currentStep = allocateStep();
+            continue;
+          }
+          subtaskStates[subtask.id] = "failed";
+          subtask.state = "failed";
+          this.reconcileSubSubtasks(subtask, "failed", err.message);
+          warnOuter(taskId, "subtask stopped after deterministic provider request error", {
+            subtaskId: subtask.id,
+            attempt: attempts,
+            error: err.message,
+            retrySuppressed: true,
+          });
+          await this.store.savePlan(taskId, plan);
+          await this.bus.publish(`task.${taskId}.plan_updated`, plan);
+          facts.push(`Subtask ${subtask.id} stopped without replacement after a deterministic provider request error. Error: ${err.message}`);
+          currentStep = allocateStep();
+          continue;
+        }
+
+        // A provider/model availability error is not an agent reasoning
+        // failure. Retrying it with a fresh agent and the same model only
+        // creates a misleading swarm of identical failures. Disable that
+        // model for this mission and resolve a different live candidate.
+        const failedModel = selectedModel || requestedModel;
+        if (failedModel && isUnavailableModelError(err)) {
+          this.addDisabledModel(taskId, failedModel);
+          const fallbackModel = await this.chooseUnavailableModelFallback(taskId, failedModel, backupModel);
+          if (fallbackModel) {
+            nextModelOverride = fallbackModel;
+            subtask.model = fallbackModel;
+            subtask.modelReason = `The originally selected model ${failedModel} was unavailable at execution time; YAAA switched this subtask to ${fallbackModel}.`;
+            await this.store.savePlan(taskId, plan);
+            await this.bus.publish(`task.${taskId}.plan_updated`, plan);
+            supervisorRedirect = null;
+            differentApproachAttempted = false;
+            identicalErrors = 0;
+            lastErrorFingerprint = null;
+            await this.bus.publish(`task.${taskId}.started`, {
+              kind: "status",
+              from: "orchestrator",
+              taskId,
+              state: "working",
+              note: `🔁 Model ${failedModel} is unavailable. Retrying ${subtask.id} with ${fallbackModel}; no duplicate agent will use the unavailable model.`,
+            });
+            currentStep = allocateStep();
+            continue;
+          }
+        }
 
         // Transient/rate-limit backoff is intentionally NOT done here: the model
         // client already retries 5xx/429 with exponential backoff that honours
@@ -1244,6 +2090,7 @@ export class OuterLoop {
         if (loopDetected || differentApproachAttempted || errorAttempts >= maxAttempts) {
           subtaskStates[subtask.id] = "failed";
           subtask.state = "failed";
+          this.reconcileSubSubtasks(subtask, "failed", err.message);
           warnOuter(taskId, "subtask marked failed", {
             subtaskId: subtask.id,
             attempts,
@@ -1289,7 +2136,9 @@ export class OuterLoop {
       resumeDirective = `A previous attempt to execute this mission failed or was interrupted with the following message:\n"${lastFailedStatus.note || lastFailedStatus.summary || "Unknown error"}"\n\nResume the existing mission, inspect the working directory for any existing files/artifacts from the previous attempt, and continue or fix them to satisfy the goal. Do not restart from scratch unless necessary.`;
     }
 
-    const subtasks = [...plan.subtasks];
+    // Keep a live reference: supervisor course correction can append work while
+    // the outer loop is running. A snapshot silently discarded that work.
+    const subtasks = plan.subtasks;
     const subtaskStates: Record<string, "pending" | "running" | "completed" | "failed"> = {};
     for (const st of subtasks) {
       subtaskStates[st.id] = st.state === "completed" ? "completed" : "pending";
@@ -1323,10 +2172,109 @@ export class OuterLoop {
     let step = Math.max(0, ...priorLedger.map((entry) => entry.step)) + 1;
     const allocateStep = (): number => step++;
     const extensionGrants = new Map<string, number>();
-    // Warm Mesh's catalog once up front so the first agent does not pay the
-    // lookup latency, and so an unreachable catalog is reported before any
-    // subtask starts rather than mid-run.
-    if (this.modelResolver) await this.resolveModel(taskId, undefined);
+    // Do not warm Mesh's catalog before the first dependency stage. Planning
+    // already resolved the selected models, and this second runtime otherwise
+    // performs another network catalog request while the UI appears stuck
+    // after approval. The first subtask resolves its requested model at the
+    // assignment boundary, where any unavailable-model fallback is visible.
+    await this.bus.publish(`task.${taskId}.started`, {
+      kind: "status",
+      from: "orchestrator",
+      taskId,
+      state: "working",
+      note: "Execution dispatcher ready. Selecting the first dependency stage and assigning its sub-agent.",
+    });
+
+    // Subscribe to periodic turn checkpoints from sub-agents
+    let checkpointChain = Promise.resolve();
+    let checkpointCount = 0;
+    this.bus.subscribe(`task.${taskId}.agent_checkpoint`, (event: any) => {
+      if (event?.agentId && event?.checkpointPath) {
+        checkpointCount += 1;
+        checkpointChain = checkpointChain.then(async () => {
+          await this.handlePeriodicCheckpoint(taskId, { ...event, continuations: checkpointCount }, plan);
+          for (const added of plan.subtasks) {
+            if (subtaskStates[added.id] === undefined) subtaskStates[added.id] = "pending";
+          }
+        }).catch((error) => warnOuter(taskId, "periodic checkpoint evaluation failed", { error: error instanceof Error ? error.message : String(error) }));
+      }
+    });
+
+    // Subscribe to sub-subtask completion events from sub-agents
+    this.bus.subscribe(`task.${taskId}.sub_subtask_completed`, async (event: any) => {
+      if (event?.agentId && event?.subSubtask) {
+        logOuter(taskId, "sub-subtask completion notified to outer loop", {
+          agentId: event.agentId,
+          subSubtaskId: event.subSubtask.id,
+          title: event.subSubtask.title,
+        });
+
+        // Sync sub-subtask completion to task plan state
+        const targetSubtask = (event.subtaskId
+          ? plan.subtasks.find((st) => st.id === event.subtaskId)
+          : undefined)
+          ?? plan.subtasks.find((st) => st.subSubtasks?.some((sst) => sst.id === event.subSubtask.id));
+        if (targetSubtask && targetSubtask.subSubtasks) {
+          const eventSteps = Array.isArray(event.allSubSubtasks) ? event.allSubSubtasks : [event.subSubtask];
+          for (const eventStep of eventSteps) {
+            const targetItem = targetSubtask.subSubtasks.find((sst) => sst.id === eventStep.id);
+            if (targetItem) Object.assign(targetItem, eventStep);
+          }
+
+          // Compact plan context if total summary size exceeds 20k token limit
+          const totalSummaryChars = plan.subtasks.reduce((acc, st) => acc + (st.result ? st.result.length : 0), 0);
+          if (totalSummaryChars > 20_000) {
+            const compactedMission = buildMissionSummary({
+              goal: plan.goal,
+              subtasks: plan.subtasks,
+              completedResults: Array.from(completedOutputs.values()),
+              maxChars: 20_000,
+            });
+            logOuter(taskId, "compacted main loop mission state past 20k threshold", { totalSummaryChars });
+            if (!plan.goal.includes("[Compacted Mission Summary]")) {
+              plan.goal = `${plan.goal}\n\n[Compacted Mission Summary]\n${compactedMission}`;
+            }
+          }
+
+          await this.store.savePlan(taskId, plan);
+          await this.bus.publish(`task.${taskId}.plan_updated`, plan);
+        }
+
+        await this.bus.publish(`task.${taskId}.started`, {
+          kind: "status",
+          from: "orchestrator",
+          taskId,
+          state: "working",
+          note: event.note || `✅ Sub-agent completed sub-subtask ${event.subSubtask.id}: ${event.subSubtask.title}`,
+        });
+      }
+    });
+
+    // Workers may discover required micro-steps after execution has started.
+    // Persist those additions into the live plan immediately so the UI and
+    // the next checkpoint see the same breakdown the worker is using.
+    this.bus.subscribe(`task.${taskId}.sub_subtask_added`, async (event: any) => {
+      if (!event?.agentId || !event?.subSubtask) return;
+      const targetSubtask = plan.subtasks.find((st) => st.id === event.subtaskId)
+        ?? plan.subtasks.find((st) => st.subSubtasks?.some((sst) => sst.id === event.subSubtask.id));
+      if (!targetSubtask) return;
+      targetSubtask.subSubtasks ??= [];
+      const incoming = Array.isArray(event.allSubSubtasks) ? event.allSubSubtasks : [event.subSubtask];
+      for (const step of incoming) {
+        const existing = targetSubtask.subSubtasks.find((candidate) => candidate.id === step.id);
+        if (existing) Object.assign(existing, step);
+        else targetSubtask.subSubtasks.push(step);
+      }
+      await this.store.savePlan(taskId, plan);
+      await this.bus.publish(`task.${taskId}.plan_updated`, plan);
+      await this.bus.publish(`task.${taskId}.started`, {
+        kind: "status",
+        from: "orchestrator",
+        taskId,
+        state: "working",
+        note: event.note || `➕ Added worker-discovered sub-subtask ${event.subSubtask.id}: ${event.subSubtask.title}`,
+      });
+    });
 
     // Outer plan loop
     while (subtasks.some((st) => subtaskStates[st.id] !== "completed" && subtaskStates[st.id] !== "failed")) {
@@ -1345,6 +2293,14 @@ export class OuterLoop {
         }
         throw new Error("Deadlock detected in subtask execution dependency graph.");
       }
+
+      await this.bus.publish(`task.${taskId}.started`, {
+        kind: "status",
+        from: "orchestrator",
+        taskId,
+        state: "working",
+        note: `🧭 Dependency stage ready: ${readySubtasks.map((st) => st.id).join(", ")} can now run after its prerequisites completed.`,
+      });
 
       // Run every currently-ready subtask concurrently. This batch is mutually
       // independent by construction: a subtask only becomes "ready" once all of
@@ -1397,6 +2353,11 @@ export class OuterLoop {
     if (failedTasks.length > 0) {
       throw new Error("Task execution failed due to subtask failure.");
     }
+
+    // Checkpoint assessments are serialized but asynchronous; finish the
+    // queued reviews before declaring the mission complete so a last-minute
+    // redirect or newly discovered task cannot be lost at shutdown.
+    await checkpointChain;
 
     // The run can finish between two event-loop ticks. Drain once more so a
     // message posted during that race cannot remain in the mailbox forever.

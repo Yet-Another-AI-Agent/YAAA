@@ -13,17 +13,28 @@ export type AgentControlDirective =
   | { type: "extend"; additionalMs: number; reason?: string }
   /** Hand the worker a corrected/new assignment to steer it mid-run. */
   | { type: "redirect"; handsOn: string; reason?: string }
+  /** Dynamically upgrade or change the model used by the worker for subsequent turns. */
+  | { type: "switch_model"; newModel: string; reason?: string }
   /** Ask the worker to wind up now and hand off its current progress. */
   | { type: "stop"; reason?: string };
 
 export class AgentControlMailbox {
   private readonly mailboxes = new Map<string, AgentControlDirective[]>();
+  private readonly stoppedAgents = new Set<string>();
 
   /** Queue a directive for an agent. Order is preserved (FIFO). */
   post(agentId: string, directive: AgentControlDirective): void {
+    if (directive.type === "stop") {
+      this.stoppedAgents.add(agentId);
+    }
     const queue = this.mailboxes.get(agentId);
     if (queue) queue.push(directive);
     else this.mailboxes.set(agentId, [directive]);
+  }
+
+  /** Check whether an agent has been requested to stop/exited. */
+  isStopped(agentId: string): boolean {
+    return this.stoppedAgents.has(agentId);
   }
 
   /** Non-destructively check whether an agent has any pending directives. */
@@ -65,6 +76,7 @@ export class AgentControlMailbox {
   /** Drop any pending directives for an agent (call when its run ends). */
   clear(agentId: string): void {
     this.mailboxes.delete(agentId);
+    this.stoppedAgents.delete(agentId);
   }
 }
 

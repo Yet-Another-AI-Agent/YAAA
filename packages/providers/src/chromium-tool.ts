@@ -8,10 +8,22 @@ export class ChromiumTool {
   private sessions = new Map<string, BrowserSession>();
   constructor(private readonly workspaceDir?: string) {}
   async open(options: { id?: string; agentId?: string; headless?: boolean; viewport?: { width: number; height: number }; userAgent?: string } = {}) {
-    const id = options.id ?? crypto.randomUUID(); const browser = await chromium.launch({ headless: options.headless ?? true });
+    const id = options.id ?? crypto.randomUUID();
+    const browser = await chromium.launch({
+      headless: options.headless ?? true,
+      args: ["--disable-features=AutofillServerCommunication,AutofillEnableSupportForMoreStructureInNames"],
+    });
     const context = await browser.newContext({ viewport: options.viewport, userAgent: options.userAgent }); const page = await context.newPage();
     const session: BrowserSession = { browser, context, page, detached: false, consoleErrors: [], networkFailures: [], sequence: 0, workspaceDir: this.workspaceDir, agentId: options.agentId };
-    page.on("console", (message) => { if (message.type() === "error") session.consoleErrors.push(message.text()); });
+    page.on("console", (message) => {
+      if (message.type() === "error") {
+        const text = message.text();
+        if (text.includes("Autofill.enable") || text.includes("Request Autofill.enable failed")) {
+          return;
+        }
+        session.consoleErrors.push(text);
+      }
+    });
     page.on("requestfailed", (request) => { session.networkFailures.push(`${request.method()} ${request.url()} — ${request.failure()?.errorText ?? "failed"}`); });
     this.sessions.set(id, session); return { id };
   }
@@ -23,8 +35,124 @@ export class ChromiumTool {
   async press(id: string, selector: string, key: string) { await this.get(id).page.locator(selector).press(key); return { selector, key, screenshotPath: await this.preview(id) }; }
   async hover(id: string, selector: string) { await this.get(id).page.locator(selector).hover(); return { selector, screenshotPath: await this.preview(id) }; }
   async reload(id: string) { await this.get(id).page.reload({ waitUntil: "domcontentloaded" }); return { url: this.get(id).page.url(), title: await this.get(id).page.title(), screenshotPath: await this.preview(id) }; }
+  async refresh(id: string) { return this.reload(id); }
+  async navigateAndWait(id: string, url: string, options: { waitForSelector?: string; waitUntil?: "domcontentloaded" | "load" | "networkidle"; timeoutMs?: number } = {}) {
+    const session = this.get(id);
+    const waitUntil = options.waitUntil ?? "networkidle";
+    const timeout = options.timeoutMs ?? 30_000;
+    const response = await session.page.goto(url, { waitUntil, timeout });
+    if (options.waitForSelector) {
+      await session.page.locator(options.waitForSelector).waitFor({ timeout });
+    }
+    return { url: session.page.url(), title: await session.page.title(), status: response?.status(), screenshotPath: await this.preview(id) };
+  }
   async back(id: string) { await this.get(id).page.goBack({ waitUntil: "domcontentloaded" }); return { url: this.get(id).page.url(), title: await this.get(id).page.title(), screenshotPath: await this.preview(id) }; }
+  async goBack(id: string) { return this.back(id); }
+  async goBackTimes(id: string, times = 1) {
+    const session = this.get(id);
+    const count = Math.max(1, Math.min(times, 20));
+    for (let i = 0; i < count; i++) {
+      await session.page.goBack({ waitUntil: "domcontentloaded" }).catch(() => null);
+    }
+    return { url: session.page.url(), title: await session.page.title(), stepsBack: count, screenshotPath: await this.preview(id) };
+  }
   async forward(id: string) { await this.get(id).page.goForward({ waitUntil: "domcontentloaded" }); return { url: this.get(id).page.url(), title: await this.get(id).page.title(), screenshotPath: await this.preview(id) }; }
+  async goFront(id: string) { return this.forward(id); }
+  async goForward(id: string) { return this.forward(id); }
+  async goFrontTimes(id: string, times = 1) {
+    const session = this.get(id);
+    const count = Math.max(1, Math.min(times, 20));
+    for (let i = 0; i < count; i++) {
+      await session.page.goForward({ waitUntil: "domcontentloaded" }).catch(() => null);
+    }
+    return { url: session.page.url(), title: await session.page.title(), stepsFront: count, screenshotPath: await this.preview(id) };
+  }
+  async goForwardTimes(id: string, times = 1) { return this.goFrontTimes(id, times); }
+  async multi(id: string, actions: Array<{ action: string; params?: Record<string, any>; actions?: any[] }>): Promise<{ id: string; results: any[]; screenshotPath?: string }> {
+    const results: any[] = [];
+    for (const item of actions) {
+      const act = item.action.toLowerCase();
+      const params = item.params ?? {};
+      let res: any;
+
+      switch (act) {
+        case "navigate":
+          res = await this.navigate(id, params.url, params.timeoutMs);
+          break;
+        case "navigate_and_wait":
+        case "navigateandwait":
+          res = await this.navigateAndWait(id, params.url, params);
+          break;
+        case "click":
+          res = await this.click(id, params.selector);
+          break;
+        case "type":
+          res = await this.type(id, params.selector, params.text, params);
+          break;
+        case "fill":
+        case "fill_form":
+          res = await this.fill(id, params.values);
+          break;
+        case "select":
+          res = await this.select(id, params.selector, params.values);
+          break;
+        case "press":
+          res = await this.press(id, params.selector, params.key);
+          break;
+        case "hover":
+          res = await this.hover(id, params.selector);
+          break;
+        case "reload":
+        case "refresh":
+          res = await this.reload(id);
+          break;
+        case "back":
+        case "go_back":
+        case "goback":
+          res = await this.back(id);
+          break;
+        case "go_back_times":
+        case "gobacktimes":
+          res = await this.goBackTimes(id, params.times);
+          break;
+        case "forward":
+        case "go_front":
+        case "gofront":
+        case "goforward":
+          res = await this.forward(id);
+          break;
+        case "go_front_times":
+        case "gofronttimes":
+        case "goforwardtimes":
+          res = await this.goFrontTimes(id, params.times);
+          break;
+        case "wait":
+        case "waitfor":
+          res = await this.waitFor(id, params.selector, params.timeoutMs);
+          break;
+        case "content":
+          res = await this.content(id, params.selector);
+          break;
+        case "observe":
+          res = await this.observe(id);
+          break;
+        case "evaluate":
+          res = await this.evaluate(id, params.expression || params.script);
+          break;
+        case "screenshot":
+          res = await this.screenshot(id, params.outputPath, params);
+          break;
+        case "multi":
+          res = await this.multi(id, item.actions || params.actions || []);
+          break;
+        default:
+          throw new Error(`Unknown action in browser multi execution: ${item.action}`);
+      }
+      results.push({ action: item.action, result: res });
+    }
+    const finalObs = await this.preview(id);
+    return { id, results, screenshotPath: finalObs };
+  }
   async content(id: string, selector = "body") { const loc = this.get(id).page.locator(selector); return { text: await loc.innerText(), html: await loc.innerHTML() }; }
   async observe(id: string) {
     const session = this.get(id);

@@ -1,3 +1,5 @@
+import type { SubSubtask } from "@yaaa/shared";
+
 export interface UIArtifact {
   path: string;
   mimeType: string;
@@ -7,13 +9,18 @@ export interface UIArtifact {
 export interface UISubtask {
   id: string;
   title: string;
-  capability: string;
+  roles: string[];
+  capabilities: string[];
   dependsOn: string[];
   riskLevel: string;
   successCriteria: string;
   model?: string;
   modelReason?: string;
   state: "pending" | "running" | "completed" | "failed";
+  subSubtasks?: SubSubtask[];
+  artifacts?: UIArtifact[];
+  result?: string;
+  summary?: string;
 }
 
 export interface UITask {
@@ -253,6 +260,10 @@ export class TaskModel {
 
   static async openWorkingFolder(taskId: string): Promise<boolean> {
     return this.getElectronAPI().openWorkingFolder(taskId);
+  }
+
+  static async openAgentWorkspace(taskId: string, agentId: string): Promise<boolean> {
+    return this.getElectronAPI().openAgentWorkspace(taskId, agentId);
   }
 
   /**

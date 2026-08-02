@@ -56,6 +56,16 @@ describe("createRuntime", () => {
 
       expect(result.success).toBe(true);
       expect(result.plan).toEqual(plan);
+      expect(events).toContainEqual({
+        type: "thought",
+        from: "orchestrator",
+        content: "Approval received. Loading the saved plan and preparing the first execution stage.",
+      });
+      expect(events).toContainEqual({
+        type: "thought",
+        from: "orchestrator",
+        content: "Implementation stages finished. Running final verification and assembling the deliverable summary.",
+      });
       expect(events).toContainEqual({ type: "complete", result });
     } finally {
       runtime.dispose();
@@ -100,7 +110,8 @@ describe("createRuntime", () => {
         {
           id: "write-report",
           title: "Write the reviewed report",
-          capability: "files",
+        roles: ["FilesAgent"],
+        capabilities: ["files"],
           dependsOn: [],
           riskLevel: "low",
           successCriteria: "A report is written",
@@ -126,10 +137,6 @@ describe("createRuntime", () => {
         path.join(root, "working", "agent-workspaces", agentId, "handsOn.md"),
         "utf-8",
       );
-      const proofOfWork = fs.readFileSync(
-        path.join(root, "working", "agent-workspaces", agentId, "proofOfWork.md"),
-        "utf-8",
-      );
       const handOff = fs.readFileSync(
         path.join(root, "working", "agent-workspaces", agentId, "handOff.md"),
         "utf-8",
@@ -137,10 +144,8 @@ describe("createRuntime", () => {
 
       expect(handsOn).toContain("Write the reviewed report");
       expect(handsOn).toContain("A report is written");
-      expect(workingHandsOn).toContain("proofOfWork.md");
       expect(workingHandsOn).toContain("handOff.md");
-      expect(proofOfWork).toContain("Mock mode: subtask completed");
-      expect(handOff).toContain("## Continuation Instructions");
+      expect(handOff).toContain("## Work Done");
       expect(handsOff).toContain("## Changed Files");
       expect(handsOff).toContain("## Tests");
       expect(handsOff).toContain("## Risks");

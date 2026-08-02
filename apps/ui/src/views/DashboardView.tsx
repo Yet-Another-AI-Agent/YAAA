@@ -92,9 +92,9 @@ function compactText(text: string, maxLength = 240): string {
 }
 
 function orchestratorModelForPreference(preference?: "sota" | "balanced" | "cost-effective"): string {
-  if (preference === "sota") return "OpenAI GPT · best available from Mesh";
-  if (preference === "cost-effective") return "google/gemini-2.5-pro-preview";
-  return "google/gemini-3.1-pro-preview";
+  if (preference === "sota") return "SOTA mode · OpenAI GPT · best available from Mesh";
+  if (preference === "cost-effective") return "Cost-effective mode · Nano/Lite model only · best available from Mesh";
+  return "Balanced mode · google/gemini-3.1-pro-preview";
 }
 
 const SUGGESTION_CHIPS = [
@@ -251,7 +251,7 @@ function AgentBrainMap({ agents, logs }: { agents: UIAgent[]; logs: UILog[] }) {
         <img src={logoImg} alt={ORCHESTRATOR_DISPLAY} />
         <div>
           <strong>{ORCHESTRATOR_DISPLAY}</strong>
-          <span>Mission brain · coordinating execution</span>
+          <span>Online · coordinating execution</span>
         </div>
         <span className="agent-brain-pulse" aria-hidden="true" />
       </div>
@@ -689,7 +689,8 @@ interface ParsedOrchestrator {
   subtasks: Array<{
     id: string;
     title: string;
-    capability: string;
+    roles: string[];
+    capabilities: string[];
     state: string;
     successCriteria: string;
     dependencies: string[];
@@ -760,7 +761,8 @@ function parseOrchestratorMd(content: string | null): ParsedOrchestrator {
           currentSubtask = {
             id: match[1],
             title: match[2].trim(),
-            capability: "",
+            roles: [],
+            capabilities: [],
             state: "pending",
             successCriteria: "",
             dependencies: [],
@@ -768,8 +770,10 @@ function parseOrchestratorMd(content: string | null): ParsedOrchestrator {
           result.subtasks.push(currentSubtask);
         }
       } else if (currentSubtask) {
-        if (line.startsWith("- Capability:")) {
-          currentSubtask.capability = line.replace("- Capability:", "").trim().replace(/`/g, "");
+        if (line.startsWith("- Capabilities:")) {
+          currentSubtask.capabilities = line.replace("- Capabilities:", "").split(",").map((value: string) => value.trim().replace(/`/g, "")).filter(Boolean);
+        } else if (line.startsWith("- Roles:")) {
+          currentSubtask.roles = line.replace("- Roles:", "").split(",").map((value: string) => value.trim().replace(/`/g, "")).filter(Boolean);
         } else if (line.startsWith("- Status:")) {
           currentSubtask.state = line.replace("- Status:", "").trim().replace(/`/g, "");
         } else if (line.startsWith("- Success Criteria:")) {
@@ -865,9 +869,20 @@ function estimateUsedTokens(agent: any, logs: any[], workspaceSnapshot?: any): n
     totalChars += workspaceSnapshot.files.handOff.length;
   }
   const agentActivity = getAgentActivity(agent, logs);
+  // LLM context events are snapshots, not additive transcripts. Counting all
+  // historical snapshots made the sidebar claim that the agent was consuming
+  // the entire accumulated context even though the runtime sends a bounded
+  // window. Count only the latest request/response snapshot and persistent
+  // non-LLM activity.
+  const llmActivity = agentActivity.filter((log) => log.metadata?.llmEvent === "request" || log.metadata?.llmEvent === "response");
+  const latestRequest = [...llmActivity].reverse().find((log) => log.metadata?.llmEvent === "request");
+  const latestResponse = [...llmActivity].reverse().find((log) => log.metadata?.llmEvent === "response");
   for (const log of agentActivity) {
+    if (log.metadata?.llmEvent) continue;
     totalChars += log.content.length;
   }
+  totalChars += latestRequest?.content.length ?? 0;
+  totalChars += latestResponse?.content.length ?? 0;
   return Math.max(1200, Math.round(totalChars / 4));
 }
 
@@ -875,6 +890,9 @@ function estimateOrchestratorUsedTokens(logs: any[], goal: string): number {
   let totalChars = 8000; // Base for orchestrator prompt + schema
   totalChars += goal.length;
   for (const log of logs) {
+    // Worker LLM snapshots belong to the worker context, not YAAA's
+    // orchestrator context. Including them here inflated YAAA's own number.
+    if (log.source === "agent" || log.metadata?.llmEvent) continue;
     totalChars += log.content.length;
   }
   return Math.max(2500, Math.round(totalChars / 4));
@@ -920,6 +938,46 @@ function isPreviewableArtifact(artPath: string): boolean {
 
 function isInternalAgentDocument(artPath: string): boolean {
   return /(?:^|\/)(?:handsOn|handOff|proofOfWork|incompleteWork)\.md$/i.test(artPath);
+}
+
+/**
+ * Completed missions should surface the requested deliverable, not every
+ * helper script, source note, or generated asset found in the workspace.
+ * Those files remain on disk and in the agent handoff, but are not primary UI
+ * outputs unless the task explicitly asks for that file type.
+ */
+function selectRelevantCompletedArtifacts(
+  artifacts: any[],
+  taskDescription: string,
+  preferredPaths: string[] = [],
+): any[] {
+  const clean = taskDescription.toLowerCase();
+  const paths = artifacts.filter((artifact) => !isInternalAgentDocument(String(artifact.path || "")));
+  if (preferredPaths.length > 0) {
+    const preferred = new Set(preferredPaths);
+    const selected = paths.filter((artifact) => preferred.has(String(artifact.path || "")));
+    if (selected.length > 0) return selected;
+  }
+  const has = (pattern: RegExp) => pattern.test(clean);
+  let extensions: RegExp | undefined;
+  if (has(/\b(?:pptx?|powerpoint|presentation|slide deck|slides?)\b/)) extensions = /\.pptx$/i;
+  else if (has(/\b(?:pdf|invoice)\b/)) extensions = /\.pdf$/i;
+  else if (has(/\b(?:docx?|word document|memo|letter)\b/)) extensions = /\.docx?$/i;
+  else if (has(/\b(?:spreadsheet|xlsx|excel|csv)\b/)) extensions = /\.(?:xlsx?|csv|tsv)$/i;
+  else if (has(/\b(?:image|illustration|sprite|png|jpeg|jpg|webp|svg|background removal)\b/)) extensions = /\.(?:png|jpe?g|webp|gif|svg)$/i;
+  else if (has(/\b(?:website|web app|browser game|html|css|javascript|typescript|phaser|react|frontend)\b/)) extensions = /\.(?:html?|css|js|jsx|ts|tsx)$/i;
+
+  if (extensions) {
+    const primary = paths.filter((artifact) => extensions!.test(String(artifact.path || "")));
+    if (primary.length > 0) return primary;
+  }
+
+  // When the requested format is not explicit, remove conventional producer
+  // scripts and implementation notes only if a more deliverable-like file is
+  // present. This prevents a report/PPT task from showing create_*.js beside
+  // the actual result while retaining code files for code tasks.
+  const deliverables = paths.filter((artifact) => !/(?:^|\/)(?:create|generate|build|setup|prepare|verify|test)[^/]*\.(?:js|mjs|cjs|ts|py|sh)$/i.test(String(artifact.path || "")));
+  return deliverables.length > 0 ? deliverables : paths;
 }
 
 export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps) {
@@ -1204,7 +1262,10 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
   const labelForSender = (raw: string): string => {
     if (isOrchestratorSender(raw)) return ORCHESTRATOR_DISPLAY;
     if (raw.toLowerCase() === "user") return "User";
-    if (raw === "User" || raw === "System" || raw === "Agent") return raw;
+    // The legacy generic "Agent" author was used for planner-generated
+    // messages. Plans are authored by YAAA, never by an anonymous worker.
+    if (/^Agent(?:\s*\(Agent\))?$/i.test(raw.trim())) return ORCHESTRATOR_DISPLAY;
+    if (raw === "User" || raw === "System") return raw;
     const a = resolveAgent(raw);
     if (a) return agentIdentity(a.id, a.role, a.displayName, a.handle).display;
     return displaySender(raw);
@@ -1470,6 +1531,7 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
 
   const memoizedData = useMemo(() => {
     let displayMessages: any[] = [];
+    let preferredArtifactPaths: string[] = [];
     const parsedOrchestrator = parseOrchestratorMd(orchestratorMd);
 
     if (inConversationView) {
@@ -1483,6 +1545,12 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
         : showTaskView
           ? resumedHistoryMessages
           : [];
+      const planSubtasks = selectedTaskId
+        ? (selectedMissionSnapshot?.plan?.subtasks || parsedOrchestrator.subtasks)
+        : subtasks;
+      preferredArtifactPaths = planSubtasks.flatMap((subtask: any) =>
+        Array.isArray(subtask.relevantArtifactPaths) ? subtask.relevantArtifactPaths : [],
+      );
       visibleHistory.forEach((msg, idx) => {
         let sender = msg.from || "Agent";
         let content = "";
@@ -1506,9 +1574,24 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
             ? `@${String(msg.to || "agent").replace(/^@/, "")} ${String(msg.answer || "").replace(/^@[^\s]+\s*/, "")}`
             : `@yaaa ${msg.answer}`;
         } else if (msg.kind === "help_request") {
-          content = `@yaaa ${msg.problem}`;
+          content = `@${String(msg.from || "agent").replace(/^@/, "")} @yaaa ${msg.problem}`;
         } else {
           content = typeof msg.data === "string" ? msg.data : JSON.stringify(msg);
+        }
+        // Keep agent-thread evidence (including handsOn.md) intact. The
+        // completed-deliverable filter is only for the orchestrator's public
+        // result; otherwise opening an agent thread loses useful context.
+        if (
+          msg.kind === "result" &&
+          msg.from === "orchestrator" &&
+          !msg.incomplete &&
+          artifactsList.length > 0
+        ) {
+          artifactsList = selectRelevantCompletedArtifacts(
+            artifactsList,
+            [selectedTask?.prompt, goal, msg.summary].filter(Boolean).join("\n"),
+            preferredArtifactPaths,
+          );
         }
 
         // Public-channel user and orchestrator turns are persisted as
@@ -1569,6 +1652,10 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
             sender = agentMatch[1];
             content = agentMatch[2];
           }
+          // Legacy live logs may wrap the plan author as [Agent]. The plan
+          // proposal is still a YAAA-authored message; do this after the
+          // legacy prefix parsing so it cannot regress to Agent (Agent).
+          if (isPlanProposal) sender = ORCHESTRATOR_DISPLAY;
           displayMessages.push({
             id: log.id,
             sender,
@@ -1607,7 +1694,7 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
       ? (selectedMissionSnapshot?.plan?.subtasks || parsedOrchestrator.subtasks)
       : subtasks;
     
-    const displayArtifacts = selectedTaskId
+    const rawDisplayArtifacts = selectedTaskId
       ? [
           { path: "orchestrator.md", mimeType: "text/markdown", description: "YAAA implementation strategy and execution ledger." },
           ...(selectedMissionSnapshot?.plan?.subtasks || []).flatMap((subtask: any) => subtask.artifacts || []),
@@ -1619,6 +1706,19 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
           }, []),
         ].filter((artifact, index, all) => !isInternalAgentDocument(String(artifact.path || "")) && all.findIndex((candidate) => candidate.path === artifact.path) === index)
       : artifacts.filter((artifact: any) => !isInternalAgentDocument(String(artifact.path || "")));
+
+    const missionDescription = [
+      selectedTask?.prompt,
+      goal,
+      ...(selectedTaskId ? (selectedMissionSnapshot?.plan?.subtasks || parsedOrchestrator.subtasks) : subtasks)
+        .map((subtask: any) => `${subtask.title} ${subtask.summary || ""} ${subtask.successCriteria || ""}`),
+    ].filter(Boolean).join("\n");
+    const completed = selectedTaskId
+      ? selectedTask?.status === "completed" || selectedMissionSnapshot?.task.status === "completed"
+      : success === true;
+    const displayArtifacts = completed
+      ? selectRelevantCompletedArtifacts(rawDisplayArtifacts, missionDescription, preferredArtifactPaths)
+      : rawDisplayArtifacts;
 
     const currentStatus = selectedTaskId
       ? (selectedMissionSnapshot?.task.status || selectedTask?.status || parsedOrchestrator.status)
@@ -1658,7 +1758,7 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
   const activeAgentCount = visibleAgents.filter(isActiveAgent).length;
   // Real capabilities this plan actually uses, replacing what used to be a
   // hardcoded fake Slack/GitHub/Web-Search "connected" list.
-  const activeCapabilities = Array.from(new Set(displaySubtasks.map((st) => st.capability).filter(Boolean)));
+  const activeCapabilities = Array.from(new Set(displaySubtasks.flatMap((st) => st.capabilities ?? []).filter(Boolean)));
 
   // Each spawned sub-agent runs in its own sub-thread. The main surface shows
   // only YAAA's assignment and the relevant result; internal work documents
@@ -2225,6 +2325,7 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
                                   {displaySubtasks.map((subtask: any) => (
                                     <li key={subtask.id}>
                                       <div>{subtask.title}</div>
+                                      {subtask.summary ? <small>{subtask.summary}</small> : null}
                                       {subtask.model ? <small>{formatModelLabel(subtask.model)}{subtask.modelReason ? ` — ${subtask.modelReason}` : ""}</small> : null}
                                     </li>
                                   ))}
@@ -2431,7 +2532,7 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
                       list always leads with it rather than rendering empty. */}
                   <div className="mission-team-list">
                     <div className="mission-team-member" key="yaaa-orchestrator">
-                      <span className="mission-team-status completed" aria-label="active" />
+                      <span className="mission-team-status online" aria-label="online" />
                       <img
                         className="mission-team-avatar"
                         src={logoImg}
@@ -2557,25 +2658,69 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
                     <div className="subtask-list">
                       {renderRightPanelList(
                         "subtasks",
-                        displaySubtasks as Array<{ id: string; title: string; capability?: string; state: string }>,
-                        (st) => (
-                        <div key={st.id} className={`subtask-item ${st.state}`}>
-                          <div className="subtask-dot-col">
-                            <span className={`status-badge ${st.state}`} />
-                          </div>
-                          <div className="subtask-body">
-                            <div className="subtask-title" style={{ fontSize: '0.85rem' }}>
-                              <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.75rem', marginRight: '0.35rem' }}>
-                                [{st.id}]
-                              </span>
-                              {st.title}
+                        displaySubtasks as Array<{ id: string; title: string; roles?: string[]; capabilities?: string[]; state: string }>,
+                        (st) => {
+                          // Micro-steps belong to the active worker. Pending
+                          // parent subtasks intentionally remain undisclosed
+                          // until their worker starts and creates/receives them.
+                          const subSubtasks = Array.isArray((st as any).subSubtasks)
+                            ? (st as any).subSubtasks
+                            : [];
+                          const completedCount = subSubtasks.filter((s: any) => s.state === "completed").length;
+                          const totalCount = subSubtasks.length;
+                          const isAllCompleted = totalCount > 0 && completedCount === totalCount;
+                          const effectiveState = isAllCompleted ? "completed" : st.state;
+                          const percent = totalCount > 0 ? Math.round((completedCount / totalCount) * 100) : (effectiveState === "completed" ? 100 : 0);
+
+                          return (
+                            <div key={st.id} className={`subtask-item ${effectiveState}`}>
+                              <div className="subtask-dot-col">
+                                <span className={`status-badge ${effectiveState}`} />
+                              </div>
+                              <div className="subtask-body">
+                                <div className="subtask-title" style={{ fontSize: '0.85rem' }}>
+                                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.75rem', marginRight: '0.35rem' }}>
+                                    [{st.id}]
+                                  </span>
+                                  {st.title}
+                                </div>
+                                <div className="subtask-meta">
+                                  {(st.roles ?? []).map((role) => <span key={role} className="capability-tag">{role}</span>)}
+                                  {(st.capabilities ?? []).map((capability) => <span key={capability} className="capability-tag">{formatCapabilityLabel(capability)}</span>)}
+                                  <span className="capability-tag" style={{ color: effectiveState === "completed" ? '#4ade80' : '#a78bfa' }}>
+                                    {effectiveState === "completed" ? "Completed (100%)" : `${completedCount}/${totalCount} micro-steps (${percent}%)`}
+                                  </span>
+                                </div>
+                                <div className="subtask-progress-container">
+                                  <div className="subtask-progress-track">
+                                    <div className="subtask-progress-fill" style={{ width: `${percent}%` }} />
+                                  </div>
+                                </div>
+                                <div className="sub-subtask-list">
+                                  {totalCount === 0 ? (
+                                    <div className="sub-subtask-item pending" style={{ opacity: 0.65 }}>
+                                      Micro-steps will be created when this subtask starts.
+                                    </div>
+                                  ) : subSubtasks.map((sst: any) => (
+                                    <div key={sst.id} className={`sub-subtask-item ${sst.state}`}>
+                                      <span className={`sub-subtask-icon ${sst.state}`}>
+                                        {sst.state === "completed" ? "✓" : sst.state === "running" ? "⚡" : "○"}
+                                      </span>
+                                      <span style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', flexWrap: 'wrap' }}>
+                                        <strong>{sst.id}:</strong> {sst.title}
+                                        {sst.state === "running" && (
+                                          <span className="running-pill" style={{ fontSize: '0.65rem', padding: '0.1rem 0.35rem', borderRadius: '4px', background: 'rgba(167, 139, 250, 0.2)', color: '#c084fc', border: '1px solid rgba(192, 132, 252, 0.4)', fontWeight: 600 }}>
+                                            IN PROGRESS
+                                          </span>
+                                        )}
+                                      </span>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
                             </div>
-                            <div className="subtask-meta">
-                              {st.capability && <span className="capability-tag">{st.capability}</span>}
-                            </div>
-                          </div>
-                        </div>
-                        ),
+                          );
+                        },
                       )}
                     </div>
                   )}
@@ -2753,7 +2898,7 @@ export function DashboardView({ viewModel, onOpenSettings }: DashboardViewProps)
                     `## Proposed plan\n\n${
                       displaySubtasks.length
                         ? displaySubtasks
-                            .map((s, i) => `${i + 1}. **${s.title}** _(capability: ${s.capability || "n/a"})_`)
+                            .map((s, i) => `${i + 1}. **${s.title}** _(roles: ${(s.roles ?? []).join(", ") || "n/a"}; capabilities: ${(s.capabilities ?? []).join(", ") || "n/a"})_`)
                             .join("\n")
                         : "_No subtasks were proposed._"
                     }`,

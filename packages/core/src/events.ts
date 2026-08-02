@@ -10,9 +10,11 @@ import type { TaskPlan, ArtifactRef, AgentRun, RuntimeAction, AgentMessage } fro
 export type RuntimeEvent =
   | { type: "task-started"; taskId: string }
   | { type: "plan-updated"; plan: TaskPlan }
+  | { type: "sub-subtask-completed"; data: Record<string, unknown> }
+  | { type: "sub-subtask-added"; data: Record<string, unknown> }
   | { type: "thought"; from: string; content: string }
   | { type: "tool-requested"; from: string; content: string; metadata?: Record<string, unknown> }
-  | { type: "llm-context"; from: string; turn: number; model: string; messages: unknown[] }
+  | { type: "llm-context"; from: string; turn: number; model: string; messageCount?: number; contextChars?: number; messageTypes?: string[]; displaySummary?: string; messages?: unknown[] }
   | { type: "llm-response"; from: string; turn: number; model: string; content: string }
   | { type: "action"; action: RuntimeAction }
   | { type: "agent-status"; agent: AgentRun }
@@ -45,6 +47,14 @@ export function mapBusEvent(
 
   if (topic === `${base}.plan_updated`) {
     return { type: "plan-updated", plan: msg as TaskPlan };
+  }
+
+  if (topic === `${base}.sub_subtask_completed`) {
+    return { type: "sub-subtask-completed", data: msg ?? {} };
+  }
+
+  if (topic === `${base}.sub_subtask_added`) {
+    return { type: "sub-subtask-added", data: msg ?? {} };
   }
 
   if (topic === `${base}.agent_message`) {
@@ -100,7 +110,11 @@ export function mapBusEvent(
       from,
       turn: Number(msg?.turn ?? 0),
       model: String(msg?.model ?? "unknown"),
-      messages: Array.isArray(msg?.messages) ? msg.messages : [],
+      ...(typeof msg?.messageCount === "number" ? { messageCount: msg.messageCount } : {}),
+      ...(typeof msg?.contextChars === "number" ? { contextChars: msg.contextChars } : {}),
+      ...(Array.isArray(msg?.messageTypes) ? { messageTypes: msg.messageTypes } : {}),
+      ...(typeof msg?.displaySummary === "string" ? { displaySummary: msg.displaySummary } : {}),
+      ...(Array.isArray(msg?.messages) ? { messages: msg.messages } : {}),
     };
   }
 

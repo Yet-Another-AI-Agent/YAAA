@@ -157,7 +157,6 @@ describe("InnerLoop Worker Loop (ReAct)", () => {
     expect(result.artifacts).toEqual(
       expect.arrayContaining([
         { path: "test.txt", mimeType: "text/plain", description: "File produced by FilesAgent." },
-        expect.objectContaining({ path: "agent-workspaces/test-agent/proofOfWork.md", mimeType: "text/markdown" }),
         expect.objectContaining({ path: "agent-workspaces/test-agent/handOff.md", mimeType: "text/markdown" }),
       ]),
     );
@@ -166,6 +165,382 @@ describe("InnerLoop Worker Loop (ReAct)", () => {
       "task.task-123.agent_message",
       expect.objectContaining({ kind: "result", summary: "Done test" }),
     );
+  });
+
+  it("returns a permission blocker when a required file operation is denied", async () => {
+    install([
+      toolCall("write_file", { path: "/tmp/yaaa-denied.txt", content: "must not escape the workspace" }),
+      new AIMessage({ content: "I cannot create the required file because the write permission was denied." }),
+    ]);
+
+    const result = await innerLoop.run({
+      agentId: "permission-blocked-agent",
+      taskId: "task-permission-blocked",
+      templateName: "FilesAgent",
+      instruction: "Create the required file inside the assigned workspace.",
+      executionContract: {
+        requiredArtifacts: ["required.txt"],
+        targetWorkspace: "task workspace",
+        expectedNextActions: ["create required.txt"],
+        dependencyGraph: [],
+        preflight: { runOncePerAssignment: true, targetPaths: [] },
+        completionSignals: ["required.txt exists"],
+        noProgress: { correctionAfter: 1, stopAfter: 2 },
+        actionQueue: { useWhen: [], maxActions: 2, maxDepth: 1, stopOnError: true },
+        verificationSurface: "files",
+      },
+    });
+
+    expect(result.permissionBlocked).toBe(true);
+    expect(result.permissionBlockReasons?.join(" ")).toContain("Approval required");
+    expect(mockFilesProvider.writeFile).not.toHaveBeenCalledWith("/tmp/yaaa-denied.txt", expect.anything());
+    expect((mockBus.publish as any).mock.calls.some(([event]: [string]) => event.endsWith("action_denied"))).toBe(true);
+  });
+
+  it("rejects zero-byte file writes instead of recording a fake deliverable", async () => {
+    install([
+      toolCall("write_file", { path: "empty.pptx", content: "" }),
+      new AIMessage({ content: "The producer was stopped because the deliverable would be empty." }),
+    ]);
+
+    const result = await innerLoop.run({
+      agentId: "empty-artifact-agent",
+      taskId: "task-empty-artifact",
+      templateName: "FilesAgent",
+      instruction: "Create the presentation artifact.",
+    });
+
+    expect(result.summary).toContain("producer was stopped");
+    expect(mockFilesProvider.writeFile).not.toHaveBeenCalledWith("empty.pptx", "");
+    expect(mockBus.publish).toHaveBeenCalledWith(
+      "task.task-empty-artifact.agent.empty-artifact-agent.action_failed",
+      expect.objectContaining({ error: expect.stringContaining("EMPTY_ARTIFACT") }),
+    );
+  });
+
+  it("returns bounded file evidence references with ranges and hashes", async () => {
+    install([
+      toolCall("read_file", { path: "game.js" }),
+      new AIMessage({ content: "Inspected the file reference." }),
+    ]);
+
+    await innerLoop.run({
+      agentId: "file-reference-agent",
+      taskId: "task-file-reference",
+      templateName: "FilesAgent",
+      instruction: "Inspect game.js before editing it.",
+      executionContract: {
+        contextPolicy: {
+          maxInputTokens: 3_000,
+          maxDependencyChars: 1_000,
+          maxHistoryTurns: 2,
+          maxFileExcerptLines: 40,
+          includeFullSkillDocs: false,
+          allowOnDemandReads: true,
+          allowedTools: ["read_file"],
+        },
+        requiredArtifacts: [],
+        targetWorkspace: "workspace",
+        expectedNextActions: ["inspect game.js"],
+        dependencyGraph: [],
+        preflight: { runOncePerAssignment: true, targetPaths: [] },
+        completionSignals: ["reference recorded"],
+        noProgress: { correctionAfter: 1, stopAfter: 2 },
+        actionQueue: { useWhen: [], maxActions: 2, maxDepth: 1, stopOnError: true },
+        verificationSurface: "files",
+      },
+    });
+
+    const evidence = scripted.seenTurns.flat()
+      .find((message) => message.getType() === "tool" && String(message.content).includes("sha256"));
+    expect(evidence).toBeTruthy();
+    expect(String(evidence?.content)).toContain("game.js");
+    expect(String(evidence?.content)).toContain("startLine");
+  });
+
+  it("blocks same-agent full rewrites and requires targeted edits", async () => {
+    install([
+      toolCall("write_file", { path: "index.html", content: "first version" }, "write_1"),
+      toolCall("write_file", { path: "index.html", content: "second version" }, "write_2"),
+      new AIMessage({ content: "I will inspect the existing file before making another edit." }),
+    ]);
+
+    const result = await innerLoop.run({
+      agentId: "rewrite-guard-agent",
+      taskId: "task-rewrite-guard",
+      templateName: "FilesAgent",
+      instruction: "create index.html without destroying existing work",
+    });
+
+    expect(result.summary).toContain("inspect the existing file");
+    expect(mockFilesProvider.writeFile.mock.calls.filter((call: [string, ...unknown[]]) => call[0] === "index.html")).toHaveLength(1);
+    expect(mockBus.publish).toHaveBeenCalledWith(
+      "task.task-rewrite-guard.agent.rewrite-guard-agent.action_completed",
+      expect.objectContaining({
+        method: "writeFile",
+        result: expect.objectContaining({ status: "unchanged" }),
+      }),
+    );
+  });
+
+  it("requires and records graph preflight before code-generation writes", async () => {
+    install([
+      toolCall("code_review_graph_preflight", { targetFiles: ["index.html", "script.js"], searchQuery: "Snake" }, "graph_1"),
+      toolCall("write_file", { path: "index.html", content: "<!doctype html>" }, "write_1"),
+      new AIMessage({ content: "Graph scope established and the file was created." }),
+    ]);
+
+    await innerLoop.run({
+      agentId: "graph-preflight-agent",
+      taskId: "task-graph-preflight",
+      templateName: "FilesAgent",
+      instruction: "Use code-generation-skill to create index.html and script.js.",
+    });
+
+    expect(mockFilesProvider.writeFile).toHaveBeenCalledWith("index.html", "<!doctype html>");
+    expect(mockBus.publish).toHaveBeenCalledWith(
+      "task.task-graph-preflight.agent.graph-preflight-agent.action_completed",
+      expect.objectContaining({ method: "preflightCheck" }),
+    );
+  });
+
+  it("executes file_multi sequentially from index 0 with recursive batches and line operations", async () => {
+    mockFilesProvider.readLines = vi.fn().mockResolvedValue({ content: "two", startLine: 10, endLine: 12, totalLines: 20 });
+    mockFilesProvider.writeLines = vi.fn().mockResolvedValue(undefined);
+    install([
+      toolCall("file_multi", {
+        actions: [
+          { action: "read_file_lines", params: { path: "game.js", startLine: 10, endLine: 12 } },
+          { action: "multi", actions: [{ action: "write_file_lines", params: { path: "game.js", startLine: 20, endLine: 21, content: "next" } }] },
+        ],
+      }),
+      new AIMessage({ content: "Batch complete." }),
+    ]);
+
+    const result = await innerLoop.run({
+      agentId: "file-multi-agent",
+      taskId: "task-123",
+      templateName: "FilesAgent",
+      instruction: "make the targeted code edits",
+    });
+
+    expect(result.summary).toBe("Batch complete.");
+    expect(mockFilesProvider.readLines).toHaveBeenCalledWith("game.js", 10, 12);
+    expect(mockFilesProvider.writeLines).toHaveBeenCalledWith("game.js", 20, 21, "next");
+    expect(result.artifacts).toEqual(expect.arrayContaining([expect.objectContaining({ path: "game.js" })]));
+  });
+
+  it("accepts common file_multi aliases and directory operations", async () => {
+    mockFilesProvider.listFiles = vi.fn().mockResolvedValue(["betta_presentation.js"]);
+    mockFilesProvider.createDirectory = vi.fn().mockResolvedValue({ status: "created" });
+    install([
+      toolCall("file_multi", {
+        actions: [
+          { action: "list", params: { path: "." } },
+          { action: "create_directory", params: { path: "images" } },
+        ],
+      }),
+      new AIMessage({ content: "Workspace prepared." }),
+    ]);
+
+    const result = await innerLoop.run({
+      agentId: "file-multi-alias-agent",
+      taskId: "task-file-multi-alias",
+      templateName: "DocumentAgent",
+      instruction: "Prepare the image directory before generating the deck.",
+    });
+
+    expect(result.summary).toBe("Workspace prepared.");
+    expect(mockFilesProvider.listFiles).toHaveBeenCalledWith(".");
+    expect(mockFilesProvider.createDirectory).toHaveBeenCalledWith("images");
+  });
+
+  it("loads only the selected skill on demand when full skill docs are omitted from the brief", async () => {
+    install([
+      toolCall("read_skill", { skillId: "code-generation-skill" }),
+      new AIMessage({ content: "Skill preflight complete." }),
+    ]);
+
+    const result = await innerLoop.run({
+      agentId: "lazy-skill-agent",
+      taskId: "task-lazy-skill",
+      templateName: "FilesAgent",
+      instruction: "Use the selected code-generation skill before working.",
+      skillIds: ["code-generation-skill"],
+      executionContract: {
+        contextPolicy: {
+          maxInputTokens: 3_000,
+          maxDependencyChars: 1_000,
+          maxHistoryTurns: 2,
+          maxFileExcerptLines: 80,
+          includeFullSkillDocs: false,
+          allowOnDemandReads: true,
+          allowedTools: ["read_skill"],
+        },
+        requiredArtifacts: [],
+        targetWorkspace: "task working directory",
+        expectedNextActions: ["read selected skill"],
+        dependencyGraph: [],
+        preflight: { runOncePerAssignment: true, targetPaths: [] },
+        completionSignals: ["preflight complete"],
+        noProgress: { correctionAfter: 1, stopAfter: 2 },
+        actionQueue: { useWhen: [], maxActions: 4, maxDepth: 1, stopOnError: true },
+        verificationSurface: "files",
+      },
+    });
+
+    expect(result.summary).toBe("Skill preflight complete.");
+    const skillResult = scripted.seenTurns
+      .flat()
+      .find((message) => message.getType() === "tool" && String(message.content).includes("Bounded Code Generation Skill"));
+    expect(skillResult).toBeTruthy();
+    const contextEvent = (mockBus.publish as any).mock.calls.find(
+      ([event]: [string]) => event === "task.task-lazy-skill.agent.lazy-skill-agent.llm_context",
+    )?.[1];
+    // The allowlist removes the normal ~50k-character FilesAgent schema. The
+    // completion/communication tools remain intentionally essential.
+    expect(contextEvent?.toolSchemaChars).toBeLessThan(8000);
+    expect(contextEvent?.contextBudgetExceeded).toBe(false);
+  });
+
+  it("enforces the provider-facing context budget even when the assignment is huge", async () => {
+    install([new AIMessage({ content: "Finished without reading unrelated context." })]);
+
+    await innerLoop.run({
+      agentId: "bounded-input-agent",
+      taskId: "task-bounded-input",
+      templateName: "FilesAgent",
+      instruction: "Implement the requested change.\n" + "unrelated transcript ".repeat(10_000),
+      executionContract: {
+        contextPolicy: {
+          maxInputTokens: 3_000,
+          maxDependencyChars: 500,
+          maxHistoryTurns: 2,
+          maxFileExcerptLines: 40,
+          includeFullSkillDocs: false,
+          allowOnDemandReads: true,
+          allowedTools: ["read_file"],
+        },
+        requiredArtifacts: [],
+        targetWorkspace: "task workspace",
+        expectedNextActions: ["implement the targeted change"],
+        dependencyGraph: [],
+        preflight: { runOncePerAssignment: true, targetPaths: [] },
+        completionSignals: ["agent reports completion"],
+        noProgress: { correctionAfter: 1, stopAfter: 2 },
+        actionQueue: { useWhen: [], maxActions: 2, maxDepth: 1, stopOnError: true },
+        verificationSurface: "files",
+      },
+    });
+
+    const contextEvent = (mockBus.publish as any).mock.calls.find(
+      ([event]: [string]) => event === "task.task-bounded-input.agent.bounded-input-agent.llm_context",
+    )?.[1];
+    // The deliberately tiny tool allowlist keeps the message packet bounded;
+    // telemetry separately exposes when tool declarations themselves consume
+    // the remaining provider budget.
+    expect(contextEvent?.contextChars).toBeLessThan(1_200);
+    expect(contextEvent?.contextBudgetExceeded).toBe(true);
+    expect(contextEvent?.omittedSections).toEqual(expect.arrayContaining(["older-tool-history", "unselected-skills"]));
+    const sentChars = scripted.seenTurns[0].reduce((total, message) => total + String(message.content).length, 0);
+    expect(sentChars).toBeLessThan(15_000);
+    expect(scripted.seenTurns[0].every((message) => !String(message.content).includes("unrelated transcript ".repeat(100)))).toBe(true);
+  });
+
+  it("caps read_file_lines at the selected excerpt size and returns reference metadata", async () => {
+    mockFilesProvider.readLines = vi.fn().mockResolvedValue({
+      content: "line 10\nline 11",
+      startLine: 10,
+      endLine: 11,
+      totalLines: 200,
+    });
+    install([
+      toolCall("read_file_lines", { path: "game.js", startLine: 10, endLine: 100 }),
+      new AIMessage({ content: "The bounded excerpt is enough." }),
+    ]);
+
+    await innerLoop.run({
+      agentId: "bounded-lines-agent",
+      taskId: "task-bounded-lines",
+      templateName: "FilesAgent",
+      instruction: "Inspect only the relevant lines of game.js.",
+      executionContract: {
+        contextPolicy: {
+          maxInputTokens: 3_000,
+          maxDependencyChars: 500,
+          maxHistoryTurns: 2,
+          maxFileExcerptLines: 2,
+          includeFullSkillDocs: false,
+          allowOnDemandReads: true,
+          allowedTools: ["read_file_lines"],
+        },
+        requiredArtifacts: [],
+        targetWorkspace: "task workspace",
+        expectedNextActions: ["inspect the relevant lines"],
+        dependencyGraph: [],
+        preflight: { runOncePerAssignment: true, targetPaths: ["game.js"] },
+        completionSignals: ["excerpt inspected"],
+        noProgress: { correctionAfter: 1, stopAfter: 2 },
+        actionQueue: { useWhen: [], maxActions: 2, maxDepth: 1, stopOnError: true },
+        verificationSurface: "files",
+      },
+    });
+
+    expect(mockFilesProvider.readLines).toHaveBeenCalledWith("game.js", 10, 11);
+    const completed = (mockBus.publish as any).mock.calls.find(
+      ([event]: [string]) => event === "task.task-bounded-lines.agent.bounded-lines-agent.action_completed",
+    )?.[1];
+    expect(completed?.result).toEqual(expect.objectContaining({
+      path: "game.js",
+      sha256: expect.any(String),
+      endLine: 11,
+      truncatedByContextPolicy: true,
+    }));
+  });
+
+  it("compacts old tool results while preserving the live ReAct loop", async () => {
+    install([
+      toolCall("read_file", { path: "file-1.txt" }, "read_1"),
+      toolCall("read_file", { path: "file-2.txt" }, "read_2"),
+      toolCall("read_file", { path: "file-3.txt" }, "read_3"),
+      toolCall("read_file", { path: "file-4.txt" }, "read_4"),
+      toolCall("read_file", { path: "file-5.txt" }, "read_5"),
+      new AIMessage({ content: "Completed after retaining only recent evidence." }),
+    ]);
+
+    const result = await innerLoop.run({
+      agentId: "history-compaction-agent",
+      taskId: "task-history-compaction",
+      templateName: "FilesAgent",
+      instruction: "Inspect the files and summarize the result.",
+      executionContract: {
+        contextPolicy: {
+          maxInputTokens: 3_000,
+          maxDependencyChars: 500,
+          maxHistoryTurns: 1,
+          maxFileExcerptLines: 40,
+          includeFullSkillDocs: false,
+          allowOnDemandReads: true,
+          allowedTools: ["read_file"],
+        },
+        requiredArtifacts: [],
+        targetWorkspace: "task workspace",
+        expectedNextActions: ["inspect files"],
+        dependencyGraph: [],
+        preflight: { runOncePerAssignment: true, targetPaths: [] },
+        completionSignals: ["summary returned"],
+        noProgress: { correctionAfter: 10, stopAfter: 12 },
+        actionQueue: { useWhen: [], maxActions: 6, maxDepth: 1, stopOnError: true },
+        verificationSurface: "files",
+      },
+    });
+
+    expect(result.summary).toContain("Completed after retaining only recent evidence.");
+    expect(scripted.seenTurns.flat().some((message) => String(message.content).includes("[earlier tool result elided"))).toBe(true);
+    const contextEvents = (mockBus.publish as any).mock.calls
+      .filter(([event]: [string]) => event.endsWith(".llm_context"))
+      .map(([, payload]: [string, any]) => payload);
+    expect(contextEvents.some((event: any) => event.historyChars > 0)).toBe(true);
   });
 
   it("serializes multiple tool calls emitted in one model turn", async () => {
@@ -198,6 +573,13 @@ describe("InnerLoop Worker Loop (ReAct)", () => {
 
     expect(result.summary).toBe("Verified both files.");
     expect(maximumActive).toBe(1);
+    // The model emitted two calls in one scripted turn. The provider-facing
+    // replay must collapse that history to one call/response pair rather than
+    // forwarding a Gemini-invalid multi-function turn.
+    const replayMessages = scripted.seenTurns[1] ?? [];
+    const replayAi = replayMessages.find((message) => message.getType() === "ai") as AIMessage | undefined;
+    expect(replayAi?.tool_calls?.length ?? 0).toBeLessThanOrEqual(1);
+    expect(replayMessages.filter((message) => message.getType() === "tool").length).toBeLessThanOrEqual(1);
   });
 
   it("parses a verifier's structured result", async () => {
@@ -288,7 +670,7 @@ describe("InnerLoop Worker Loop (ReAct)", () => {
       }),
     ).rejects.toThrow("produced no deliverable artifacts");
     expect(mockFilesProvider.writeFile).toHaveBeenCalledWith(
-      "agent-workspaces/tool-summary-agent/proofOfWork.md",
+      "agent-workspaces/tool-summary-agent/handOff.md",
       expect.stringContaining("Status: FAILED"),
     );
     expect(mockBus.publish).toHaveBeenCalledWith(
@@ -325,7 +707,6 @@ describe("InnerLoop Worker Loop (ReAct)", () => {
     expect(result.artifacts).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ path: "agent-workspaces/inspection-agent/incompleteWork.md" }),
-        expect.objectContaining({ path: "agent-workspaces/inspection-agent/proofOfWork.md" }),
         expect.objectContaining({ path: "agent-workspaces/inspection-agent/handOff.md" }),
       ]),
     );
@@ -383,7 +764,6 @@ describe("InnerLoop Worker Loop (ReAct)", () => {
     expect(result.artifacts).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ path: "solar_system_outline.md" }),
-        expect.objectContaining({ path: "agent-workspaces/artifact-agent/proofOfWork.md" }),
         expect.objectContaining({ path: "agent-workspaces/artifact-agent/handOff.md" }),
       ]),
     );
@@ -418,7 +798,6 @@ describe("InnerLoop Worker Loop (ReAct)", () => {
     expect(result.artifacts).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ path: "solar_system_outline.md" }),
-        expect.objectContaining({ path: "agent-workspaces/continue-agent/proofOfWork.md" }),
         expect.objectContaining({ path: "agent-workspaces/continue-agent/handOff.md" }),
       ]),
     );
@@ -449,7 +828,6 @@ describe("InnerLoop Worker Loop (ReAct)", () => {
     expect(result.artifacts).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ path: "recovered.md" }),
-        expect.objectContaining({ path: "agent-workspaces/recover-agent/proofOfWork.md" }),
         expect.objectContaining({ path: "agent-workspaces/recover-agent/handOff.md" }),
       ]),
     );
@@ -477,10 +855,9 @@ describe("InnerLoop Worker Loop (ReAct)", () => {
 
     expect(result.summary).toBe("Recovered from tool failure");
     // The failed write is NOT recorded as an artifact; the runtime still records
-    // proof/handoff documents for the recovered attempt.
+    // handoff documents for the recovered attempt.
     expect(result.artifacts).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ path: "agent-workspaces/test-agent/proofOfWork.md" }),
         expect.objectContaining({ path: "agent-workspaces/test-agent/handOff.md" }),
       ]),
     );
@@ -508,8 +885,8 @@ describe("InnerLoop Worker Loop (ReAct)", () => {
       instruction: "read the same file forever",
     });
 
-    expect(result.summary).toBe("Giving up and reporting.");
-    expect(mockFilesProvider.readFile).toHaveBeenCalledTimes(3);
+    expect(result.summary).toContain("Agent stopped by supervisor");
+    expect(mockFilesProvider.readFile).toHaveBeenCalledTimes(2);
   });
 
   it("never sends an empty text content block to the model (Bedrock rejects them)", async () => {
@@ -605,10 +982,6 @@ describe("InnerLoop Worker Loop (ReAct)", () => {
         expect.objectContaining({ content: expect.stringContaining("hung-agent: model.invoke") }),
       );
       expect(mockFilesProvider.writeFile).toHaveBeenCalledWith(
-        "agent-workspaces/hung-agent/proofOfWork.md",
-        expect.stringContaining("Status: FAILED"),
-      );
-      expect(mockFilesProvider.writeFile).toHaveBeenCalledWith(
         "agent-workspaces/hung-agent/handOff.md",
         expect.stringContaining("Tool progress observed before failure: No"),
       );
@@ -618,7 +991,6 @@ describe("InnerLoop Worker Loop (ReAct)", () => {
           kind: "result",
           from: "hung-agent",
           artifacts: expect.arrayContaining([
-            expect.objectContaining({ path: "agent-workspaces/hung-agent/proofOfWork.md" }),
             expect.objectContaining({ path: "agent-workspaces/hung-agent/handOff.md" }),
           ]),
         }),
@@ -709,8 +1081,130 @@ describe("InnerLoop Worker Loop (ReAct)", () => {
     // Verify that the last turn model input messages actually contain the system notice
     const lastTurnMessages = scripted.seenTurns[3];
     const hasNotice = lastTurnMessages.some(
-      (m) => m.content.toString().includes("System Notice: You have performed")
+      (m) => m.content.toString().includes("System Notice: The last 3 web searches returned no useful results")
     );
     expect(hasNotice).toBe(true);
+  });
+
+  it("does not warn merely because three web searches returned useful results", async () => {
+    const mockWebProvider = {
+      search: vi.fn().mockResolvedValue([{ title: "Useful result", url: "https://example.com" }]),
+    };
+    container.register("capability:web", mockWebProvider);
+    install([
+      toolCall("web_search", { query: "first" }, "s1"),
+      toolCall("web_search", { query: "second" }, "s2"),
+      toolCall("web_search", { query: "third" }, "s3"),
+      new AIMessage({ content: "I found useful sources." }),
+    ]);
+
+    await innerLoop.run({
+      agentId: "useful-search-agent",
+      taskId: "task-123",
+      templateName: "ResearcherAgent",
+      instruction: "research the topic",
+    });
+
+    const notices = (mockBus.publish as any).mock.calls.filter(
+      ([topic, payload]: [string, any]) => topic.endsWith(".thought") && payload?.content?.includes("last 3 web searches"),
+    );
+    expect(notices).toHaveLength(0);
+  });
+
+  it("stops repeated successful evidence instead of spending more model turns", async () => {
+    mockFilesProvider.listFiles.mockResolvedValue(["index.html"]);
+    install([
+      toolCall("list_files", { path: "." }, "list_1"),
+      toolCall("list_files", { path: "." }, "list_2"),
+      toolCall("list_files", { path: "." }, "list_3"),
+      new AIMessage({ content: "The workspace is ready." }),
+    ]);
+
+    await innerLoop.run({
+      agentId: "no-progress-agent",
+      taskId: "task-no-progress",
+      templateName: "FilesAgent",
+      instruction: "inspect the workspace and stop when the evidence is unchanged",
+    });
+
+    expect(scripted.seenTurns.length).toBeLessThanOrEqual(3);
+    expect(mockBus.publish).toHaveBeenCalledWith(
+      "task.task-no-progress.agent.no-progress-agent.thought",
+      expect.objectContaining({ content: expect.stringContaining("No progress detected") }),
+    );
+  });
+
+  it("stops an identical file-tool contract failure instead of retrying forever", async () => {
+    install([
+      toolCall("file_multi", {
+        actions: [{ action: "execute_shell_command", params: { command: "node generate_presentation.js" } }],
+      }, "bad-1"),
+      toolCall("file_multi", {
+        actions: [{ action: "execute_shell_command", params: { command: "node generate_presentation.js" } }],
+      }, "bad-2"),
+      toolCall("file_multi", {
+        actions: [{ action: "execute_shell_command", params: { command: "node generate_presentation.js" } }],
+      }, "bad-3"),
+    ]);
+
+    const result = await innerLoop.run({
+      agentId: "contract-loop-agent",
+      taskId: "task-contract-loop",
+      templateName: "DocumentAgent",
+      instruction: "Run the existing presentation generator and produce the PPTX.",
+    });
+
+    expect(result.incomplete).toBe(true);
+    expect(result.stopReason).toBe("no-progress");
+    expect(result.summary).toContain("No progress budget exhausted");
+    expect(scripted.seenTurns.length).toBeLessThanOrEqual(3);
+    const failures = (mockBus.publish as any).mock.calls.filter(
+      ([topic]: [string]) => topic === "task.task-contract-loop.agent.contract-loop-agent.action_failed",
+    );
+    expect(failures).toHaveLength(2);
+  });
+
+  it("groups different shell commands hidden inside file_multi as one contract failure", async () => {
+    install([
+      toolCall("file_multi", {
+        actions: [{ action: "execute_command", params: { command: "python3 generate_pptx.py" } }],
+      }, "bad-python"),
+      toolCall("file_multi", {
+        actions: [{ action: "execute_command", params: { command: "node create_pptx.js" } }],
+      }, "bad-node"),
+    ]);
+
+    const result = await innerLoop.run({
+      agentId: "contract-variant-agent",
+      taskId: "task-contract-variant",
+      templateName: "DocumentAgent",
+      instruction: "Run the generator and produce the final presentation.",
+    });
+
+    expect(result.incomplete).toBe(true);
+    expect(result.stopReason).toBe("no-progress");
+    expect(scripted.seenTurns.length).toBeLessThanOrEqual(3);
+  });
+
+  it("does not call successful void writes failures", async () => {
+    install([
+      toolCall("write_file", { path: "one.txt", content: "1" }, "w1"),
+      toolCall("write_file", { path: "two.txt", content: "2" }, "w2"),
+      toolCall("write_file", { path: "three.txt", content: "3" }, "w3"),
+      new AIMessage({ content: "All files written." }),
+    ]);
+
+    const result = await innerLoop.run({
+      agentId: "write-guard-agent",
+      taskId: "task-123",
+      templateName: "FilesAgent",
+      instruction: "write three files",
+    });
+
+    expect(result.summary).toBe("All files written.");
+    const notices = (mockBus.publish as any).mock.calls.filter(
+      ([topic, payload]: [string, any]) => topic.endsWith(".thought") && payload?.content?.includes("repeatedly failed"),
+    );
+    expect(notices).toHaveLength(0);
   });
 });

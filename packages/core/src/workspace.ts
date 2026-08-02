@@ -90,9 +90,9 @@ export interface ResumeProfile {
 export function buildStrategyAcknowledgement(goal: string): string {
   const requestedAgentCount = getRequestedAgentCount(goal);
   if (requestedAgentCount !== null) {
-    return `I’ll prepare a strategy using exactly ${requestedAgentCount} agents and preserve the roles you requested. I’ll account for the deliverable, dependencies, required tools, model assignments, verification steps, and likely risks before showing you the plan for approval.`;
+    return `I’ll prepare a strategy using exactly ${requestedAgentCount} agents and preserve the roles you requested. I’ll account for the deliverable, dependencies, required tools, model assignments, verification steps, and likely risks, then show you the plan for approval so you can review it before any agent starts.`;
   }
-  return "I’ll prepare an implementation strategy by mapping the deliverable, scope, dependencies, required tools, model and agent assignments, verification steps, and likely risks. I’ll show you the plan for approval before any agent starts.";
+  return "I’ll prepare an implementation strategy by mapping the deliverable, scope, dependencies, required tools, model and agent assignments, verification steps, and likely risks. I’ll show you the plan for approval so you can review it before any agent starts.";
 }
 
 function buildClarificationFallback(goal: string): string {
@@ -651,7 +651,7 @@ export class Workspace {
       files: {
         handsOn: read("handsOn.md"),
         handOff: read("handOff.md"),
-        proofOfWork: read("proofOfWork.md"),
+        checkpoint: read("checkpoint.md"),
         incompleteWork: read("incompleteWork.md"),
       },
     };
@@ -1460,6 +1460,11 @@ export class Workspace {
 
     if (decision.action === "prepare_plan") {
       this.updateTaskStatus(taskId, "planning");
+      hooks.onEvent?.({
+        type: "thought",
+        from: "orchestrator",
+        content: "The request is clear enough to plan. I’m preparing the implementation strategy now.",
+      });
       const acknowledgement = await this.generateStrategyAcknowledgement(goal);
       await this.appendOrchestratorReplyToMission(taskId, acknowledgement);
       hooks.onEvent?.({ type: "status", from: "orchestrator", note: acknowledgement });
@@ -1493,29 +1498,10 @@ export class Workspace {
   }
 
   private async generateStrategyAcknowledgement(goal: string): Promise<string> {
-    try {
-      const config = this.loadConfig();
-      const gateway = new MeshGateway({
-        apiKey: config.accessToken ?? process.env.MESH_API_KEY ?? undefined,
-        modelMapping: config.preferredModels as any,
-        modelPreference: config.modelPreference ?? "balanced",
-      });
-      const messages: ChatMessage[] = [
-        {
-          role: "system",
-          content: `You are the YAAA team lead. Generate a friendly, concise user-facing planning update in 1-3 sentences. Explain how you are preparing the implementation strategy by mentioning only the relevant factors you will consider, such as the deliverable and scope, audience or constraints, dependencies, required tools, agent/model assignments, verification steps, and risks or time limits. Do not reveal private chain-of-thought or provide detailed hidden reasoning. End by making clear that the user will review and approve the plan before any agent starts. Use the term "strategy" or "implementation strategy".`,
-        },
-        { role: "user", content: `Goal: ${goal}` },
-      ];
-      const res = await gateway.chat(messages, {
-        modelRole: "utility",
-        temperature: 0.7,
-      });
-      const text = res.content.trim();
-      return text || buildStrategyAcknowledgement(goal);
-    } catch (err) {
-      return buildStrategyAcknowledgement(goal);
-    }
+    // This message is a phase indicator, not a reasoning task. Calling a
+    // utility model here added a full network round trip before the planner
+    // could start, while producing no information needed for execution.
+    return buildStrategyAcknowledgement(goal);
   }
 
   async evaluateConversationalOnboarding(
@@ -1831,6 +1817,11 @@ Do not output any conversational text or JSON. Respond with ONLY the raw synthes
     taskId: string,
     hooks: RunTaskHooks = {},
   ): Promise<TaskRunResult> {
+    hooks.onEvent?.({
+      type: "thought",
+      from: "orchestrator",
+      content: "Approval command accepted. Claiming the saved task and loading its plan.",
+    });
     const row = this.claimTaskForRun(taskId);
 
     const store = new SqliteStore(this.tasksDir);
@@ -1844,6 +1835,11 @@ Do not output any conversational text or JSON. Respond with ONLY the raw synthes
       this.updateTaskStatus(taskId, "failed");
       throw new Error("Task plan is missing; create a new mission instead.");
     }
+    hooks.onEvent?.({
+      type: "thought",
+      from: "orchestrator",
+      content: "Saved plan loaded. Initializing the execution team and checking the first dependency stage.",
+    });
     return this.runTask(
       row.prompt,
       { taskId, taskDir: row.path, workingDir: path.join(row.path, "working") },
@@ -2017,10 +2013,6 @@ Do not output any conversational text or JSON. Respond with ONLY the raw synthes
           content += `- **Role expectation:** ${review.roleExpectation}\n`;
           content += `- **Selected model:** \`${review.selectedModel}\`\n`;
           content += `- **Model reasoning:** ${review.modelReason}\n`;
-          content += `- **Role fit review:**\n`;
-          for (const role of review.consideredRoles ?? []) {
-            content += `  - ${role.relevant ? "✅" : "—"} \`${role.agentTemplate}\`: ${role.rationale}\n`;
-          }
           content += `\n`;
         }
       }
@@ -2036,8 +2028,10 @@ Do not output any conversational text or JSON. Respond with ONLY the raw synthes
       content += `\n`;
       for (const subtask of plan.subtasks ?? []) {
         content += `- **[${subtask.id}]** ${subtask.title}\n`;
-        content += `  - Capability: \`${subtask.capability}\`\n`;
-        content += `  - Agent role: \`${subtask.agentTemplate || "YAAA-selected specialist"}\`\n`;
+        if (subtask.summary) content += `  - Summary: ${subtask.summary}\n`;
+        content += `  - Roles: ${subtask.roles.map((role: string) => `\`${role}\``).join(", ")}\n`;
+        content += `  - Capabilities: ${subtask.capabilities.map((capability: string) => `\`${capability}\``).join(", ")}\n`;
+        if (subtask.skills && subtask.skills.length > 0) content += `  - Required skills before tool use: ${subtask.skills.map((skill: string) => `\`${skill}\``).join(", ")}\n`;
         if (subtask.routingReason) content += `  - Routing: ${subtask.routingReason}\n`;
         if (subtask.model) content += `  - Model: \`${subtask.model}\`${subtask.modelReason ? ` — ${subtask.modelReason}` : ""}\n`;
         content += `  - Status: \`${subtask.state || "pending"}\`\n`;

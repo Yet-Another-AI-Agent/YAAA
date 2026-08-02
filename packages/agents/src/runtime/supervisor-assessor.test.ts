@@ -55,4 +55,15 @@ describe("SupervisorAssessor", () => {
     const decision = await new SupervisorAssessor().assess("t1", ctx);
     expect(decision.action).toBe("continue");
   });
+
+  it("tells the router not to claim that live permissions changed", async () => {
+    gateway.chat.mockResolvedValue({ content: '{"recipientIds":[],"reply":"The capability is unavailable.","reason":"missing tool"}' });
+    await new SupervisorAssessor().routeMessage("t1", {
+      missionGoal: "Build a deck",
+      userMessage: "I cannot run the generator because shell is missing.",
+      activeAgents: [{ id: "a1", handle: "@a1", assignment: "Build the deck" }],
+    });
+    const systemMessage = gateway.chat.mock.calls[0][0][0].content;
+    expect(systemMessage).toContain("never claim that a tool, permission, model, or capability was added or updated");
+  });
 });

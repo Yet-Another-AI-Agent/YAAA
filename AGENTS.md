@@ -38,3 +38,11 @@ Fall back to Grep/Glob/Read **only** when the graph doesn't cover what you need.
 4. Use `query_graph` pattern="tests_for" to check coverage.
 
 ## Imported Claude Cowork project instructions
+
+### Agent assignment artifact names
+
+When working inside a task workspace, use the exact case-sensitive filenames:
+
+- `handsOn.md` is the orchestrator-authored assignment and instructions document. Read it before acting.
+- `handOff.md` is the agent-produced completion or blocker handoff. Create or update it when stopping.
+- Do not substitute `README.md` or `instructions.md` for `handsOn.md` unless those files actually exist.

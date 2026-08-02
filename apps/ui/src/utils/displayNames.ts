@@ -104,7 +104,8 @@ export function displaySender(
   if (!sender) return "Agent";
   if (isOrchestratorSender(sender)) return ORCHESTRATOR_DISPLAY;
   // Generic, unattributed labels have no id to derive an identity from.
-  if (sender === "User" || sender === "System" || sender === "Agent") return sender;
+  if (sender === "User" || sender === "System") return sender;
+  if (/^Agent(?:\s*\(Agent\))?$/i.test(sender)) return ORCHESTRATOR_DISPLAY;
   return agentIdentity(sender, roleLookup?.(sender)).display;
 }
 

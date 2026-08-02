@@ -33,6 +33,7 @@ const killedTasks = new Set();
 const confirmingTasks = new Set();
 const recentTaskEvents = new Map();
 const MAX_RECENT_TASK_EVENTS = 100;
+let taskEventSequence = 0;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -71,11 +72,18 @@ function sendToRenderer(channel, payload) {
 }
 
 function emitTaskEvent(taskId, payload) {
+  const event = {
+    ...payload,
+    // Replay and live delivery can overlap while a newly-created task is
+    // attaching its renderer subscription. Give both deliveries the same
+    // identity so the renderer can safely ignore the second one.
+    eventId: `${taskId}:${++taskEventSequence}`,
+  };
   const recent = recentTaskEvents.get(taskId) ?? [];
-  recent.push(payload);
+  recent.push(event);
   if (recent.length > MAX_RECENT_TASK_EVENTS) recent.shift();
   recentTaskEvents.set(taskId, recent);
-  sendToRenderer("task-event", payload);
+  sendToRenderer("task-event", event);
 }
 
 /**
@@ -97,6 +105,18 @@ function forwardRuntimeEvent(taskId, event) {
         data: event.plan,
       });
       break;
+    case "sub-subtask-completed":
+      emitTaskEvent(taskId, {
+        topic: `task.${taskId}.sub_subtask_completed`,
+        data: event.data,
+      });
+      break;
+    case "sub-subtask-added":
+      emitTaskEvent(taskId, {
+        topic: `task.${taskId}.sub_subtask_added`,
+        data: event.data,
+      });
+      break;
     case "thought":
       emitTaskEvent(taskId, {
         topic: `task.${taskId}.agent.${event.from}.thought`,
@@ -112,7 +132,14 @@ function forwardRuntimeEvent(taskId, event) {
     case "llm-context":
       emitTaskEvent(taskId, {
         topic: `task.${taskId}.agent.${event.from}.llm_context`,
-        data: { turn: event.turn, model: event.model, messages: event.messages },
+        data: {
+          turn: event.turn,
+          model: event.model,
+          messageCount: event.messageCount,
+          contextChars: event.contextChars,
+          messageTypes: event.messageTypes,
+          displaySummary: event.displaySummary,
+        },
       });
       break;
     case "llm-response":
@@ -239,8 +266,6 @@ ipcMain.handle("confirm-task", async (_event, taskId) => {
     return { status: "error", error: "Task is already running or was deleted" };
   }
   confirmingTasks.add(taskId);
-  // The immediate acknowledgement lets the renderer transition to running
-  // while the full result continues over the existing event channels.
   setTimeout(() => {
     workspace
       .confirmTask(taskId, {
@@ -500,6 +525,14 @@ ipcMain.handle("parse-resume", async (_event, text) => {
 ipcMain.handle("open-working-folder", async (_event, taskId) => {
   if (!taskId) return false;
   const folderPath = path.join(workspace.getYaaaDir(), "tasks", taskId, "working");
+  await shell.openPath(folderPath);
+  return true;
+});
+
+ipcMain.handle("open-agent-workspace", async (_event, { taskId, agentId }) => {
+  const isSafeSegment = (value) => typeof value === "string" && value.length > 0 && value !== "." && value !== ".." && !value.includes("/") && !value.includes("\\");
+  if (!isSafeSegment(taskId) || !isSafeSegment(agentId)) return false;
+  const folderPath = path.join(workspace.getYaaaDir(), "tasks", taskId, "working", "agent-workspaces", agentId);
   await shell.openPath(folderPath);
   return true;
 });
